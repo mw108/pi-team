@@ -1,0 +1,1 @@
+Propose a complete implementation independently. Use the solverId provided in your context. Do not look for other solver proposals or state files. Explain advantages, disadvantages, assumptions, risks and required tests.

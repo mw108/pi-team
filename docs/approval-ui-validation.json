@@ -1,0 +1,11 @@
+{
+  "at": "2026-09-27T22:02:56.888Z",
+  "mode": "tui",
+  "values": [
+    "synthetic-test",
+    "synthetic-lint"
+  ],
+  "passed": true,
+  "synthetic": true,
+  "noRealPermissionsGranted": true
+}

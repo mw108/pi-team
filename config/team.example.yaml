@@ -1,0 +1,98 @@
+# Replace configure-model-id with an ID returned by your endpoint's /v1/models.
+# Every role may independently select a configured Pi provider/model.
+workflow:
+  maxFullCycles: 3
+  maxLocalFixCycles: 5
+  maxPentestCycles: 2
+  maxAgentFailures: 2
+  maxQuestions: 5
+  agentTimeoutMs: 300000
+  maxToolCalls: 80
+qualityGates:
+  codeReview: { enabled: true }
+  pentest: { enabled: false }
+  testing: { enabled: true }
+  commit: { enabled: true }
+tester:
+  mayModifyTests: false
+  testPaths: [tests/, test/]
+integrations:
+  serena: { enabled: true }
+  context7: { enabled: true }
+  web: { enabled: true }
+pentest:
+  localUrls: []
+  localHttp:
+    allowedOrigins: []
+    allowedMethods: [GET]
+    timeoutMs: 10000
+    maxRequestBodyBytes: 1048576
+    maxResponseBodyBytes: 2097152
+commit:
+  runHooks: false
+# Explicitly approve commands after reviewing this repository's scripts/CI.
+# These examples match pi-team itself; replace them for other repositories.
+commands:
+  - id: typecheck
+    executable: npm
+    args: [run, typecheck]
+    purpose: static
+    timeoutMs: 120000
+  - id: test
+    executable: npm
+    args: [test]
+    purpose: test
+    timeoutMs: 120000
+agents:
+  orchestrator:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  researcher:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  solver1:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  solver2:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  solver3:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  critic:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  reviewer:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  implementor:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  codeReviewer:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  pentester:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  securityReviewer:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  tester:
+    provider: local
+    model: configure-model-id
+    thinking: off
+  commitAgent:
+    provider: local
+    model: configure-model-id
+    thinking: off

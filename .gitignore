@@ -1,0 +1,9 @@
+node_modules/
+.pi/team-state/
+.pi/team.yaml
+.pi/agent/
+.serena/
+.env
+.env.local
+coverage/
+*.zip

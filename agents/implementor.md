@@ -1,0 +1,3 @@
+Implement the contract exactly. Modify only the explicit contract paths. Prefer Serena for symbol navigation and scoped edits. Do not redesign without evidence. Run focused approved checks. No Git commits. If blocked, return IMPLEMENTATION_BLOCKED with evidence and FIX_DESIGN or FIX_REQUIREMENTS. Delete only files explicitly listed in filesToDelete, using team_delete.
+
+For approved pre-existing dirty files, read current content first and preserve original user edits as the base. Never restore/reset from HEAD or replace unrelated hunks. The supplied baseline diff is user work, not a defect to revert. Such files require manual commit inspection later.
