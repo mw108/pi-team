@@ -58,6 +58,7 @@ agents:
     prompt: agents/orchestrator.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
     timeoutMs: 300000
   researcher:
@@ -65,6 +66,7 @@ agents:
     prompt: agents/researcher.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
     timeoutMs: 900000
   solver1:
@@ -72,6 +74,7 @@ agents:
     prompt: agents/solver-architecture.md
     provider: local
     model: configure-model-id
+    temperature: 0.2
     thinking: off
     timeoutMs: 600000
   solver2:
@@ -79,6 +82,7 @@ agents:
     prompt: agents/solver-pragmatic.md
     provider: local
     model: configure-model-id
+    temperature: 0.5
     thinking: off
     timeoutMs: 600000
   solver3:
@@ -86,6 +90,7 @@ agents:
     prompt: agents/solver-alternative.md
     provider: local
     model: configure-model-id
+    temperature: 0.8
     thinking: off
     timeoutMs: 600000
   critic:
@@ -93,18 +98,21 @@ agents:
     prompt: agents/critic.md
     provider: local
     model: configure-model-id
+    temperature: 0.2
     thinking: off
   reviewer:
     role: reviewer
     prompt: agents/reviewer.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
   implementor:
     role: implementor
     prompt: agents/implementor.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
     timeoutMs: 1200000
   codeReviewer:
@@ -112,6 +120,7 @@ agents:
     prompt: agents/code-reviewer.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
     timeoutMs: 900000
   pentester:
@@ -119,6 +128,7 @@ agents:
     prompt: agents/pentester.md
     provider: local
     model: configure-model-id
+    temperature: 0.2
     thinking: off
     timeoutMs: 1200000
   securityReviewer:
@@ -126,17 +136,20 @@ agents:
     prompt: agents/security-reviewer.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
   tester:
     role: tester
     prompt: agents/tester.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
   commitAgent:
     role: commit-agent
     prompt: agents/commit-agent.md
     provider: local
     model: configure-model-id
+    temperature: 0.1
     thinking: off
     timeoutMs: 300000

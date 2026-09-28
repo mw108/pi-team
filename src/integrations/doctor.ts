@@ -18,6 +18,7 @@ import { StateStore } from "../workflow/persistence.ts";
 import { git, dirtyPaths } from "../workflow/git.ts";
 import { checkAskCompatibility } from "./pi-ask.ts";
 import { packagePath } from "./resources.ts";
+import { assertTemperatureSupported } from "../agents/sampling.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -112,14 +113,20 @@ export async function doctor(cwd: string) {
     });
     for (const role of roles) {
       const selection = config.agents[role];
-      const present = Boolean(
-          runtime.getModel(selection.provider, selection.model),
-        ),
+      const model = runtime.getModel(selection.provider, selection.model);
+      const present = Boolean(model),
         auth = runtime.hasConfiguredAuth(selection.provider);
       lines.push(
-        `${role}: ${selection.provider}/${selection.model}; model ${present ? "registered" : "MISSING"}; auth ${auth ? "configured" : "MISSING"}`,
+        `${role}: ${selection.provider}/${selection.model}; model ${present ? "registered" : "MISSING"}; auth ${auth ? "configured" : "MISSING"}${selection.temperature === undefined ? "" : `; temperature ${selection.temperature}`}`,
       );
       if (!present || !auth) ok = false;
+      if (model)
+        try {
+          assertTemperatureSupported(model, selection);
+        } catch (error) {
+          ok = false;
+          lines.push(`${role}: FAIL — ${String(error)}`);
+        }
     }
     lines.push(
       `Web credential: ${process.env.EXA_API_KEY ? "EXA_API_KEY present" : "EXA_API_KEY unavailable"}`,

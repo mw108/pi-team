@@ -33,6 +33,7 @@ import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { effectiveConfig } from "./discovery.ts";
 import { AgentTimeoutError, getAgentTimeoutMs } from "./errors.ts";
+import { configureAgentSampling } from "./sampling.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -74,6 +75,7 @@ export class PiRunner implements AgentRunner {
       throw new Error(
         `Provider ${selected.provider} has no configured authentication`,
       );
+    configureAgentSampling(runtime, model, selected);
     const settings = SettingsManager.inMemory({
       packages: [],
       extensions: [],

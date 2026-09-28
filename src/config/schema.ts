@@ -38,6 +38,7 @@ const agent = z
     prompt: z.string().min(1),
     provider: z.string().min(1),
     model: z.string().min(1),
+    temperature: z.number().finite().min(0).max(2).optional(),
     timeoutMs: z.number().int().min(1000).max(3600000).optional(),
     thinking: z
       .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])

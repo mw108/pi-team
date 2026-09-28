@@ -106,22 +106,33 @@ agents:
     prompt: agents/solver-architecture.md
     provider: local
     model: your-model-id
+    temperature: 0.2
     thinking: off
   solver2:
     role: solver
     prompt: agents/solver-pragmatic.md
     provider: local
     model: your-model-id
+    temperature: 0.5
     thinking: off
   solver3:
     role: solver
     prompt: agents/solver-alternative.md
     provider: local
     model: your-model-id
+    temperature: 0.8
     thinking: off
 ```
 
 The default solver prompts favor architecture, minimal change and alternative approaches respectively, while retaining the same output contract. For a Laravel project, add its conventions to `agents/implementor.md`; for Angular, tailor `agents/reviewer.md` to component and testing patterns. A security-heavy Solver can use a separate prompt file with its own `prompt:` path, and a minimal-change Solver can favor existing patterns in `agents/solver-pragmatic.md`. Keep the required slot names and logical roles; optional pentest may be disabled, but its slot remains defined for schema consistency. Set every placeholder `model: configure-model-id` to a model Pi can resolve, or use `--from-global` to carry over known-working assignments.
+
+### Agent sampling
+
+Each agent can set `temperature: 0.2` alongside `thinking: off`. Temperature is optional and must be a finite number from 0 to 2. When omitted, Pi and the provider use their model default; existing project configurations do not need an edit. Lower values favor consistency, while higher values allow more varied samples. The template uses 0.2 for the architecture Solver, 0.5 for the pragmatic Solver, and 0.8 for the alternative Solver. Their distinct prompts remain the main source of different approaches; temperature does not guarantee better reasoning.
+
+Pi 0.87.1 has no temperature argument on `createAgentSession()` or `session.prompt()`. Pi Team passes the configured value through that agent session's `ModelRuntime.streamSimple()` generation options on each request. Pi's OpenAI-compatible adapter sends it as the `temperature` request field. An explicit agent value overrides a model's `samplingParams.temperature`; an omitted value leaves the provider/model default untouched. Workflow state saves the resolved agent configuration, and the existing team YAML hash catches temperature edits during resume. `/team doctor` reports invalid values and statically known unsupported combinations.
+
+Provider support varies. Pi Team rejects explicit temperature for Pi APIs whose installed adapter does not forward it, Anthropic extended thinking or models marked as not supporting temperature, and OpenAI/Codex reasoning models. For other supported adapters, a model or server may still reject a particular value; that provider error is reported rather than treated as a successful application. Check the chosen model before using the template examples with a different provider.
 
 Project YAML and Markdown are repository-controlled input. Prompt paths must stay within `.pi/team/`, including through symlinks; missing, empty or unreadable prompts fail early. A prompt cannot grant tools or change the engine's centrally enforced role permissions. YAML cannot import modules, run shell text or bypass command approval, Git protections or local HTTP policy. Pi's normal repository instructions remain available to sessions alongside each project's role prompt.
 
