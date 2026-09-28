@@ -57,7 +57,14 @@ export const contract = {
   requiredChanges: ["Use addition"],
   technicalDecisions: [],
   constraints: [],
-  requiredTests: ["test"],
+  requiredTests: [
+    {
+      description: "addition remains covered",
+      action: "existing" as const,
+      file: "tests/math.test.mjs",
+      scope: "unit" as const,
+    },
+  ],
   acceptanceCriteria: ["2 + 3 = 5"],
   knownRisks: [],
 };

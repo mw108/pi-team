@@ -10,7 +10,11 @@ import {
 import { z } from "zod";
 import { pathToFileURL } from "node:url";
 import { agentDir } from "../config/loader.ts";
-import { allowedTools, checkTool } from "./permissions.ts";
+import {
+  allowedTools,
+  checkTool,
+  validateContractPaths,
+} from "./permissions.ts";
 import {
   commandTool,
   execute,
@@ -257,6 +261,8 @@ export class PiRunner implements AgentRunner {
       let result: any;
       try {
         result = parseText(role, session.getLastAssistantText() ?? "");
+        if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
+          await validateContractPaths(state.cwd, result);
       } catch (error) {
         // Correction is output-only: never replay writes or commands because of malformed JSON.
         session.setActiveToolsByName([]);
@@ -270,6 +276,8 @@ export class PiRunner implements AgentRunner {
         if (signal?.aborted)
           throw new Error("Agent interrupted during schema correction");
         result = parseText(role, session.getLastAssistantText() ?? "");
+        if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
+          await validateContractPaths(state.cwd, result);
       }
       if (role === "tester" && result.type !== "QUESTION_REQUEST") {
         if (!evidence.length)

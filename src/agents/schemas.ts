@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { posix } from "node:path";
+import { assertRelative } from "./permissions.ts";
 
 export const roles = [
   "orchestrator",
@@ -73,18 +75,86 @@ export const critiqueSchema = z.object({
   rejectedElements: strings,
   unresolvedRisks: strings,
 });
-export const contractSchema = z.object({
-  goal: text,
-  filesToModify: strings,
-  filesToCreate: strings,
-  filesToDelete: strings,
-  requiredChanges: strings,
-  technicalDecisions: strings,
-  constraints: strings,
-  requiredTests: strings,
-  acceptanceCriteria: strings,
-  knownRisks: strings,
+const contractPath = z.string().superRefine((path, ctx) => {
+  try {
+    assertRelative(path);
+    if (
+      path.includes("\\") ||
+      /[?*\[\]]/.test(path) ||
+      posix.normalize(path) !== path ||
+      path === "." ||
+      path.endsWith("/")
+    )
+      throw new Error("Not an exact normalized path");
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      message: "Expected an exact repository-relative path",
+    });
+  }
 });
+export const requiredTestSchema = z
+  .object({
+    description: z.string().trim().min(1),
+    action: z.enum(["existing", "create", "modify"]),
+    file: contractPath.optional(),
+    scope: z.enum(["unit", "integration", "e2e", "other"]).optional(),
+    acceptanceCriteria: z.array(z.string().trim().min(1)).optional(),
+  })
+  .superRefine((test, ctx) => {
+    if (test.action !== "existing" && !test.file)
+      ctx.addIssue({
+        code: "custom",
+        path: ["file"],
+        message: `${test.action} requires a test file`,
+      });
+  });
+export const contractSchema = z
+  .object({
+    goal: text,
+    filesToModify: z.array(contractPath),
+    filesToCreate: z.array(contractPath),
+    filesToDelete: z.array(contractPath),
+    requiredChanges: strings,
+    technicalDecisions: strings,
+    constraints: strings,
+    requiredTests: z.array(requiredTestSchema),
+    acceptanceCriteria: strings,
+    knownRisks: strings,
+  })
+  .superRefine((contract, ctx) => {
+    const actions = new Map<string, Set<string>>();
+    for (const [index, test] of contract.requiredTests.entries()) {
+      if (!test.file) continue;
+      if (
+        test.action === "modify" &&
+        !contract.filesToModify.includes(test.file)
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["requiredTests", index, "file"],
+          message: `modify test file must appear in filesToModify: ${test.file}`,
+        });
+      if (
+        test.action === "create" &&
+        !contract.filesToCreate.includes(test.file)
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["requiredTests", index, "file"],
+          message: `create test file must appear in filesToCreate: ${test.file}`,
+        });
+      const seen = actions.get(test.file) ?? new Set<string>();
+      seen.add(test.action);
+      actions.set(test.file, seen);
+      if (seen.has("create") && seen.has("modify"))
+        ctx.addIssue({
+          code: "custom",
+          path: ["requiredTests", index],
+          message: `Conflicting test actions for: ${test.file}`,
+        });
+    }
+  });
 export const implementationSchema = z.union([
   z.object({
     status: z.literal("IMPLEMENTED"),

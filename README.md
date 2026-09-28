@@ -286,6 +286,43 @@ flowchart TD
 
 Testing failures classified as `FIX_DESIGN` return to Researcher. Every fix invalidates later quality approvals. Files are hashed at quality gates and checked again before commit; changes after review block the commit. Tester edits, when enabled, require another reviewed cycle rather than bypassing an earlier review.
 
+### Test responsibility
+
+The Reviewer specifies automated coverage in the Implementation Contract. Each `requiredTests` entry has a `description`, an `action`, and optional `file`, `scope` (`unit`, `integration`, `e2e`, or `other`) and `acceptanceCriteria`. `existing` means current coverage must keep passing; its file may be omitted if unknown. `modify` means the Implementor updates the named existing test file, which must be in `filesToModify`. `create` means the Implementor adds the named new test file, which must be in `filesToCreate`. Contract validation rejects mismatched lists and conflicting create/modify actions for the same path. Test paths receive the same repository boundary checks as other contract paths.
+
+The Implementor writes the required production and test code before Code Review. The Code Reviewer checks the actual diff and test assertions against the contract and returns `FIX_LOCAL` for ordinary missing coverage. The Tester then executes approved validation commands. `tester.mayModifyTests` remains `false` by default; enabling it is an exceptional repair capability, not the normal owner of contract tests.
+
+For example, a login contract can keep its success test and require a new failure case in the same file:
+
+```json
+{
+  "filesToModify": [
+    "src/app/login/login.component.ts",
+    "src/app/login/login.component.spec.ts"
+  ],
+  "filesToCreate": [],
+  "requiredTests": [
+    {
+      "description": "Successful login remains covered",
+      "action": "existing",
+      "file": "src/app/login/login.component.spec.ts",
+      "scope": "unit"
+    },
+    {
+      "description": "Failed login displays the backend error",
+      "action": "modify",
+      "file": "src/app/login/login.component.spec.ts",
+      "scope": "unit",
+      "acceptanceCriteria": [
+        "HTTP error is returned",
+        "backend message is displayed",
+        "submitting state resets"
+      ]
+    }
+  ]
+}
+```
+
 Penetration testing is off by default. Enable only authorized, disposable local application targets:
 
 ```yaml
@@ -326,7 +363,7 @@ The Pen Tester uses reversible probes against disposable local test data. Broade
 
 ## State, limits and recovery
 
-State is authoritative structured JSON under `.pi/team/state/<workflow-id>.json`. Atomic writes flush a temporary file before rename. State contains the task, requirements, configuration snapshot, config and prompt hashes, baseline Git evidence, results, findings, questions/answers, counters, history, commit intent, discovered/approved commands, exact dirty-path approvals and pending selections. Version 1 states missing the earlier additive fields load conservatively, but workflows without project config and prompt hashes cannot resume automatically. Existing `.pi/team-state/` files are preserved and reported as legacy; start a new workflow after project initialization. Full agent conversations and private reasoning are not forwarded between roles. Read-only role sessions are fresh and in memory; phase-specific structured results form their context.
+State is authoritative structured JSON under `.pi/team/state/<workflow-id>.json`. Atomic writes flush a temporary file before rename. State contains the task, requirements, configuration snapshot, config and prompt hashes, baseline Git evidence, results, findings, questions/answers, counters, history, commit intent, discovered/approved commands, exact dirty-path approvals and pending selections. Version 1 states migrate to version 2 on load: legacy string `requiredTests` entries become `{ "description": "...", "action": "existing" }` without invented file paths. Version 1 states missing the earlier additive fields load conservatively, but workflows without project config and prompt hashes cannot resume automatically. Existing `.pi/team-state/` files are preserved and reported as legacy; start a new workflow after project initialization. Full agent conversations and private reasoning are not forwarded between roles. Read-only role sessions are fresh and in memory; phase-specific structured results form their context.
 
 `/team-init` creates `.pi/team/.gitignore` containing `state/`; an equivalent root `.gitignore` entry is `.pi/team/state/`. The engine adds a local `.git/info/exclude` entry only for Serena caches. It preserves project ignore files and leaves team YAML/prompts available for version control. State can contain repository source/diffs, so treat it as private. Directory/file permissions are 0700/0600 for newly created state. It is not an encrypted secret store.
 

@@ -15,8 +15,8 @@ import {
 } from "../agents/schemas.ts";
 import {
   assertRelative,
-  assertWithin,
   contractPaths,
+  validateContractPaths,
 } from "../agents/permissions.ts";
 import {
   discoverCommands,
@@ -680,11 +680,9 @@ export class WorkflowEngine {
           }
         }
         if (s.phase === "IMPLEMENT") {
-          const paths = contractPaths(contractSchema.parse(s.results.reviewer));
-          for (const path of paths) {
-            assertRelative(path);
-            await assertWithin(this.cwd, path);
-          }
+          const contract = contractSchema.parse(s.results.reviewer);
+          const paths = contractPaths(contract);
+          await validateContractPaths(this.cwd, contract);
           const overlap = paths.filter(
             (path) =>
               s.baseline.dirtyPaths.includes(path) &&
@@ -836,10 +834,7 @@ export class WorkflowEngine {
         }
         if (s.phase === "REVIEW") {
           const contract = contractSchema.parse(s.results.reviewer);
-          for (const path of contractPaths(contract)) {
-            assertRelative(path);
-            await assertWithin(this.cwd, path);
-          }
+          await validateContractPaths(this.cwd, contract);
           if (
             new Set(contractPaths(contract)).size !==
             contractPaths(contract).length

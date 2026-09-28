@@ -66,7 +66,7 @@ export const baselineSchema = z.object({
   cachedDiff: z.string(),
 });
 export const stateSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   id: z.string().uuid(),
   cwd: z.string(),
   task: z.string().min(1),
@@ -133,8 +133,29 @@ export const stateSchema = z.object({
   commit: z.object({ hash: z.string(), files: z.array(z.string()) }).optional(),
 });
 export type WorkflowState = z.infer<typeof stateSchema>;
+function migrateState(value: unknown): unknown {
+  if (!value || typeof value !== "object" || (value as any).version !== 1)
+    return value;
+  const old = value as Record<string, unknown>;
+  const results = { ...((old.results ?? {}) as Record<string, unknown>) };
+  for (const key of ["reviewer", "previous_reviewer"]) {
+    const contract = results[key];
+    if (!contract || typeof contract !== "object") continue;
+    const raw = contract as Record<string, unknown>;
+    if (!Array.isArray(raw.requiredTests)) continue;
+    results[key] = {
+      ...raw,
+      requiredTests: raw.requiredTests.map((test) =>
+        typeof test === "string"
+          ? { description: test, action: "existing" }
+          : test,
+      ),
+    };
+  }
+  return { ...old, version: 2, results };
+}
 export function validateState(value: unknown): WorkflowState {
-  const state = stateSchema.parse(value);
+  const state = stateSchema.parse(migrateState(value));
   for (const command of state.approvedCommands)
     if (
       !state.discoveredCommands.some(
@@ -157,7 +178,7 @@ export function newState(
   baseline: z.infer<typeof baselineSchema>,
 ): WorkflowState {
   return {
-    version: 1,
+    version: 2,
     id: randomUUID(),
     cwd,
     task,

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { newState, validateState } from "../src/workflow/state.ts";
@@ -14,6 +14,7 @@ test("version 1 state without additive approval/config fields migrates conservat
     diff: "",
     cachedDiff: "",
   });
+  raw.version = 1;
   for (const key of [
     "approvedCommands",
     "discoveredCommands",
@@ -30,7 +31,47 @@ test("version 1 state without additive approval/config fields migrates conservat
   assert.equal(loaded.commandApprovalComplete, false);
   assert.equal(loaded.config.commit.runHooks, false);
   assert.deepEqual(loaded.config.pentest.localHttp.allowedMethods, ["GET"]);
-  assert.equal(loaded.version, 1);
+  assert.equal(loaded.version, 2);
+});
+test("version 1 string test requirements migrate without inventing paths", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
+  const raw: any = newState(cwd, "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  raw.version = 1;
+  const legacy = {
+    goal: "Login",
+    filesToModify: [],
+    filesToCreate: [],
+    filesToDelete: [],
+    requiredChanges: [],
+    technicalDecisions: [],
+    constraints: [],
+    requiredTests: ["successful login", "failed login"],
+    acceptanceCriteria: [],
+    knownRisks: [],
+  };
+  raw.results = { reviewer: legacy, previous_reviewer: legacy };
+  const store = new StateStore(cwd);
+  await mkdir(store.dir, { recursive: true });
+  await writeFile(store.path(raw.id), JSON.stringify(raw));
+  const loaded = await store.load(raw.id);
+  assert.equal(loaded.version, 2);
+  const migrated = ["reviewer", "previous_reviewer"].map(
+    (key) => (loaded.results[key] as any).requiredTests,
+  );
+  for (const tests of migrated)
+    assert.deepEqual(tests, [
+      { description: "successful login", action: "existing" },
+      { description: "failed login", action: "existing" },
+    ]);
+  await store.save(loaded);
+  assert.equal((await store.load(raw.id)).version, 2);
+  assert.throws(() => validateState({ ...raw, version: 2 }), /requiredTests/);
 });
 test("approval state and pending selection survive serialization without global config changes", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-state-")),

@@ -100,6 +100,15 @@ export async function assertWithin(cwd: string, path: string) {
     }
   }
 }
+export async function validateContractPaths(cwd: string, contract: Contract) {
+  for (const path of [
+    ...contractPaths(contract),
+    ...contract.requiredTests.flatMap((test) => (test.file ? [test.file] : [])),
+  ]) {
+    assertRelative(path);
+    await assertWithin(cwd, path);
+  }
+}
 export async function checkTool(
   role: Role,
   name: string,

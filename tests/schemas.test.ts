@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { parseText, parseResult, type Role } from "../src/agents/schemas.ts";
 import { PiRunner } from "../src/agents/runner.ts";
 import { newState } from "../src/workflow/state.ts";
-import { config, output, repository } from "./helpers.ts";
+import { config, contract, output, repository } from "./helpers.ts";
 import { baseline } from "../src/workflow/git.ts";
 test("structured results accept valid data and reject invalid routing", () => {
   assert.equal(
@@ -44,6 +44,52 @@ test("schema correction retry is exactly once and disables actions", async () =>
   assert.equal(prompts, 2);
   assert.ok(disabled);
   assert.equal(result.summary, "Fix arithmetic");
+});
+test("Reviewer contract inconsistency triggers output-only correction", async () => {
+  const cwd = await repository();
+  const s = newState(cwd, "task", config(), await baseline(cwd));
+  let prompts = 0;
+  let correction = "";
+  let disabled = false;
+  const valid = {
+    ...contract,
+    filesToModify: ["math.js", "tests/math.test.mjs"],
+    requiredTests: [
+      {
+        description: "failure",
+        action: "modify",
+        file: "tests/math.test.mjs",
+        acceptanceCriteria: ["error asserted"],
+      },
+    ],
+  };
+  const invalid = {
+    ...valid,
+    requiredTests: [{ description: "failure", action: "modify" }],
+  };
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async (text: string) => {
+        prompts++;
+        if (prompts === 2) correction = text;
+      },
+      getLastAssistantText: () =>
+        JSON.stringify(prompts === 1 ? invalid : valid),
+      setActiveToolsByName: (tools: string[]) => {
+        disabled = tools.length === 0;
+      },
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const result = await runner.run("reviewer", s);
+  assert.equal(prompts, 2);
+  assert.ok(disabled);
+  assert.match(correction, /requires a test file/);
+  assert.match(correction, /requiredTests/);
+  assert.equal(result.requiredTests[0].file, "tests/math.test.mjs");
 });
 test("persistent malformed output fails after one correction", async () => {
   const cwd = await repository();
