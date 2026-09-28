@@ -1,0 +1,18 @@
+{
+  "at": "2026-09-28T12:16:15.733Z",
+  "repository": "/var/folders/b0/1dvd759576n8fkzyv62pz_m00000gn/T/pi-team-test-2Q3g8p",
+  "projectRoot": "/private/var/folders/b0/1dvd759576n8fkzyv62pz_m00000gn/T/pi-team-test-2Q3g8p",
+  "subdirectory": "/var/folders/b0/1dvd759576n8fkzyv62pz_m00000gn/T/pi-team-test-2Q3g8p/src/module",
+  "initFiles": 13,
+  "customProjectPromptUsed": true,
+  "templatePromptUsed": false,
+  "workflowPhaseBeforeInterruption": "DONE",
+  "commit": "0b4467639c084c56403e424b8b8bf9836ce688ff",
+  "interruptedPhase": "RESEARCH",
+  "driftDetected": "configDrift",
+  "changed": [
+    "agents/solver-pragmatic.md"
+  ],
+  "statePath": "/private/var/folders/b0/1dvd759576n8fkzyv62pz_m00000gn/T/pi-team-test-2Q3g8p/.pi/team/state/95976c47-7ed1-449d-86b5-ddeee992be39.json",
+  "remoteInference": false
+}

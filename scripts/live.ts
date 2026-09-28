@@ -26,8 +26,8 @@ config.commands = [
 ];
 // Enable the optional security gates in the live acceptance run.
 config.qualityGates.pentest.enabled = true;
-await mkdir(join(cwd, ".pi"), { recursive: true });
-await writeFile(join(cwd, ".pi", "team.yaml"), YAML.stringify(config));
+await mkdir(join(cwd, ".pi", "team"), { recursive: true });
+await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(config));
 const runtime = await ModelRuntime.create({
   authPath: `${agentDir()}/auth.json`,
   modelsPath: `${agentDir()}/models.json`,

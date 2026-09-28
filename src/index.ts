@@ -10,6 +10,8 @@ import {
 } from "./integrations/pi-ask.ts";
 import { doctor } from "./integrations/doctor.ts";
 import { progress } from "./ui/progress.ts";
+import { initTeam } from "./config/init.ts";
+import { projectRoot } from "./config/project.ts";
 export default function teamExtension(pi: ExtensionAPI) {
   let active: AbortController | undefined;
   pi.on("session_start", async (_event, ctx) => {
@@ -21,6 +23,31 @@ export default function teamExtension(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", () => {
     active?.abort();
+  });
+  pi.registerCommand("team-init", {
+    description:
+      "Create project-local Pi Team configuration and agent prompts; --repair adds missing files; --from-global copies compatible legacy settings",
+    handler: async (args, ctx) => {
+      try {
+        const option = args.trim();
+        if (!["", "--repair", "--from-global"].includes(option))
+          throw new Error("Usage: /team-init [--repair|--from-global]");
+        const result = await initTeam(
+          ctx.cwd,
+          option === "--repair"
+            ? "repair"
+            : option === "--from-global"
+              ? "from-global"
+              : "default",
+        );
+        ctx.ui.notify(
+          `${result.message}\nProject: ${result.root}\nCreated:\n${result.created.join("\n") || "(none)"}\nExisting:\n${result.existing.join("\n") || "(none)"}`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(String(error), "error");
+      }
+    },
   });
   pi.registerCommand("team-stop", {
     description: "Interrupt the active team and preserve its state",
@@ -36,7 +63,7 @@ export default function teamExtension(pi: ExtensionAPI) {
     description: "Show the latest persisted team workflow",
     handler: async (args, ctx) => {
       try {
-        const store = new StateStore(ctx.cwd),
+        const store = new StateStore(await projectRoot(ctx.cwd)),
           state = args.trim()
             ? await store.load(args.trim())
             : await store.latest();
@@ -89,8 +116,12 @@ export default function teamExtension(pi: ExtensionAPI) {
           if (!state) throw new Error("No persisted workflow");
           await engine.resumeReadonly(state);
         } else {
-          const { config } = await loadConfig(ctx.cwd);
-          state = await engine.start(args.trim(), config);
+          const definition = await loadConfig(ctx.cwd);
+          state = await engine.start(
+            args.trim(),
+            definition.config,
+            definition,
+          );
         }
         const result = await engine.run(state, active.signal);
         pi.appendEntry("pi-team:workflow", {

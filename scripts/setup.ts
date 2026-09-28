@@ -44,7 +44,6 @@ if (!Object.keys(web).length) {
   );
 }
 for (const [source, target] of [
-  ["config/team.example.yaml", join(dir, "team.yaml")],
   ["config/models.example.json", join(dir, "models.json")],
 ]) {
   try {
@@ -55,5 +54,5 @@ for (const [source, target] of [
   }
 }
 console.log(
-  "Created missing Pi configuration only. Existing files preserved; credentials not printed.",
+  "Created missing Pi provider/integration configuration only. Existing files preserved; credentials not printed. Run /team-init in each repository for its team definition.",
 );

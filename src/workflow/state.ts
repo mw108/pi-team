@@ -27,7 +27,7 @@ const exactPath = z.string().superRefine((path, ctx) => {
   }
 });
 export const approvalSchema = z.object({
-  kind: z.enum(["commands", "dirtyPaths", "manualCommit"]),
+  kind: z.enum(["commands", "dirtyPaths", "manualCommit", "configDrift"]),
   title: z.string(),
   prompt: z.string(),
   options: z.array(
@@ -73,6 +73,17 @@ export const stateSchema = z.object({
   requirements: z.array(z.string()),
   phase: z.enum(phases),
   config: configSchema,
+  teamConfigPath: z.string().optional(),
+  teamConfigHash: z.string().optional(),
+  agentPromptHashes: z.record(z.string()).optional(),
+  driftCandidate: z
+    .object({
+      configPath: z.string(),
+      configHash: z.string(),
+      agentPromptHashes: z.record(z.string()),
+      changed: z.array(z.string()),
+    })
+    .optional(),
   fullCycle: z.number().int().min(1),
   localFixCycle: z.number().int().min(0),
   pentestCycle: z.number().int().min(0),

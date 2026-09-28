@@ -1,6 +1,11 @@
 import { appendFile, readFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { projectRootSync } from "../config/project.ts";
+import {
+  loadConfig,
+  snapshotDefinition,
+  type TeamDefinition,
+} from "../config/loader.ts";
 import type { AgentRunner } from "../agents/runner.ts";
 import {
   parseResult,
@@ -69,27 +74,44 @@ export class WorkflowEngine {
     readonly runner: AgentRunner,
     readonly ui: EngineUI,
   ) {
-    this.cwd = realpathSync(cwd);
+    this.cwd = projectRootSync(cwd);
     this.store = new StateStore(this.cwd);
   }
-  async start(task: string, config: TeamConfig) {
+  async start(task: string, config: TeamConfig, definition?: TeamDefinition) {
     const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
     if (root !== this.cwd)
       throw new Error("Run /team from the repository root");
-    // Local Git exclusion preserves project .gitignore and never stages workflow data.
+    const snapshot = await snapshotDefinition(
+      this.cwd,
+      config,
+      definition?.path,
+    );
+    if (
+      definition &&
+      (snapshot.configHash !== definition.configHash ||
+        JSON.stringify(snapshot.agentPromptHashes) !==
+          JSON.stringify(definition.agentPromptHashes))
+    )
+      throw new Error(
+        "Project team definition changed during workflow startup",
+      );
+    // Exclude only cache files; project team YAML and prompts are versionable.
     const exclude = resolve(
       this.cwd,
       (await git(this.cwd, ["rev-parse", "--git-path", "info/exclude"])).trim(),
     );
-    const patterns = ["/.pi/team-state/", "/.pi/team.yaml", "/.serena/"];
+    const patterns = ["/.serena/"];
     const current = await readFile(exclude, "utf8").catch(() => "");
     const missing = patterns.filter((p) => !current.split("\n").includes(p));
     if (missing.length)
       await appendFile(
         exclude,
-        `\n# Pi Team local state\n${missing.join("\n")}\n`,
+        `\n# Pi Team Serena cache\n${missing.join("\n")}\n`,
       );
     const state = newState(this.cwd, task, config, await baseline(this.cwd));
+    state.teamConfigPath = snapshot.path;
+    state.teamConfigHash = snapshot.configHash;
+    state.agentPromptHashes = snapshot.agentPromptHashes;
     record(state, "started");
     await this.store.save(state);
     return state;
@@ -179,6 +201,55 @@ export class WorkflowEngine {
           break;
         }
         this.ui.progress(s);
+        if (s.pendingApproval?.kind !== "configDrift") {
+          if (!s.teamConfigHash || !s.agentPromptHashes || !s.teamConfigPath) {
+            block(
+              s,
+              "Legacy workflow lacks project configuration and prompt hashes; start a new workflow after /team-init --from-global.",
+            );
+            break;
+          }
+          const current = await loadConfig(this.cwd);
+          const changed: string[] = [];
+          if (
+            current.path !== s.teamConfigPath ||
+            current.configHash !== s.teamConfigHash
+          )
+            changed.push("team.yaml");
+          for (const [slot, hash] of Object.entries(current.agentPromptHashes))
+            if (s.agentPromptHashes[slot] !== hash)
+              changed.push(current.config.agents[slot as Role].prompt);
+          if (changed.length) {
+            s.driftCandidate = {
+              configPath: current.path,
+              configHash: current.configHash,
+              agentPromptHashes: current.agentPromptHashes,
+              changed,
+            };
+            s.pendingApproval = {
+              kind: "configDrift",
+              title: "Project team definition changed",
+              prompt: `Review changed project team files before continuing: ${changed.join(", ")}. Abort is the safe default. Resuming restarts reasoning with the new team definition and original cycle limits; after implementation it is unavailable.`,
+              options: [
+                {
+                  value: "resume",
+                  label: "Resume with new config",
+                  description:
+                    "Restart reasoning before implementation with refreshed project prompts and config",
+                },
+                {
+                  value: "abort",
+                  label: "Abort this workflow",
+                  description: "Preserve state and repository for inspection",
+                },
+              ],
+            };
+            s.phase = "WAITING_USER";
+            record(s, "configuration_drift", changed.join(", "));
+            await this.store.save(s);
+            continue;
+          }
+        }
         if (s.phase === "WAITING_USER") {
           if (s.pendingApproval) {
             if (s.questionCount >= s.config.workflow.maxQuestions) {
@@ -246,12 +317,72 @@ export class WorkflowEngine {
                   s,
                   "Contract touches pre-existing user changes: dirty file approval denied",
                 );
+            } else if (request.kind === "configDrift") {
+              if (selected.length !== 1 || selected[0] !== "resume") {
+                block(
+                  s,
+                  "Configuration drift was not approved; state and repository preserved.",
+                );
+              } else {
+                const candidate = s.driftCandidate,
+                  current = await loadConfig(this.cwd);
+                if (
+                  !candidate ||
+                  candidate.configPath !== current.path ||
+                  candidate.configHash !== current.configHash ||
+                  JSON.stringify(candidate.agentPromptHashes) !==
+                    JSON.stringify(current.agentPromptHashes)
+                )
+                  block(
+                    s,
+                    "Team definition changed again during approval; inspect and start a new workflow.",
+                  );
+                else if (s.results.implementor || s.commitIntent || s.commit)
+                  block(
+                    s,
+                    "Project team changed after implementation; inspect repository effects and start a new workflow.",
+                  );
+                else if (
+                  Object.keys(s.results).length &&
+                  s.fullCycle >= s.config.workflow.maxFullCycles
+                )
+                  block(
+                    s,
+                    "Full design cycle limit reached before configuration refresh",
+                  );
+                else {
+                  if (Object.keys(s.results).length) s.fullCycle++;
+                  for (const role of Object.keys(phaseRoles).flatMap(
+                    (phase) => phaseRoles[phase as Phase] ?? [],
+                  ))
+                    delete s.results[role];
+                  s.config = current.config;
+                  s.teamConfigPath = current.path;
+                  s.teamConfigHash = current.configHash;
+                  s.agentPromptHashes = current.agentPromptHashes;
+                  s.phase = "ORCHESTRATE";
+                  delete s.pendingQuestion;
+                  delete s.resumePhase;
+                  delete s.gateHashes;
+                  record(
+                    s,
+                    "configuration_refresh",
+                    "Reasoning restarted with project definition",
+                  );
+                }
+              }
+              delete s.driftCandidate;
             } else
               block(
                 s,
                 "Manual commit required: inspect and stage approved dirty files yourself. Automatic commit is disabled because hunk ownership cannot be established.",
               );
-            if ((s.phase as Phase) !== "BLOCKED")
+            if ((s.phase as Phase) === "WAITING_USER")
+              s.phase = s.resumePhase ?? "RESEARCH";
+            else if (
+              (s.phase as Phase) !== "BLOCKED" &&
+              request.kind !== "configDrift"
+            )
               s.phase = s.resumePhase ?? "RESEARCH";
             delete s.pendingApproval;
             delete s.resumePhase;

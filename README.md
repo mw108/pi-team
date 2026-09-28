@@ -8,11 +8,11 @@ This setup uses Pi **0.87.1**, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena
 
 The user-facing `pi` executable is installed under `~/.local/bin`. This project and its four integration packages are registered as local Pi packages. Keep this checkout and its `node_modules` directory available.
 
-See [investigation](docs/investigation.md), [executed validation](docs/validation.md), [integration validation](docs/integration-validation.json) and [live workflow validation](docs/live-validation.json) for checks actually performed. The live workflow completed after a guarded resume; its original failure budget was preserved.
+See [investigation](docs/investigation.md), [executed validation](docs/validation.md), [project-local fixture evidence](docs/project-local-validation.json), [integration validation](docs/integration-validation.json) and [live workflow validation](docs/live-validation.json) for checks actually performed. The prior live workflow completed after a guarded resume; its original failure budget was preserved.
 
 ## Start a task
 
-Open Pi from the root of the target Git repository:
+Open Pi anywhere inside the target Git repository. Pi Team resolves its Git root for configuration, prompts, state and Git operations:
 
 ```bash
 cd /path/to/repository
@@ -22,6 +22,7 @@ pi
 Then enter:
 
 ```text
+/team-init
 /team Implement feature X according to requirement Y.
 /team doctor
 /team-status
@@ -30,7 +31,7 @@ Then enter:
 /team resume <workflow-id>
 ```
 
-`/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. It uses the configuration snapshot stored with that workflow, so later configuration edits do not silently change an in-progress run. Start a new task to apply new configuration.
+Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection.
 
 A clean Git status means there are no uncommitted changes. Existing changes are recorded and preserved. A contract that touches a path already dirty at task start waits for explicit per-file approval before implementation. Denied files remain blocked. Approved dirty files require manual commit inspection; automatic staging cannot establish hunk ownership. Unrelated pre-existing dirty files are excluded from commits. Existing staged changes prevent automatic commit.
 
@@ -61,20 +62,52 @@ Choose one registration per package; registering both the local and npm copies c
 
 ## Team configuration
 
-The configuration search order is:
+Pi Team is installed once as a global Pi extension. Its engine, commands and bootstrap templates are global; each repository owns its active definition. The configuration search order is:
 
-1. The exact file named by `PI_TEAM_CONFIG`, when set.
-2. `.pi/team.yaml` in the current repository.
-3. `~/.pi/agent/team.yaml`, or `$PI_CODING_AGENT_DIR/team.yaml`.
+1. The file named by `PI_TEAM_CONFIG`, when explicitly set (relative paths resolve from the Git root).
+2. `<repo>/.pi/team/team.yaml`.
+3. An actionable initialization error.
 
-Copy the [complete example](config/team.example.yaml), choose real provider/model IDs and optionally preapprove trusted validation commands:
+Normal `/team` execution never reads `~/.pi/agent/team.yaml` or bundled template prompts. Initialize from the [complete template](templates/team.yaml):
 
-```bash
-mkdir -p .pi
-cp /path/to/pi-team/config/team.example.yaml .pi/team.yaml
+```text
+/team-init
+# Existing .pi/team/: reports existing files, changes nothing
+/team-init --repair
+# Adds missing template files only; preserves all existing files
+/team-init --from-global
+# Copies compatible settings from the old global team.yaml and creates project prompts
 ```
 
-Each of the 13 agents has an independent `provider`, `model` and `thinking` selection. The three solvers can use the same model or different providers. Their initial contexts remain independent either way.
+The generated tree contains `.pi/team/team.yaml`, `.pi/team/agents/*.md`, `.pi/team/.gitignore` with `state/`, and `.pi/team/state/`. Initialization never commits files or edits the repository root `.gitignore`. Commit the YAML, prompts and nested `.gitignore` when they represent your team's reviewed policy; keep state private. If the directory already exists, default init does not change it. `--repair` creates only missing files. `--from-global` reads the legacy global config only when requested, transfers compatible settings into a new project YAML, preserves the old file and never overwrites an existing project YAML or prompt.
+
+Every one of the 13 fixed workflow slots has a configured logical `role`, `prompt`, `provider`, `model` and `thinking`. The prompt path is relative to `.pi/team/`. The three independent Solver instances can share a model or use different providers and prompts:
+
+```yaml
+agents:
+  solver1:
+    role: solver
+    prompt: agents/solver-architecture.md
+    provider: local
+    model: your-model-id
+    thinking: off
+  solver2:
+    role: solver
+    prompt: agents/solver-pragmatic.md
+    provider: local
+    model: your-model-id
+    thinking: off
+  solver3:
+    role: solver
+    prompt: agents/solver-alternative.md
+    provider: local
+    model: your-model-id
+    thinking: off
+```
+
+The default solver prompts favor architecture, minimal change and alternative approaches respectively, while retaining the same output contract. For a Laravel project, add its conventions to `agents/implementor.md`; for Angular, tailor `agents/reviewer.md` to component and testing patterns. A security-heavy Solver can use a separate prompt file with its own `prompt:` path, and a minimal-change Solver can favor existing patterns in `agents/solver-pragmatic.md`. Keep the required slot names and logical roles; optional pentest may be disabled, but its slot remains defined for schema consistency. Set every placeholder `model: configure-model-id` to a model Pi can resolve, or use `--from-global` to carry over known-working assignments.
+
+Project YAML and Markdown are repository-controlled input. Prompt paths must stay within `.pi/team/`, including through symlinks; missing, empty or unreadable prompts fail early. A prompt cannot grant tools or change the engine's centrally enforced role permissions. YAML cannot import modules, run shell text or bypass command approval, Git protections or local HTTP policy. Pi's normal repository instructions remain available to sessions alongside each project's role prompt.
 
 Commands are explicit executable/argument lists, not shell strings:
 
@@ -104,7 +137,7 @@ Approve repository validation commands
 [ ] ["npm", "run", "build"]      package.json scripts.build; build
 ```
 
-Select all or a subset and submit; select none to reject all. No option is automatically approved. Cancellation/noninteractive execution persists `WAITING_USER`; `/team resume` reopens the same request. Freeform text and notes cannot grant permissions. Additional custom commands are supported through reviewed configuration, not freeform approval text. `approvedCommands` and discovered source evidence are persisted only in this workflow's state, never automatically written to global configuration. Already configured argv commands count as preapproved. Configure them in repository `.pi/team.yaml` to avoid repeated prompts. Rejecting all candidates when no preapproved validation exists blocks a workflow with testing enabled.
+Select all or a subset and submit; select none to reject all. No option is automatically approved. Cancellation/noninteractive execution persists `WAITING_USER`; `/team resume` reopens the same request. Freeform text and notes cannot grant permissions. Additional custom commands are supported through reviewed configuration, not freeform approval text. `approvedCommands` and discovered source evidence are persisted only in this workflow's state, never automatically written to project configuration. Already configured argv commands count as preapproved. Configure them in repository `.pi/team/team.yaml` to avoid repeated prompts. Rejecting all candidates when no preapproved validation exists blocks a workflow with testing enabled.
 
 Deterministic Tester control executes every approved `test`/`static` command once, supplies captured stdout, stderr, exit codes and timeout evidence to the model, and overrides fabricated results. No successful checks means no PASS. The existing `purpose` values remain backward compatible: Implementor gets `development`, `test` and `static`; Code Reviewer gets `static`; Tester gets `test` and `static`; Pen Tester gets `pentest`. Rich discovery categories such as lint/build/typecheck map to `static`. Processes use `shell: false`, fixed argv and a small environment without provider credentials. Raw shells, Git executables and control/chaining tokens are rejected. An approved package script may itself run arbitrary local code, including shell commands; inspect its source before approval. These are permission controls, not an OS sandbox.
 
@@ -116,7 +149,7 @@ The configured remote base URL is exactly:
 https://overload-speak-sleek.ngrok-free.dev
 ```
 
-The discovered loaded model is `unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL`. It is registered as Pi provider `local` in the private `~/.pi/agent/models.json` and assigned to all roles in the user team configuration. The server reported a 262,144-token context window. The extension caps output at 8,192 tokens. No remote models were downloaded, loaded or unloaded.
+The discovered loaded model is `unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL`. It is registered as Pi provider `local` in the private `~/.pi/agent/models.json` and assigned to all roles in this repository's `.pi/team/team.yaml`. The server reported a 262,144-token context window. The extension caps output at 8,192 tokens. No remote models were downloaded, loaded or unloaded.
 
 The base URL remains unchanged. Pi's OpenAI-compatible client adds the protocol's `chat/completions` request path itself. Do not append `/v1` to this configured base. For a different endpoint, use the exact base it requires, which may include `/v1`.
 
@@ -252,9 +285,9 @@ The Pen Tester uses reversible probes against disposable local test data. Broade
 
 ## State, limits and recovery
 
-State is authoritative structured JSON under `.pi/team-state/<workflow-id>.json`. Atomic writes flush a temporary file before rename. State contains the task, requirements, configuration snapshot, baseline Git evidence, results, findings, questions/answers, counters, history, commit intent, discovered/approved commands, exact dirty-path approvals and pending selections. Version 1 states missing the additive fields load with empty approvals, conservative HTTP defaults and disabled hooks; no permissions are inferred during migration. Full agent conversations and private reasoning are not forwarded between roles. Read-only role sessions are fresh and in memory; phase-specific structured results form their context.
+State is authoritative structured JSON under `.pi/team/state/<workflow-id>.json`. Atomic writes flush a temporary file before rename. State contains the task, requirements, configuration snapshot, config and prompt hashes, baseline Git evidence, results, findings, questions/answers, counters, history, commit intent, discovered/approved commands, exact dirty-path approvals and pending selections. Version 1 states missing the earlier additive fields load conservatively, but workflows without project config and prompt hashes cannot resume automatically. Existing `.pi/team-state/` files are preserved and reported as legacy; start a new workflow after project initialization. Full agent conversations and private reasoning are not forwarded between roles. Read-only role sessions are fresh and in memory; phase-specific structured results form their context.
 
-The engine adds local entries to `.git/info/exclude` for state, local team configuration and Serena caches. It preserves `.gitignore`. State can contain repository source/diffs, so treat it as private. Directory/file permissions are 0700/0600 for newly created state. It is not an encrypted secret store.
+`/team-init` creates `.pi/team/.gitignore` containing `state/`; an equivalent root `.gitignore` entry is `.pi/team/state/`. The engine adds a local `.git/info/exclude` entry only for Serena caches. It preserves project ignore files and leaves team YAML/prompts available for version control. State can contain repository source/diffs, so treat it as private. Directory/file permissions are 0700/0600 for newly created state. It is not an encrypted secret store.
 
 Defaults are three full design cycles, five local repairs, two pentest runs, two agent failures, five submitted questions, 80 tool calls per invocation and a five-minute agent timeout. Counters are global to the workflow and persist through resume. One likely transient read-only failure may retry once; malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
 
@@ -288,10 +321,11 @@ cd /path/to/pi-team
 npm run check
 npm run doctor  # also available inside Pi as /team doctor
 npm run smoke
+node --import tsx scripts/project-local-smoke.ts
 node --import tsx scripts/live.ts
 ```
 
-`check` runs TypeScript checking and workflow tests covering routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, real test execution and real local commits in temporary repositories. `smoke` directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
+`check` runs TypeScript checking and workflow tests covering routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, project-local configuration and real local commits in temporary repositories. `smoke` directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. `project-local-smoke.ts` initializes a temporary repository, loads a customized project prompt through the actual Pi session factory, runs a deterministic fixture workflow from a subdirectory and checks prompt-drift gating; it writes `docs/project-local-validation.json` and does not invoke remote inference. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
 
 If the model is missing, inspect `/model`, `models.json` and the selected role's provider/model ID. The role IDs must match Pi's registry. If the ngrok endpoint changes, update the base URL and verify the model:
 

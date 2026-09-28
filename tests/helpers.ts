@@ -1,4 +1,7 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import YAML from "yaml";
+import { initTeam } from "../src/config/init.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configSchema } from "../src/config/schema.ts";
@@ -9,9 +12,15 @@ import type { WorkflowState } from "../src/workflow/state.ts";
 import type { AgentRunner } from "../src/agents/runner.ts";
 import { effectiveConfig } from "../src/agents/discovery.ts";
 export function config() {
+  const defaults = YAML.parse(
+    readFileSync(new URL("../templates/team.yaml", import.meta.url), "utf8"),
+  );
   return configSchema.parse({
     agents: Object.fromEntries(
-      roles.map((r) => [r, { provider: "fixture", model: "fixture" }]),
+      roles.map((r) => [
+        r,
+        { ...defaults.agents[r], provider: "fixture", model: "fixture" },
+      ]),
     ),
     integrations: {
       serena: { enabled: false },
@@ -132,6 +141,7 @@ export async function repository() {
     "import assert from 'node:assert/strict';import {test} from 'node:test';import {add} from '../math.js';test('addition',()=>assert.equal(add(2,3),5));\n",
   );
   await git(cwd, ["init"]);
+  await initTeam(cwd);
   await git(cwd, ["config", "user.name", "Pi Team Test"]);
   await git(cwd, ["config", "user.email", "pi-team-test@example.invalid"]);
   await git(cwd, ["add", "."]);

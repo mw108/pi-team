@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import YAML from "yaml";
 import { packagePath } from "../src/integrations/resources.ts";
-import { agentDir } from "../src/config/loader.ts";
+import { agentDir, loadConfig } from "../src/config/loader.ts";
 const baseUrl = process.argv[2];
 if (!baseUrl) throw new Error("Provide the exact endpoint base URL");
 const clientPath = pathToFileURL(
@@ -56,7 +56,7 @@ config.providers.local = {
   ],
 };
 await writeFile(path, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
-const teamPath = join(agentDir(), "team.yaml"),
+const teamPath = (await loadConfig(process.cwd())).path,
   team = YAML.parse(await readFile(teamPath, "utf8"));
 for (const role of Object.values(team.agents) as any[]) {
   if (role.provider === "local" && role.model === "configure-model-id")

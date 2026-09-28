@@ -1,8 +1,41 @@
 import { z } from "zod";
 import { roles } from "../agents/schemas.ts";
 import { httpMethods, localUrl } from "./http.ts";
+export const logicalRoles = [
+  "orchestrator",
+  "researcher",
+  "solver",
+  "critic",
+  "reviewer",
+  "implementor",
+  "code-reviewer",
+  "pentester",
+  "security-reviewer",
+  "tester",
+  "commit-agent",
+] as const;
+export const expectedRoles: Record<
+  (typeof roles)[number],
+  (typeof logicalRoles)[number]
+> = {
+  orchestrator: "orchestrator",
+  researcher: "researcher",
+  solver1: "solver",
+  solver2: "solver",
+  solver3: "solver",
+  critic: "critic",
+  reviewer: "reviewer",
+  implementor: "implementor",
+  codeReviewer: "code-reviewer",
+  pentester: "pentester",
+  securityReviewer: "security-reviewer",
+  tester: "tester",
+  commitAgent: "commit-agent",
+};
 const agent = z
   .object({
+    role: z.enum(logicalRoles),
+    prompt: z.string().min(1),
     provider: z.string().min(1),
     model: z.string().min(1),
     thinking: z
@@ -96,12 +129,14 @@ export const configSchema = z
     integrations: z
       .object({ serena: gate(true), context7: gate(true), web: gate(true) })
       .default({}),
-    agents: z.object(
-      Object.fromEntries(roles.map((r) => [r, agent])) as Record<
-        (typeof roles)[number],
-        typeof agent
-      >,
-    ),
+    agents: z
+      .object(
+        Object.fromEntries(roles.map((r) => [r, agent])) as Record<
+          (typeof roles)[number],
+          typeof agent
+        >,
+      )
+      .strict(),
     commands: z.array(commandSchema).default([]),
     commit: z.object({ runHooks: z.boolean().default(false) }).default({}),
     pentest: z
@@ -134,6 +169,14 @@ export const configSchema = z
   })
   .strict()
   .superRefine((v, ctx) => {
+    for (const slot of roles) {
+      const definition = v.agents[slot];
+      if (definition && definition.role !== expectedRoles[slot])
+        ctx.addIssue({
+          code: "custom",
+          message: `Invalid role for ${slot}: expected ${expectedRoles[slot]}`,
+        });
+    }
     for (const command of v.commands) {
       const executable = command.executable
         .split(/[\\/]/)

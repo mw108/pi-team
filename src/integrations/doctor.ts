@@ -7,6 +7,10 @@ import { roles } from "../agents/schemas.ts";
 import { readFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { agentDir, loadConfig } from "../config/loader.ts";
+import { legacyGlobalConfig } from "../config/loader.ts";
+import { projectRoot, teamRoot } from "../config/project.ts";
+import { access } from "node:fs/promises";
+import { join } from "node:path";
 import { configSchema } from "../config/schema.ts";
 import { localUrl } from "../config/http.ts";
 import { discoverCommands } from "../agents/discovery.ts";
@@ -15,8 +19,10 @@ import { git, dirtyPaths } from "../workflow/git.ts";
 import { checkAskCompatibility } from "./pi-ask.ts";
 import { packagePath } from "./resources.ts";
 export async function doctor(cwd: string) {
+  cwd = await projectRoot(cwd);
   const lines: string[] = [
     `OS ${process.platform}/${process.arch}; Node ${process.version}`,
+    `Pi Team project root: ${cwd}`,
   ];
   let ok = true;
   const check = async (label: string, run: () => Promise<string>) => {
@@ -94,6 +100,11 @@ export async function doctor(cwd: string) {
   });
   await check("Configuration", async () => {
     const { config, path } = await loadConfig(cwd);
+    lines.push(`Configuration: ${path}`);
+    for (const role of roles)
+      lines.push(
+        `Agent ${role}: ${config.agents[role].role} → ${config.agents[role].prompt}`,
+      );
     configSchema.parse(config);
     const runtime = await ModelRuntime.create({
       authPath: `${agentDir()}/auth.json`,
@@ -134,7 +145,12 @@ export async function doctor(cwd: string) {
       }
       if (!rejected) throw new Error("External-origin validation failed");
     }
-    const state = await new StateStore(cwd).latest();
+    let state;
+    try {
+      state = await new StateStore(cwd).latest();
+    } catch (error) {
+      lines.push(`Legacy state warning: ${String(error)}`);
+    }
     lines.push(`Configured commands: ${config.commands.length}`);
     lines.push(`Discovered commands: ${(await discoverCommands(cwd)).length}`);
     lines.push(
@@ -153,5 +169,17 @@ export async function doctor(cwd: string) {
     ).trim();
     return `${root}; ${paths.length} dirty paths; configured hooks ${hooks || "repository default"}`;
   });
+  for (const [label, path] of [
+    ["Legacy global config", legacyGlobalConfig()],
+    ["Legacy project config", join(cwd, ".pi", "team.yaml")],
+    ["Legacy state", join(cwd, ".pi", "team-state")],
+  ])
+    try {
+      await access(path);
+      lines.push(`${label}: present at ${path}; not used automatically`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        lines.push(`${label}: cannot inspect — ${String(error)}`);
+    }
   return { ok, lines };
 }

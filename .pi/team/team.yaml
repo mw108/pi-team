@@ -1,4 +1,4 @@
-# Example project-local team.yaml. Initialize with /team-init.
+# Migrated from the legacy global team.yaml. Original file was preserved.
 workflow:
   maxFullCycles: 3
   maxLocalFixCycles: 5
@@ -28,6 +28,101 @@ integrations:
     enabled: true
   web:
     enabled: true
+agents:
+  orchestrator:
+    role: orchestrator
+    prompt: agents/orchestrator.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  researcher:
+    role: researcher
+    prompt: agents/researcher.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  solver1:
+    role: solver
+    prompt: agents/solver-architecture.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  solver2:
+    role: solver
+    prompt: agents/solver-pragmatic.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  solver3:
+    role: solver
+    prompt: agents/solver-alternative.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  critic:
+    role: critic
+    prompt: agents/critic.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  reviewer:
+    role: reviewer
+    prompt: agents/reviewer.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  implementor:
+    role: implementor
+    prompt: agents/implementor.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  codeReviewer:
+    role: code-reviewer
+    prompt: agents/code-reviewer.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  pentester:
+    role: pentester
+    prompt: agents/pentester.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  securityReviewer:
+    role: security-reviewer
+    prompt: agents/security-reviewer.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  tester:
+    role: tester
+    prompt: agents/tester.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+  commitAgent:
+    role: commit-agent
+    prompt: agents/commit-agent.md
+    provider: local
+    model: unsloth/Qwen3-Coder-35B-A3B:Q8_K_XL
+    thinking: off
+commands:
+  - id: typecheck
+    executable: npm
+    args:
+      - run
+      - typecheck
+    purpose: static
+    timeoutMs: 120000
+  - id: test
+    executable: npm
+    args:
+      - test
+    purpose: test
+    timeoutMs: 120000
+commit:
+  runHooks: false
 pentest:
   localUrls: []
   localHttp:
@@ -37,85 +132,3 @@ pentest:
     timeoutMs: 10000
     maxRequestBodyBytes: 1048576
     maxResponseBodyBytes: 2097152
-commit:
-  runHooks: false
-commands: []
-agents:
-  orchestrator:
-    role: orchestrator
-    prompt: agents/orchestrator.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  researcher:
-    role: researcher
-    prompt: agents/researcher.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  solver1:
-    role: solver
-    prompt: agents/solver-architecture.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  solver2:
-    role: solver
-    prompt: agents/solver-pragmatic.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  solver3:
-    role: solver
-    prompt: agents/solver-alternative.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  critic:
-    role: critic
-    prompt: agents/critic.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  reviewer:
-    role: reviewer
-    prompt: agents/reviewer.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  implementor:
-    role: implementor
-    prompt: agents/implementor.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  codeReviewer:
-    role: code-reviewer
-    prompt: agents/code-reviewer.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  pentester:
-    role: pentester
-    prompt: agents/pentester.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  securityReviewer:
-    role: security-reviewer
-    prompt: agents/security-reviewer.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  tester:
-    role: tester
-    prompt: agents/tester.md
-    provider: local
-    model: configure-model-id
-    thinking: off
-  commitAgent:
-    role: commit-agent
-    prompt: agents/commit-agent.md
-    provider: local
-    model: configure-model-id
-    thinking: off

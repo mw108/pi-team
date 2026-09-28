@@ -7,11 +7,16 @@ import {
   readdir,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { projectRootSync } from "../config/project.ts";
 import { validateState, type WorkflowState } from "./state.ts";
 export class StateStore {
   readonly dir: string;
+  readonly legacyDir: string;
   constructor(cwd: string) {
-    this.dir = join(cwd, ".pi", "team-state");
+    const root = projectRootSync(cwd);
+    this.dir = join(root, ".pi", "team", "state");
+    this.legacyDir = join(root, ".pi", "team-state");
   }
   path(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid workflow ID");
@@ -35,6 +40,13 @@ export class StateStore {
     try {
       return validateState(JSON.parse(await readFile(this.path(id), "utf8")));
     } catch (e) {
+      if (
+        (e as NodeJS.ErrnoException).code === "ENOENT" &&
+        existsSync(join(this.legacyDir, `${id}.json`))
+      )
+        throw new Error(
+          `Legacy state ${id} exists at .pi/team-state/. It has no project prompt hashes and cannot be resumed automatically. Preserve and inspect it; start a new workflow after /team-init --from-global.`,
+        );
       throw new Error(
         `Cannot load workflow ${id}; original state preserved: ${String(e)}`,
       );
@@ -45,7 +57,18 @@ export class StateStore {
     try {
       entries = await readdir(this.dir);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+        if (
+          existsSync(this.legacyDir) &&
+          (await readdir(this.legacyDir)).some((n) =>
+            /^[a-f0-9-]{36}\.json$/.test(n),
+          )
+        )
+          throw new Error(
+            "Legacy workflows exist at .pi/team-state/. They lack project prompt hashes and cannot be resumed automatically. Preserve and inspect them; start a new workflow after /team-init --from-global.",
+          );
+        return undefined;
+      }
       throw e;
     }
     const states = await Promise.all(
@@ -53,6 +76,16 @@ export class StateStore {
         .filter((n) => /^[a-f0-9-]{36}\.json$/.test(n))
         .map((n) => this.load(n.slice(0, -5))),
     );
+    if (
+      !states.length &&
+      existsSync(this.legacyDir) &&
+      (await readdir(this.legacyDir)).some((n) =>
+        /^[a-f0-9-]{36}\.json$/.test(n),
+      )
+    )
+      throw new Error(
+        "Legacy workflows exist at .pi/team-state/. They lack project prompt hashes and cannot be resumed automatically. Preserve and inspect them; start a new workflow after /team-init --from-global.",
+      );
     return states.sort((a, b) =>
       (b.history.at(-1)?.at ?? "").localeCompare(a.history.at(-1)?.at ?? ""),
     )[0];

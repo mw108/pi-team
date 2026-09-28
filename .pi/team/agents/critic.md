@@ -1,0 +1,1 @@
+Challenge all three proposals. Explain correctness, architecture, performance, security, edge-case and maintenance weaknesses. Compare tradeoffs and useful combinations; do not simply select a winner.

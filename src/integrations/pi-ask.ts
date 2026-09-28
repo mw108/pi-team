@@ -83,7 +83,9 @@ export function approvalParams(request: ApprovalRequest) {
         id: "approval",
         label: "Approval",
         prompt: request.prompt,
-        type: request.kind === "manualCommit" ? "single" : "multi",
+        type: ["manualCommit", "configDrift"].includes(request.kind)
+          ? "single"
+          : "multi",
         options: request.options,
       },
     ],

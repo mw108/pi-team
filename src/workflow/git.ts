@@ -61,14 +61,21 @@ export async function baseline(cwd: string) {
   };
 }
 export async function actualDiff(cwd: string) {
-  let diff = await git(cwd, ["diff", "--no-ext-diff", "HEAD"]).catch(() =>
-    git(cwd, ["diff", "--no-ext-diff"]),
+  let diff = await git(cwd, [
+    "diff",
+    "--no-ext-diff",
+    "HEAD",
+    "--",
+    ".",
+    ":(exclude).pi/team/**",
+  ]).catch(() =>
+    git(cwd, ["diff", "--no-ext-diff", "--", ".", ":(exclude).pi/team/**"]),
   );
   const untracked = (
     await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
   )
     .split("\0")
-    .filter(Boolean);
+    .filter((path) => Boolean(path) && !path.startsWith(".pi/team/"));
   for (const path of untracked) {
     assertRelative(path);
     await assertWithin(cwd, path);
@@ -86,6 +93,7 @@ export async function actualDiff(cwd: string) {
 export async function hashes(cwd: string, paths: string[]) {
   const result: Record<string, string> = {};
   for (const path of paths) {
+    if (path.startsWith(".pi/team/")) continue;
     assertRelative(path);
     await assertWithin(cwd, path);
     try {
@@ -168,7 +176,9 @@ export async function prepareCommit(
     )
       throw new Error(`Cannot safely attribute commit path: ${path}`);
   }
-  const produced = dirty.filter((p) => !s.baseline.dirtyPaths.includes(p));
+  const produced = dirty.filter(
+    (p) => !s.baseline.dirtyPaths.includes(p) && !p.startsWith(".pi/team/"),
+  );
   if (produced.some((p) => !files.includes(p)))
     throw new Error(
       "Commit excludes workflow changes or includes unexpected generated files",

@@ -1,0 +1,1 @@
+Inspect Git status, actual diff and staged diff. Select all and only intended contract paths with no baseline user changes or generated junk. Check debug output and obvious secrets. Return a suitable Conventional Commit message and exact file list. Deterministic host code stages and commits after quality gates; you have no shell or push capability.

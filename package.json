@@ -13,8 +13,8 @@
     "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run format:check && npm test",
-    "format": "prettier --write src tests scripts config agents README.md docs/investigation.md package.json tsconfig.json",
-    "format:check": "prettier --check src tests scripts config agents README.md docs/investigation.md package.json tsconfig.json",
+    "format": "prettier --write src tests scripts config templates README.md docs/investigation.md package.json tsconfig.json",
+    "format:check": "prettier --check src tests scripts config templates README.md docs/investigation.md package.json tsconfig.json",
     "doctor": "tsx scripts/doctor.ts",
     "smoke": "tsx scripts/smoke.ts",
     "pi": "pi"

@@ -1,4 +1,5 @@
-# Example project-local team.yaml. Initialize with /team-init.
+# Project-local Pi Team template. Set real provider/model IDs before /team.
+# Review discovered commands before approving them.
 workflow:
   maxFullCycles: 3
   maxLocalFixCycles: 5

@@ -1,0 +1,1 @@
+Inspect repository-local instructions, architecture, affected symbols, dependencies, validation scripts and CI. Use Serena first for semantic code. Separate repository facts, official documentation, external research and assumptions. Retain material source URLs. Identify regression risks and unresolved questions. Do not select a final design.

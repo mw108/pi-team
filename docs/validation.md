@@ -1,5 +1,18 @@
 # Executed validation
 
+## Project-local team validation — 2026-09-28
+
+| Check | Result |
+| --- | --- |
+| `npm run check` | Passed: TypeScript, Prettier, **94 automated tests** |
+| `node --import tsx --test tests/project-local.test.ts` | 15 focused tests passed: Git-root resolution, config and prompt validation, init/migration, doctor, permissions, state and drift approval |
+| `npm run doctor` | Passed outside the filesystem sandbox: all 13 project prompts and selected model IDs found, Pi/Serena/pi-ask/Context7 checks passed; legacy global config reported but not used |
+| `node --import tsx scripts/project-local-smoke.ts` | Passed: temporary Git repo initialized, customized Solver prompt loaded by a real Pi SDK session, deterministic fixture workflow completed from a subdirectory with real tests and local commit, changed prompt paused resume |
+
+The machine-readable [project-local fixture evidence](project-local-validation.json) records a `DONE` workflow commit and subsequent `configDrift` pause for `agents/solver-pragmatic.md`. The real Pi SDK session was created to verify the project prompt; workflow agents returned deterministic fixture results, so this run did **not** test remote model inference. The fixture commit occurred only in the temporary test repository. No Git push occurred.
+
+The prior `~/.pi/agent/team.yaml` remains available for explicit `/team-init --from-global` migration, but normal `/team` no longer reads it. Old `.pi/team-state/` is diagnosed and preserved rather than merged into hashed project state. Doctor's first sandboxed attempt could not lock the existing Pi credential store; rerunning with normal filesystem access passed.
+
 ## Enhancement validation — 2026-09-28
 
 | Check                                                                                         | Result                                                                                                                                                                    |
