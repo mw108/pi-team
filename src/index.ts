@@ -9,11 +9,21 @@ import {
   checkAskCompatibility,
 } from "./integrations/pi-ask.ts";
 import { doctor } from "./integrations/doctor.ts";
-import { progress } from "./ui/progress.ts";
+import { progress, renderProgress } from "./ui/progress.ts";
+import { ProgressRuntime } from "./ui/runtime.ts";
+import type { WorkflowState } from "./workflow/state.ts";
 import { initTeam } from "./config/init.ts";
 import { projectRoot } from "./config/project.ts";
+import { AgentLogStore } from "./workflow/agent-logs.ts";
+import { roles, type Role } from "./agents/schemas.ts";
 export default function teamExtension(pi: ExtensionAPI) {
-  let active: AbortController | undefined;
+  let active:
+    | {
+        controller: AbortController;
+        runtime: ProgressRuntime;
+        state?: WorkflowState;
+      }
+    | undefined;
   pi.on("session_start", async (_event, ctx) => {
     try {
       await checkAskCompatibility();
@@ -22,7 +32,9 @@ export default function teamExtension(pi: ExtensionAPI) {
     }
   });
   pi.on("session_shutdown", () => {
-    active?.abort();
+    active?.controller.abort();
+    active?.runtime.cancel();
+    active?.runtime.dispose();
   });
   pi.registerCommand("team-init", {
     description:
@@ -52,7 +64,8 @@ export default function teamExtension(pi: ExtensionAPI) {
   pi.registerCommand("team-stop", {
     description: "Interrupt the active team and preserve its state",
     handler: async (_args, ctx) => {
-      active?.abort();
+      active?.controller.abort();
+      active?.runtime.cancel();
       ctx.ui.notify(
         "Team interruption requested; state will be saved.",
         "info",
@@ -63,17 +76,61 @@ export default function teamExtension(pi: ExtensionAPI) {
     description: "Show the latest persisted team workflow",
     handler: async (args, ctx) => {
       try {
-        const store = new StateStore(await projectRoot(ctx.cwd)),
+        const root = await projectRoot(ctx.cwd),
+          store = new StateStore(root),
+          live = active?.state?.cwd === root ? active : undefined,
           state = args.trim()
             ? await store.load(args.trim())
-            : await store.latest();
+            : (live?.state ?? (await store.latest()));
         if (state) {
-          progress(ctx, state);
+          const runtime =
+            live?.state?.id === state.id ? live.runtime : undefined;
+          if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `Workflow ${state.id}: ${state.phase}${state.blocker ? ` — ${state.blocker}` : ""}`,
+            `${renderProgress(state, runtime).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}`,
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
+      } catch (e) {
+        ctx.ui.notify(String(e), "error");
+      }
+    },
+  });
+  pi.registerCommand("team-log", {
+    description:
+      "Inspect per-agent attempt logs: /team-log [agent [--attempt N]]",
+    handler: async (args, ctx) => {
+      try {
+        const root = await projectRoot(ctx.cwd);
+        const state =
+          active?.state?.cwd === root
+            ? active.state
+            : await new StateStore(root).latest();
+        if (!state) {
+          ctx.ui.notify("No team workflow in this repository.", "info");
+          return;
+        }
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        if (
+          parts.length &&
+          (!roles.includes(parts[0] as Role) ||
+            (parts.length !== 1 &&
+              (parts.length !== 3 ||
+                parts[1] !== "--attempt" ||
+                !/^[1-9]\d*$/.test(parts[2]))))
+        )
+          throw new Error("Usage: /team-log [agent [--attempt N]]");
+        const logs = new AgentLogStore(root);
+        ctx.ui.notify(
+          parts.length
+            ? await logs.timeline(
+                state.id,
+                parts[0] as Role,
+                parts[2] ? Number(parts[2]) : undefined,
+              )
+            : await logs.overview(state.id),
+          "info",
+        );
       } catch (e) {
         ctx.ui.notify(String(e), "error");
       }
@@ -100,12 +157,20 @@ export default function teamExtension(pi: ExtensionAPI) {
         return;
       }
       await ctx.waitForIdle();
-      active = new AbortController();
+      const controller = new AbortController();
+      const runtime = new ProgressRuntime(() => {
+        if (runtime.state) progress(ctx, runtime.state, runtime);
+      });
+      active = { controller, runtime };
+      controller.signal.addEventListener("abort", () => runtime.cancel(), {
+        once: true,
+      });
       try {
         const engine = new WorkflowEngine(ctx.cwd, new PiRunner(), {
-          progress: (s) => progress(ctx, s),
+          progress: (s) => runtime.bind(s),
           ask: (q) => askUser(pi, ctx, q),
           approve: (request) => askApproval(pi, ctx, request),
+          agentEvent: (event) => runtime.event(event),
         });
         const [verb, id] = args.trim().split(/\s+/);
         let state;
@@ -123,7 +188,13 @@ export default function teamExtension(pi: ExtensionAPI) {
             definition,
           );
         }
-        const result = await engine.run(state, active.signal);
+        active.state = state;
+        runtime.configure(
+          state.config.ui.progress.refreshMs,
+          state.config.ui.progress.enabled,
+        );
+        runtime.bind(state);
+        const result = await engine.run(state, controller.signal);
         pi.appendEntry("pi-team:workflow", {
           id: result.id,
           phase: result.phase,
@@ -139,6 +210,7 @@ export default function teamExtension(pi: ExtensionAPI) {
       } catch (e) {
         ctx.ui.notify(String(e), "error");
       } finally {
+        runtime.dispose();
         active = undefined;
       }
     },

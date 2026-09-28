@@ -8,7 +8,7 @@ This setup uses Pi **0.87.1**, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena
 
 The user-facing `pi` executable is installed under `~/.local/bin`. This project and its four integration packages are registered as local Pi packages. Keep this checkout and its `node_modules` directory available.
 
-See [investigation](docs/investigation.md), [executed validation](docs/validation.md), [project-local fixture evidence](docs/project-local-validation.json), [integration validation](docs/integration-validation.json) and [live workflow validation](docs/live-validation.json) for checks actually performed. The prior live workflow completed after a guarded resume; its original failure budget was preserved.
+See [investigation](docs/investigation.md), [executed validation](docs/validation.md), [progress fixture evidence](docs/progress-validation.json), [project-local fixture evidence](docs/project-local-validation.json), [integration validation](docs/integration-validation.json) and [live workflow validation](docs/live-validation.json) for checks actually performed. The prior live workflow completed after a guarded resume; its original failure budget was preserved.
 
 ## Start a task
 
@@ -26,12 +26,28 @@ Then enter:
 /team Implement feature X according to requirement Y.
 /team doctor
 /team-status
+/team-log
+/team-log researcher
+/team-log researcher --attempt 1
 /team-stop
 /team resume
 /team resume <workflow-id>
 ```
 
 Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection.
+
+The in-place progress widget shows each agent as `○` pending, `●` running, `✓` completed, or `✗` failed; `◉` marks a pause for user input. Parallel Solvers update independently. Running agents show elapsed time, refreshed every two seconds by default, and a short activity label such as “Serena: references,” “Context7,” “Running tests,” or “Creating commit.” Tool arguments, source text, credentials and private reasoning are never included. Completed phases remain visible without adding permanent log lines. `/team-status` shows the same live information while this Pi session is running; after a restart it reports persisted state and says live timing is unavailable. `/team-stop` immediately marks running agents stopped and clears the heartbeat.
+
+“Design cycle” counts full research/design attempts; “Local fixes” counts implementation repairs. The Pentest cycle and Pen Tester/Security Reviewer appear only when pentesting is enabled. Disabled quality gates are identified explicitly. Project teams can tune the widget in `.pi/team/team.yaml`:
+
+```yaml
+ui:
+  progress:
+    enabled: true
+    refreshMs: 2000 # 500–10000
+    showToolActivity: true
+    showModels: false # optional concise model IDs
+```
 
 A clean Git status means there are no uncommitted changes. Existing changes are recorded and preserved. A contract that touches a path already dirty at task start waits for explicit per-file approval before implementation. Denied files remain blocked. Approved dirty files require manual commit inspection; automatic staging cannot establish hunk ownership. Unrelated pre-existing dirty files are excluded from commits. Existing staged changes prevent automatic commit.
 
@@ -213,6 +229,20 @@ See [mcp.example.json](config/mcp.example.json). The runner uses an isolated `cr
 
 `pi-web-access` provides `web_search` and `fetch_content` to the Researcher. The setup uses the existing `EXA_API_KEY` environment variable and an Exa provider configuration in `~/.pi/agent/web-search.json`; no search engine is implemented. Ensure Pi inherits the credential from its launching shell. Curator UI is disabled for unattended Researcher sessions. Other roles do not receive web tools by default.
 
+Activity labels describe capabilities: `web_search` is “Web search” whether Exa or another supported provider supplies it; `fetch_content` is “Web research.” The installed MCP adapter exposes a generic `mcp` tool with a nested tool name. Only known Context7 calls render as “Context7”; unknown MCP calls render as “MCP tool.” No separate `pi-exa` extension is installed in this setup. Project-specific tools can be classified in `.pi/team/team.yaml`, for example:
+
+```yaml
+toolActivity:
+  mappings:
+    "custom_search_*": { category: web-search, provider: Custom }
+    "context7_*": { category: documentation, provider: Context7 }
+ui:
+  progress:
+    showToolProvider: false
+```
+
+Exact mappings take precedence over prefix patterns. Provider names are shown only when `showToolProvider: true`; mapping values are validated and tool arguments are never displayed.
+
 ## Workflow and routing
 
 ```mermaid
@@ -289,7 +319,9 @@ State is authoritative structured JSON under `.pi/team/state/<workflow-id>.json`
 
 `/team-init` creates `.pi/team/.gitignore` containing `state/`; an equivalent root `.gitignore` entry is `.pi/team/state/`. The engine adds a local `.git/info/exclude` entry only for Serena caches. It preserves project ignore files and leaves team YAML/prompts available for version control. State can contain repository source/diffs, so treat it as private. Directory/file permissions are 0700/0600 for newly created state. It is not an encrypted secret store.
 
-Defaults are three full design cycles, five local repairs, two pentest runs, two agent failures, five submitted questions, 80 tool calls per invocation and a five-minute agent timeout. Counters are global to the workflow and persist through resume. One likely transient read-only failure may retry once; malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
+Defaults are three full design cycles, five local repairs, two pentest runs, two agent failures, five submitted questions, 80 tool calls per invocation and a five-minute fallback agent timeout. The template suggests longer budgets for local models. `agents.<role>.timeoutMs` overrides `workflow.agentTimeoutMs`; both accept 1,000–3,600,000 ms. This is one total execution budget for the agent's commands and model exchange after session setup, not an inactivity timer. Tester validation commands retain their separate `commands[].timeoutMs` budgets. Existing project YAML is never rewritten. Counters are global to the workflow and persist through resume. One likely transient read-only failure may retry once; `retry 1/1` means the second and final attempt, and the widget shows the prior failure reason. Every attempt start/failure and retry is persisted in workflow history. Malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
+
+With `logging.agentLogs.level: summary` (the default), each attempt has an append-only JSONL file at `.pi/team/state/<workflow-id>.logs/<agent>/attempt-N.jsonl`. `/team-log` lists attempts, `/team-log researcher` shows the latest timeline, and `--attempt N` selects an earlier one. `/team-status` shows the last failure and points to the logs. Summary events contain lifecycle, safe tool names/categories, duration, success or failure, and the final visible assistant text available from Pi before session disposal, capped at 64 KiB with known credential patterns redacted. They never include reasoning blocks, tool arguments, tool results, headers, queries or full provider errors. `logging.agentLogs.level: off` disables new attempt files; history still records retries. Treat logs as private because visible assistant output can contain repository data. Logs are retained after completion and tied to their state file: remove `<workflow-id>.json` and its matching `<workflow-id>.logs/` together during manual retention cleanup; Pi Team does not silently delete either.
 
 A repository lock prevents concurrent team engines. A stale lock is reclaimed only if its process no longer exists. Corrupted states fail closed and remain untouched.
 
@@ -322,10 +354,11 @@ npm run check
 npm run doctor  # also available inside Pi as /team doctor
 npm run smoke
 node --import tsx scripts/project-local-smoke.ts
+node --import tsx scripts/progress-smoke.ts
 node --import tsx scripts/live.ts
 ```
 
-`check` runs TypeScript checking and workflow tests covering routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, project-local configuration and real local commits in temporary repositories. `smoke` directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. `project-local-smoke.ts` initializes a temporary repository, loads a customized project prompt through the actual Pi session factory, runs a deterministic fixture workflow from a subdirectory and checks prompt-drift gating; it writes `docs/project-local-validation.json` and does not invoke remote inference. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
+`check` runs TypeScript checking and workflow tests covering routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, project-local configuration, progress and real local commits in temporary repositories. `smoke` directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. `project-local-smoke.ts` initializes a temporary repository, loads a customized project prompt through the actual Pi session factory, runs a deterministic fixture workflow from a subdirectory and checks prompt-drift gating; it writes `docs/project-local-validation.json` and does not invoke remote inference. `progress-smoke.ts` runs delayed fixture agents through complete workflows with pentest both disabled and enabled; it writes `docs/progress-validation.json`. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
 
 If the model is missing, inspect `/model`, `models.json` and the selected role's provider/model ID. The role IDs must match Pi's registry. If the ngrok endpoint changes, update the base URL and verify the model:
 

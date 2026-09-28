@@ -38,6 +38,7 @@ const agent = z
     prompt: z.string().min(1),
     provider: z.string().min(1),
     model: z.string().min(1),
+    timeoutMs: z.number().int().min(1000).max(3600000).optional(),
     thinking: z
       .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
       .default("off"),
@@ -108,7 +109,7 @@ export const configSchema = z
         maxPentestCycles: z.number().int().min(1).default(2),
         maxAgentFailures: z.number().int().min(1).default(2),
         maxQuestions: z.number().int().min(1).default(5),
-        agentTimeoutMs: z.number().int().min(100).default(300000),
+        agentTimeoutMs: z.number().int().min(1000).max(3600000).default(300000),
         maxToolCalls: z.number().int().min(1).default(80),
       })
       .default({}),
@@ -128,6 +129,54 @@ export const configSchema = z
       .default({}),
     integrations: z
       .object({ serena: gate(true), context7: gate(true), web: gate(true) })
+      .default({}),
+    ui: z
+      .object({
+        progress: z
+          .object({
+            enabled: z.boolean().default(true),
+            refreshMs: z.number().int().min(500).max(10000).default(2000),
+            showToolActivity: z.boolean().default(true),
+            showModels: z.boolean().default(false),
+            showToolProvider: z.boolean().default(false),
+          })
+          .default({}),
+      })
+      .default({}),
+    toolActivity: z
+      .object({
+        mappings: z
+          .record(
+            z
+              .object({
+                category: z.enum([
+                  "web-search",
+                  "web-research",
+                  "documentation",
+                  "mcp",
+                  "tool",
+                ]),
+                provider: z
+                  .string()
+                  .regex(/^[A-Za-z][A-Za-z0-9 ._-]{0,31}$/)
+                  .refine(
+                    (value) =>
+                      !/bearer|token|api.?key|secret|password/i.test(value),
+                    "Provider label may not contain credential text",
+                  )
+                  .optional(),
+              })
+              .strict(),
+          )
+          .default({}),
+      })
+      .default({}),
+    logging: z
+      .object({
+        agentLogs: z
+          .object({ level: z.enum(["off", "summary"]).default("summary") })
+          .default({}),
+      })
       .default({}),
     agents: z
       .object(
@@ -169,6 +218,12 @@ export const configSchema = z
   })
   .strict()
   .superRefine((v, ctx) => {
+    for (const pattern of Object.keys(v.toolActivity.mappings))
+      if (!/^[A-Za-z][A-Za-z0-9_.-]{0,79}\*?$/.test(pattern))
+        ctx.addIssue({
+          code: "custom",
+          message: `Invalid tool activity pattern: ${pattern}`,
+        });
     for (const slot of roles) {
       const definition = v.agents[slot];
       if (definition && definition.role !== expectedRoles[slot])

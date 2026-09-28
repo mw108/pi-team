@@ -5,7 +5,7 @@ workflow:
   maxPentestCycles: 2
   maxAgentFailures: 2
   maxQuestions: 5
-  agentTimeoutMs: 300000
+  agentTimeoutMs: 600000 # total agent execution budget; role timeoutMs overrides
   maxToolCalls: 80
 qualityGates:
   codeReview:
@@ -39,6 +39,18 @@ pentest:
     maxResponseBodyBytes: 2097152
 commit:
   runHooks: false
+ui:
+  progress:
+    enabled: true
+    refreshMs: 2000
+    showToolActivity: true
+    showModels: false
+    showToolProvider: false
+logging:
+  agentLogs:
+    level: summary
+toolActivity:
+  mappings: {}
 commands: []
 agents:
   orchestrator:
@@ -47,30 +59,35 @@ agents:
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 300000
   researcher:
     role: researcher
     prompt: agents/researcher.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 900000
   solver1:
     role: solver
     prompt: agents/solver-architecture.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 600000
   solver2:
     role: solver
     prompt: agents/solver-pragmatic.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 600000
   solver3:
     role: solver
     prompt: agents/solver-alternative.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 600000
   critic:
     role: critic
     prompt: agents/critic.md
@@ -89,18 +106,21 @@ agents:
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 1200000
   codeReviewer:
     role: code-reviewer
     prompt: agents/code-reviewer.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 900000
   pentester:
     role: pentester
     prompt: agents/pentester.md
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 1200000
   securityReviewer:
     role: security-reviewer
     prompt: agents/security-reviewer.md
@@ -119,3 +139,4 @@ agents:
     provider: local
     model: configure-model-id
     thinking: off
+    timeoutMs: 300000

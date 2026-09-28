@@ -1,13 +1,29 @@
 # Executed validation
 
+## Attempt logging and timeout validation — 2026-09-28
+
+`npm run check` passed TypeScript, Prettier and 109 automated tests; `npm run doctor` passed against the existing project configuration. The deterministic one-second Researcher fixture exercised two timed-out attempts, a visible retry reason, persisted attempt history, two separate JSONL logs, redacted visible partial output and a final blocked state. A separate one-second test verified that a provider abort rejection is preserved as a typed timeout. Additional fixtures checked tool start/end events, provider-neutral Exa/Google/custom classifications, Context7 versus generic MCP labels, `/team-log` overview/latest/explicit/missing attempts, a running attempt, and logging-off behavior. No slow remote-model run was performed for this change.
+
+Installed integration inspection found `pi-web-access` 0.32.0 registering `web_search` and `fetch_content`; its active private search provider is Exa. The installed `pi-mcp-adapter` 3.0.0 registers the `mcp` gateway, with Context7 calls addressed as `context7_resolve-library-id` and `context7_query-docs`. Pi Serena registers names including `serena_find_symbol`. No separate `pi-exa` package was found. The private provider config was inspected by key/provider name only, without reading credential values into validation output.
+
+## Live progress validation — 2026-09-28
+
+| Check                                             | Result                                                                                                                                                                                                |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`                                   | Passed: TypeScript, Prettier, **103 automated tests**                                                                                                                                                 |
+| `node --import tsx --test tests/progress.test.ts` | 9 focused tests passed: gate display, agent lifecycle, fake heartbeat, safe activity, waiting state, config bounds, independent Solvers, live `/team-status` and `/team-stop`, and observer isolation |
+| `node --import tsx scripts/progress-smoke.ts`     | Two temporary-repository workflows reached `DONE`, one with pentest disabled and one enabled; real validation commands and local commits completed                                                    |
+
+The [progress fixture evidence](progress-validation.json) records a Researcher tool label, a visible `00:01` heartbeat, one completed Solver while two were still running, and correct disabled/enabled pentest displays. Delays and agent answers were deterministic fixtures. Pi 0.87.1's installed declarations were checked for `setWidget(string[])` and `tool_execution_start`/`tool_execution_end`; no fresh slow remote-model TUI run was observed for this change. The fixture committed only within temporary repositories and performed no push.
+
 ## Project-local team validation — 2026-09-28
 
-| Check | Result |
-| --- | --- |
-| `npm run check` | Passed: TypeScript, Prettier, **94 automated tests** |
-| `node --import tsx --test tests/project-local.test.ts` | 15 focused tests passed: Git-root resolution, config and prompt validation, init/migration, doctor, permissions, state and drift approval |
-| `npm run doctor` | Passed outside the filesystem sandbox: all 13 project prompts and selected model IDs found, Pi/Serena/pi-ask/Context7 checks passed; legacy global config reported but not used |
-| `node --import tsx scripts/project-local-smoke.ts` | Passed: temporary Git repo initialized, customized Solver prompt loaded by a real Pi SDK session, deterministic fixture workflow completed from a subdirectory with real tests and local commit, changed prompt paused resume |
+| Check                                                  | Result                                                                                                                                                                                                                        |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`                                        | Passed: TypeScript, Prettier, **94 automated tests**                                                                                                                                                                          |
+| `node --import tsx --test tests/project-local.test.ts` | 15 focused tests passed: Git-root resolution, config and prompt validation, init/migration, doctor, permissions, state and drift approval                                                                                     |
+| `npm run doctor`                                       | Passed outside the filesystem sandbox: all 13 project prompts and selected model IDs found, Pi/Serena/pi-ask/Context7 checks passed; legacy global config reported but not used                                               |
+| `node --import tsx scripts/project-local-smoke.ts`     | Passed: temporary Git repo initialized, customized Solver prompt loaded by a real Pi SDK session, deterministic fixture workflow completed from a subdirectory with real tests and local commit, changed prompt paused resume |
 
 The machine-readable [project-local fixture evidence](project-local-validation.json) records a `DONE` workflow commit and subsequent `configDrift` pause for `agents/solver-pragmatic.md`. The real Pi SDK session was created to verify the project prompt; workflow agents returned deterministic fixture results, so this run did **not** test remote model inference. The fixture commit occurred only in the temporary test repository. No Git push occurred.
 

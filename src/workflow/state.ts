@@ -97,6 +97,15 @@ export const stateSchema = z.object({
       phase: z.enum(phases),
       event: z.string(),
       detail: z.string(),
+      meta: z
+        .object({
+          agent: z.enum(roles),
+          attempt: z.number().int().positive(),
+          reason: z.string().optional(),
+          timeoutMs: z.number().int().optional(),
+          durationMs: z.number().int().optional(),
+        })
+        .optional(),
     }),
   ),
   pendingQuestion: questionSchema.optional(),
@@ -169,12 +178,18 @@ export function newState(
     commandApprovalComplete: false,
   };
 }
-export function record(state: WorkflowState, event: string, detail = "") {
+export function record(
+  state: WorkflowState,
+  event: string,
+  detail = "",
+  meta?: WorkflowState["history"][number]["meta"],
+) {
   state.history.push({
     at: new Date().toISOString(),
     phase: state.phase,
     event,
     detail,
+    ...(meta ? { meta } : {}),
   });
 }
 export function block(state: WorkflowState, reason: string) {

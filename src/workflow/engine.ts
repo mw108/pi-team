@@ -43,6 +43,15 @@ import {
   type ApprovalRequest,
 } from "./state.ts";
 import { transition } from "./router.ts";
+import type { AgentEvent } from "../ui/runtime.ts";
+import {
+  AgentTimeoutError,
+  classifyFailure,
+  getAgentTimeoutMs,
+  safeFailureLabel,
+} from "../agents/errors.ts";
+import { AgentLogStore, redactVisibleText } from "./agent-logs.ts";
+import { classifyToolActivity } from "../ui/activity.ts";
 const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
@@ -66,9 +75,29 @@ export interface EngineUI {
   progress(state: WorkflowState): void;
   ask(question: Question): Promise<string | undefined>;
   approve?(request: ApprovalRequest): Promise<string[] | undefined>;
+  agentEvent?(event: AgentEvent): void;
 }
 export class WorkflowEngine {
   readonly store: StateStore;
+  readonly logs: AgentLogStore;
+  private historyWrite = Promise.resolve();
+  private async persistAttempt(
+    state: WorkflowState,
+    event: string,
+    detail: string,
+    meta: NonNullable<WorkflowState["history"][number]["meta"]>,
+  ) {
+    record(state, event, detail, meta);
+    this.historyWrite = this.historyWrite.then(() => this.store.save(state));
+    await this.historyWrite;
+  }
+  private emitAgentEvent(event: AgentEvent) {
+    try {
+      this.ui.agentEvent?.(event);
+    } catch {
+      // Progress is observational; it must not change routing or permissions.
+    }
+  }
   constructor(
     readonly cwd: string,
     readonly runner: AgentRunner,
@@ -76,6 +105,7 @@ export class WorkflowEngine {
   ) {
     this.cwd = projectRootSync(cwd);
     this.store = new StateStore(this.cwd);
+    this.logs = new AgentLogStore(this.cwd);
   }
   async start(task: string, config: TeamConfig, definition?: TeamDefinition) {
     const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
@@ -116,31 +146,196 @@ export class WorkflowEngine {
     await this.store.save(state);
     return state;
   }
-  async invoke(role: Role, s: WorkflowState, signal?: AbortSignal) {
+  async invoke(
+    role: Role,
+    s: WorkflowState,
+    signal?: AbortSignal,
+    authoritative = s,
+  ) {
     let failures = 0;
+    this.emitAgentEvent({ type: "start", role });
     for (let attempt = 0; attempt < 2; attempt++) {
+      const timeoutMs = getAgentTimeoutMs(s.config, role);
+      const prior = authoritative.history
+        .filter(
+          (h) => h.event === "agent_attempt_started" && h.meta?.agent === role,
+        )
+        .map((h) => h.meta!.attempt);
+      const logged =
+        s.config.logging.agentLogs.level === "off"
+          ? undefined
+          : await this.logs
+              .create(s.id, role, Math.max(0, ...prior) + 1)
+              .catch(() => undefined);
+      const attemptNumber = logged?.attempt ?? Math.max(0, ...prior) + 1;
+      const started = Date.now();
+      logged?.logger.append({
+        type: "agent_start",
+        agent: role,
+        attempt: attemptNumber,
+        timeoutMs,
+      });
+      await this.persistAttempt(
+        authoritative,
+        "agent_attempt_started",
+        `${role} attempt ${attemptNumber} started`,
+        { agent: role, attempt: attemptNumber, timeoutMs },
+      );
+      const calls = new Map<string, { name: string; started: number }>();
       try {
+        const result = parseResult(
+          role,
+          await this.runner.run(
+            role,
+            s,
+            signal,
+            (toolName, toolCallId, innerToolName, success) => {
+              const key = toolCallId ?? "single";
+              if (toolName) {
+                const activity = classifyToolActivity(
+                  toolName,
+                  s.config,
+                  innerToolName,
+                );
+                const rawName =
+                  toolName === "mcp" && innerToolName
+                    ? innerToolName
+                    : toolName;
+                calls.set(key, {
+                  name: /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(rawName)
+                    ? rawName
+                    : "unknown_tool",
+                  started: Date.now(),
+                });
+                logged?.logger.append({
+                  type: "tool_start",
+                  tool: calls.get(key)!.name,
+                  activity: activity.label,
+                  ...(activity.provider ? { provider: activity.provider } : {}),
+                });
+              } else {
+                const call = calls.get(key);
+                if (call) {
+                  logged?.logger.append({
+                    type: "tool_end",
+                    tool: call.name,
+                    durationMs: Date.now() - call.started,
+                    success: success ?? true,
+                  });
+                  calls.delete(key);
+                }
+              }
+              this.emitAgentEvent(
+                toolName
+                  ? {
+                      type: "activity",
+                      role,
+                      toolName,
+                      toolCallId,
+                      innerToolName,
+                    }
+                  : { type: "activityEnd", role, toolCallId },
+              );
+            },
+            attemptNumber,
+            (text) =>
+              logged?.logger.append({
+                type: "assistant_output",
+                text: redactVisibleText(text),
+              }),
+          ),
+        );
+        logged?.logger.append({
+          type: "agent_complete",
+          durationMs: Date.now() - started,
+        });
+        await logged?.logger.flush();
+        await this.persistAttempt(
+          authoritative,
+          "agent_attempt_completed",
+          `${role} attempt ${attemptNumber} completed`,
+          {
+            agent: role,
+            attempt: attemptNumber,
+            durationMs: Date.now() - started,
+          },
+        );
+        if (role !== "commitAgent" || result.type === "QUESTION_REQUEST")
+          this.emitAgentEvent({ type: "complete", role });
         return {
-          result: parseResult(role, await this.runner.run(role, s, signal)),
+          result,
           failures,
         };
       } catch (e) {
+        const category = classifyFailure(e);
+        const agentTimeoutMs =
+          e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
+        const label = safeFailureLabel(category, agentTimeoutMs);
+        const durationMs = Date.now() - started;
+        logged?.logger.append({
+          type: "provider_error",
+          category,
+          label,
+          durationMs,
+          ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
+        });
+        await logged?.logger.flush();
+        await this.persistAttempt(
+          authoritative,
+          "agent_attempt_failed",
+          `${role} attempt ${attemptNumber}: ${label}`,
+          {
+            agent: role,
+            attempt: attemptNumber,
+            reason: category,
+            durationMs,
+            ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
+          },
+        );
         if (signal?.aborted) throw e;
         failures++;
-        const transient =
-          /429|503|timeout|timed out|ECONN|fetch failed|network|rate limit/i.test(
-            String(e),
-          );
+        const transient = [
+          "timeout",
+          "http_503",
+          "rate_limit",
+          "network",
+        ].includes(category);
         if (
           s.agentFailures + failures >= s.config.workflow.maxAgentFailures ||
           attempt === 1 ||
           mutatingRoles.includes(role) ||
           !transient
         ) {
-          const error = new Error(String(e));
+          this.emitAgentEvent({ type: "fail", role, error: String(e) });
+          const error =
+            e instanceof AgentTimeoutError ? e : new Error(String(e));
           Object.assign(error, { failures });
           throw error;
         }
+        logged?.logger.append({
+          type: "retry",
+          nextAttempt: attemptNumber + 1,
+          category,
+          label,
+        });
+        await logged?.logger.flush();
+        await this.persistAttempt(
+          authoritative,
+          "agent_retry",
+          `${role} retry ${attempt + 1}/1: ${label}`,
+          {
+            agent: role,
+            attempt: attemptNumber,
+            reason: category,
+            ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
+          },
+        );
+        this.emitAgentEvent({
+          type: "retry",
+          role,
+          attempt: attempt + 1,
+          reason: label,
+        });
       }
     }
     throw new Error("Agent failed");
@@ -561,7 +756,7 @@ export class WorkflowEngine {
         const results = await Promise.allSettled(
           runRoles.map(async (role) => ({
             role,
-            ...(await this.invoke(role, structuredClone(s), signal)),
+            ...(await this.invoke(role, structuredClone(s), signal, s)),
           })),
         );
         // Failure accounting belongs to the authoritative parent, not the isolated snapshots.
@@ -597,7 +792,7 @@ export class WorkflowEngine {
               : result;
           } else {
             s.results[role] = result;
-            record(s, "agent_completed", role);
+            if (role !== "commitAgent") record(s, "agent_completed", role);
           }
         }
         delete s.inFlight;
@@ -649,12 +844,37 @@ export class WorkflowEngine {
           throw new Error("Validation changed reviewed files");
         if (s.phase === "COMMIT") {
           const result = s.results.commitAgent as any;
-          s.commitIntent = await prepareCommit(s, result.files, result.message);
-          // Persist intent before a non-idempotent operation. Interrupted commits require inspection.
-          s.inFlight = { phase: "COMMIT", roles: ["commitAgent"] };
-          await this.store.save(s);
-          s.commit = await createCommit(s);
-          delete s.inFlight;
+          try {
+            this.emitAgentEvent({
+              type: "activity",
+              role: "commitAgent",
+              toolName: "commit_inspect",
+            });
+            s.commitIntent = await prepareCommit(
+              s,
+              result.files,
+              result.message,
+            );
+            // Persist intent before a non-idempotent operation. Interrupted commits require inspection.
+            s.inFlight = { phase: "COMMIT", roles: ["commitAgent"] };
+            await this.store.save(s);
+            this.emitAgentEvent({
+              type: "activity",
+              role: "commitAgent",
+              toolName: "commit_create",
+            });
+            s.commit = await createCommit(s);
+            delete s.inFlight;
+            this.emitAgentEvent({ type: "complete", role: "commitAgent" });
+            record(s, "agent_completed", "commitAgent");
+          } catch (error) {
+            this.emitAgentEvent({
+              type: "fail",
+              role: "commitAgent",
+              error: String(error),
+            });
+            throw error;
+          }
         }
         transition(s);
         record(s, "phase_completed");

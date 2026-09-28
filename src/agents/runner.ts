@@ -32,15 +32,32 @@ import {
 import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { effectiveConfig } from "./discovery.ts";
+import { AgentTimeoutError, getAgentTimeoutMs } from "./errors.ts";
+
+export type ActivityObserver = (
+  toolName: string | undefined,
+  toolCallId?: string,
+  innerToolName?: string,
+  success?: boolean,
+) => void;
+export type OutputObserver = (text: string) => void;
 
 export interface AgentRunner {
-  run(role: Role, state: WorkflowState, signal?: AbortSignal): Promise<any>;
+  run(
+    role: Role,
+    state: WorkflowState,
+    signal?: AbortSignal,
+    activity?: ActivityObserver,
+    attempt?: number,
+    output?: OutputObserver,
+  ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
   async createSession(
     role: Role,
     s: WorkflowState,
     evidence: CommandEvidence[] = [],
+    activity?: ActivityObserver,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
       selected = config.agents[role];
@@ -102,6 +119,18 @@ export class PiRunner implements AgentRunner {
           return { block: true, reason: String(e) };
         }
       });
+      pi.on("tool_execution_start", (event) => {
+        activity?.(
+          event.toolName,
+          event.toolCallId,
+          event.toolName === "mcp" && typeof event.args?.tool === "string"
+            ? event.args.tool
+            : undefined,
+        );
+      });
+      pi.on("tool_execution_end", (event) => {
+        activity?.(undefined, event.toolCallId, undefined, !event.isError);
+      });
     };
     const schema = zodToJsonSchema(
       z.union([resultSchemas[role], questionSchema]),
@@ -159,19 +188,27 @@ export class PiRunner implements AgentRunner {
     await session.bindExtensions({ mode: "print" });
     return session;
   }
-  async run(role: Role, state: WorkflowState, signal?: AbortSignal) {
+  async run(
+    role: Role,
+    state: WorkflowState,
+    signal?: AbortSignal,
+    activity?: ActivityObserver,
+    attempt = 1,
+    output?: OutputObserver,
+  ) {
     const evidence: CommandEvidence[] = [];
-    const session = await this.createSession(role, state, evidence);
+    const session = await this.createSession(role, state, evidence, activity);
+    const timeoutMs = getAgentTimeoutMs(state.config, role);
     const executionAbort = new AbortController();
     let timedOut = false;
     const abort = () => {
       executionAbort.abort();
-      void session.abort();
+      void session.abort().catch(() => {});
     };
     const timer = setTimeout(() => {
       timedOut = true;
       abort();
-    }, state.config.workflow.agentTimeoutMs);
+    }, timeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     try {
       if (signal?.aborted) throw new Error("Workflow interrupted");
@@ -180,10 +217,16 @@ export class PiRunner implements AgentRunner {
         const required = effectiveConfig(state).commands.filter((c) =>
           ["test", "static"].includes(c.purpose),
         );
-        for (const command of required)
-          evidence.push(
-            await execute(command, state.cwd, executionAbort.signal),
-          );
+        for (const command of required) {
+          activity?.(`validation_${command.purpose}`);
+          try {
+            evidence.push(
+              await execute(command, state.cwd, executionAbort.signal),
+            );
+          } finally {
+            activity?.(undefined);
+          }
+        }
         input.verifiedCommandResults = evidence;
         // Commands are executed once by workflow control; the model analyzes their results.
         session.setActiveToolsByName(
@@ -193,11 +236,13 @@ export class PiRunner implements AgentRunner {
         );
       }
       if (timedOut || executionAbort.signal.aborted)
-        throw new Error(timedOut ? "Agent timed out" : "Workflow interrupted");
+        throw timedOut
+          ? new AgentTimeoutError(role, timeoutMs, attempt)
+          : new Error("Workflow interrupted");
       await session.prompt(JSON.stringify(input), {
         expandPromptTemplates: false,
       });
-      if (timedOut) throw new Error("Agent timed out");
+      if (timedOut) throw new AgentTimeoutError(role, timeoutMs, attempt);
       if (signal?.aborted) throw new Error("Workflow interrupted");
       const last = session.messages
         .filter((m) => m.role === "assistant")
@@ -216,7 +261,9 @@ export class PiRunner implements AgentRunner {
           { expandPromptTemplates: false },
         );
         if (timedOut || signal?.aborted)
-          throw new Error("Agent interrupted during schema correction");
+          throw timedOut
+            ? new AgentTimeoutError(role, timeoutMs, attempt)
+            : new Error("Agent interrupted during schema correction");
         result = parseText(role, session.getLastAssistantText() ?? "");
       }
       if (role === "tester" && result.type !== "QUESTION_REQUEST") {
@@ -238,7 +285,17 @@ export class PiRunner implements AgentRunner {
           throw new Error("Tester skipped a configured validation command");
       }
       return result;
+    } catch (error) {
+      if (timedOut) throw new AgentTimeoutError(role, timeoutMs, attempt);
+      throw error;
     } finally {
+      // Pi's helper extracts only assistant text blocks, never reasoning blocks.
+      try {
+        const visible = session.getLastAssistantText();
+        if (visible) output?.(visible);
+      } catch {
+        // Diagnostics must not replace an agent result or error.
+      }
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       await session.extensionRunner
