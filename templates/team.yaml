@@ -6,7 +6,7 @@ workflow:
   maxPentestCycles: 2
   maxAgentFailures: 2
   maxQuestions: 5
-  agentTimeoutMs: 600000 # total agent execution budget; role timeoutMs overrides
+  agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout
   maxToolCalls: 80
 qualityGates:
   codeReview:
@@ -70,6 +70,7 @@ agents:
     temperature: 0.1
     thinking: off
     timeoutMs: 900000
+    # timeoutMs: 0 # no wall-clock timeout; maxToolCalls and /team-stop still apply
   solver1:
     role: solver
     prompt: agents/solver-architecture.md

@@ -298,10 +298,9 @@ test("parallel solver events update each result before siblings settle", async (
 
 test("/team-status reports live agent and /team-stop removes working display", async () => {
   const cwd = await repository();
-  await writeFile(
-    join(cwd, ".pi", "team", "team.yaml"),
-    YAML.stringify(config()),
-  );
+  const cfg = config();
+  cfg.agents.researcher.timeoutMs = 0;
+  await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
   const commands = new Map<string, any>(),
     notices: string[] = [],
     widgets: string[][] = [],

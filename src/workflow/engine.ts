@@ -156,6 +156,7 @@ export class WorkflowEngine {
     this.emitAgentEvent({ type: "start", role });
     for (let attempt = 0; attempt < 2; attempt++) {
       const timeoutMs = getAgentTimeoutMs(s.config, role);
+      const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
       const prior = authoritative.history
         .filter(
           (h) => h.event === "agent_attempt_started" && h.meta?.agent === role,
@@ -173,13 +174,19 @@ export class WorkflowEngine {
         type: "agent_start",
         agent: role,
         attempt: attemptNumber,
-        timeoutMs,
+        timeoutMs: timeoutMs ?? null,
+        timeoutMode,
       });
       await this.persistAttempt(
         authoritative,
         "agent_attempt_started",
         `${role} attempt ${attemptNumber} started`,
-        { agent: role, attempt: attemptNumber, timeoutMs },
+        {
+          agent: role,
+          attempt: attemptNumber,
+          timeoutMs: timeoutMs ?? null,
+          timeoutMode,
+        },
       );
       const calls = new Map<string, { name: string; started: number }>();
       try {
@@ -267,7 +274,15 @@ export class WorkflowEngine {
           failures,
         };
       } catch (e) {
-        const category = classifyFailure(e);
+        const failure = classifyFailure(e);
+        const category =
+          e instanceof AgentTimeoutError
+            ? "timeout"
+            : signal?.aborted
+              ? "cancelled"
+              : timeoutMs === undefined && failure === "timeout"
+                ? "network"
+                : failure;
         const agentTimeoutMs =
           e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
         const label = safeFailureLabel(category, agentTimeoutMs);

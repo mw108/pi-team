@@ -1,8 +1,17 @@
 import type { Role } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
 
-export const getAgentTimeoutMs = (config: TeamConfig, role: Role) =>
-  config.agents[role].timeoutMs ?? config.workflow.agentTimeoutMs;
+export const getAgentTimeoutMs = (
+  config: TeamConfig,
+  role: Role,
+): number | undefined => {
+  const configured =
+    config.agents[role].timeoutMs ?? config.workflow.agentTimeoutMs;
+  return configured === 0 ? undefined : configured;
+};
+
+export const formatAgentTimeout = (timeoutMs: number | undefined) =>
+  timeoutMs === undefined ? "unlimited" : `${timeoutMs} ms`;
 
 export class AgentTimeoutError extends Error {
   readonly category = "timeout";
@@ -17,6 +26,7 @@ export class AgentTimeoutError extends Error {
 }
 
 export type FailureCategory =
+  | "cancelled"
   | "timeout"
   | "http_503"
   | "rate_limit"
@@ -50,6 +60,8 @@ export function safeFailureLabel(
   timeoutMs?: number,
 ) {
   switch (category) {
+    case "cancelled":
+      return "cancelled";
     case "timeout":
       return `timeout${
         timeoutMs

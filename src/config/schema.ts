@@ -39,7 +39,9 @@ const agent = z
     provider: z.string().min(1),
     model: z.string().min(1),
     temperature: z.number().finite().min(0).max(2).optional(),
-    timeoutMs: z.number().int().min(1000).max(3600000).optional(),
+    timeoutMs: z
+      .union([z.literal(0), z.number().int().min(1000).max(3600000)])
+      .optional(),
     thinking: z
       .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
       .default("off"),
@@ -110,7 +112,9 @@ export const configSchema = z
         maxPentestCycles: z.number().int().min(1).default(2),
         maxAgentFailures: z.number().int().min(1).default(2),
         maxQuestions: z.number().int().min(1).default(5),
-        agentTimeoutMs: z.number().int().min(1000).max(3600000).default(300000),
+        agentTimeoutMs: z
+          .union([z.literal(0), z.number().int().min(1000).max(3600000)])
+          .default(300000),
         maxToolCalls: z.number().int().min(1).default(80),
       })
       .default({}),

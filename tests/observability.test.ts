@@ -1,11 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { stat, readFile, realpath, appendFile } from "node:fs/promises";
+import {
+  stat,
+  readFile,
+  realpath,
+  appendFile,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
+import YAML from "yaml";
 import { config, repository, FixtureRunner, output } from "./helpers.ts";
 import { configSchema } from "../src/config/schema.ts";
 import {
   AgentTimeoutError,
+  formatAgentTimeout,
   getAgentTimeoutMs,
   classifyFailure,
 } from "../src/agents/errors.ts";
@@ -23,18 +31,38 @@ import {
 import { ProgressRuntime } from "../src/ui/runtime.ts";
 import { renderProgress } from "../src/ui/progress.ts";
 import teamExtension from "../src/index.ts";
+import { doctor } from "../src/integrations/doctor.ts";
 import type { Role } from "../src/agents/schemas.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
 
-test("role timeout takes precedence and invalid budgets are rejected", () => {
+test("agent and global timeout validation, inheritance, and runtime resolution", () => {
   const cfg = config();
   cfg.workflow.agentTimeoutMs = 300000;
   cfg.agents.researcher.timeoutMs = 900000;
   assert.equal(getAgentTimeoutMs(cfg, "researcher"), 900000);
   assert.equal(getAgentTimeoutMs(cfg, "critic"), 300000);
-  for (const timeoutMs of [0, -1, 999, 3600001, 1.5])
+  cfg.agents.researcher.timeoutMs = 0;
+  assert.equal(getAgentTimeoutMs(cfg, "researcher"), undefined);
+  assert.equal(
+    formatAgentTimeout(getAgentTimeoutMs(cfg, "researcher")),
+    "unlimited",
+  );
+  assert.equal(configSchema.safeParse(cfg).success, true);
+  cfg.workflow.agentTimeoutMs = 0;
+  assert.equal(getAgentTimeoutMs(cfg, "critic"), undefined);
+  cfg.agents.researcher.timeoutMs = 900000;
+  assert.equal(getAgentTimeoutMs(cfg, "researcher"), 900000);
+  assert.equal(
+    formatAgentTimeout(getAgentTimeoutMs(cfg, "researcher")),
+    "900000 ms",
+  );
+  assert.equal(configSchema.safeParse(cfg).success, true);
+  delete cfg.agents.researcher.timeoutMs;
+  assert.equal(getAgentTimeoutMs(cfg, "researcher"), undefined);
+  assert.equal(configSchema.safeParse(cfg).success, true);
+  for (const timeoutMs of [-1, 500, 999, 3600001, 1.5, NaN, Infinity, "1000"])
     assert.equal(
       configSchema.safeParse({
         ...cfg,
@@ -45,11 +73,187 @@ test("role timeout takes precedence and invalid budgets are rejected", () => {
       }).success,
       false,
     );
+  for (const agentTimeoutMs of [-1, 500, 3600001, 1.5, NaN, Infinity, "1000"])
+    assert.equal(
+      configSchema.safeParse({
+        ...cfg,
+        workflow: { ...cfg.workflow, agentTimeoutMs },
+      }).success,
+      false,
+    );
   const error = new AgentTimeoutError("researcher", 1000, 2);
   assert.deepEqual(
     [error.agentId, error.timeoutMs, error.attempt, classifyFailure(error)],
     ["researcher", 1000, 2, "timeout"],
   );
+});
+
+test("deterministic runner fixture: positive timeout, unlimited completion, cancellation", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.agentTimeoutMs = 1000;
+  cfg.agents.researcher.timeoutMs = 1000;
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const state = await engine.start("Timeout fixture", cfg);
+  const runner = new PiRunner();
+  let aborts = 0;
+  runner.createSession = async () => {
+    let rejectPrompt: ((error: Error) => void) | undefined;
+    return {
+      messages: [{ role: "assistant", stopReason: "end" }],
+      prompt: () =>
+        new Promise<void>((resolve, reject) => {
+          rejectPrompt = reject;
+          setTimeout(resolve, 1150);
+        }),
+      abort: async () => {
+        aborts++;
+        rejectPrompt?.(new Error("provider aborted"));
+      },
+      getLastAssistantText: () => JSON.stringify(output("researcher")),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+    } as any;
+  };
+  await assert.rejects(
+    () => runner.run("researcher", state),
+    (error: unknown) =>
+      error instanceof AgentTimeoutError && error.timeoutMs === 1000,
+  );
+  state.config.agents.researcher.timeoutMs = 0;
+  assert.deepEqual(await runner.run("researcher", state), output("researcher"));
+  const controller = new AbortController();
+  const cancelled = runner.run("researcher", state, controller.signal);
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(cancelled, /provider aborted|Workflow interrupted/);
+  assert.equal(aborts, 2);
+});
+
+test("unlimited attempts log clear mode, cancellation, and provider retry", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.agentTimeoutMs = 0;
+  cfg.agents.researcher.timeoutMs = 0;
+  const retryRunner = new FixtureRunner(async (role, _state, count) => {
+    if (role === "researcher" && count === 1)
+      throw Object.assign(new Error("provider unavailable"), { status: 503 });
+  });
+  const engine = new WorkflowEngine(cwd, retryRunner, ui);
+  const state = await engine.start("Retry fixture", cfg);
+  await engine.invoke("researcher", state);
+  assert.equal(retryRunner.counts.researcher, 2);
+  assert.deepEqual(
+    state.history
+      .filter((entry) => entry.event === "agent_retry")
+      .map((entry) => entry.meta?.reason),
+    ["http_503"],
+  );
+  assert.equal(
+    state.history.find((entry) => entry.event === "agent_attempt_started")?.meta
+      ?.timeoutMs,
+    null,
+  );
+  assert.equal(
+    state.history.find((entry) => entry.event === "agent_attempt_started")?.meta
+      ?.timeoutMode,
+    "unlimited",
+  );
+  const logs = new AgentLogStore(cwd);
+  const first = await logs.read(state.id, "researcher", 1);
+  assert.equal(first[0].timeoutMs, null);
+  assert.equal(first[0].timeoutMode, "unlimited");
+  assert.equal(
+    first.some((event) => event.category === "timeout"),
+    false,
+  );
+
+  const providerTimeoutRunner = new FixtureRunner(
+    async (role, _state, count) => {
+      if (role === "researcher" && count === 1)
+        throw new Error("provider request timed out");
+    },
+  );
+  const providerTimeoutEngine = new WorkflowEngine(
+    cwd,
+    providerTimeoutRunner,
+    ui,
+  );
+  const providerTimeoutState = await providerTimeoutEngine.start(
+    "Provider timeout fixture",
+    cfg,
+  );
+  await providerTimeoutEngine.invoke("researcher", providerTimeoutState);
+  assert.deepEqual(
+    providerTimeoutState.history
+      .filter((entry) => entry.event === "agent_retry")
+      .map((entry) => entry.meta?.reason),
+    ["network"],
+  );
+
+  const pi = new PiRunner();
+  pi.createSession = async () => {
+    let rejectPrompt: ((error: Error) => void) | undefined;
+    return {
+      messages: [],
+      prompt: () =>
+        new Promise((_resolve, reject) => {
+          rejectPrompt = reject;
+        }),
+      abort: async () => rejectPrompt?.(new Error("provider aborted")),
+      getLastAssistantText: () => "",
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+    } as any;
+  };
+  const cancelEngine = new WorkflowEngine(cwd, pi, ui);
+  const cancelState = await cancelEngine.start("Cancel fixture", cfg);
+  const controller = new AbortController();
+  const pending = cancelEngine.invoke(
+    "researcher",
+    cancelState,
+    controller.signal,
+  );
+  setTimeout(() => controller.abort(), 100);
+  await assert.rejects(pending, /provider aborted|Workflow interrupted/);
+  const cancelled = await new AgentLogStore(cwd).read(
+    cancelState.id,
+    "researcher",
+    1,
+  );
+  assert.equal(cancelled[0].timeoutMs, null);
+  assert.equal(cancelled[0].timeoutMode, "unlimited");
+  assert.equal(
+    cancelled.find((event) => event.type === "provider_error")?.category,
+    "cancelled",
+  );
+  assert.equal(
+    cancelled.some(
+      (event) => event.type === "retry" || event.category === "timeout",
+    ),
+    false,
+  );
+  assert.equal(
+    cancelState.history.find((entry) => entry.event === "agent_attempt_failed")
+      ?.meta?.reason,
+    "cancelled",
+  );
+});
+
+test("doctor displays unlimited and positive agent timeouts", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.agents.researcher.timeoutMs = 0;
+  cfg.agents.solver1.timeoutMs = 900000;
+  await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
+  const result = await doctor(cwd);
+  assert.match(result.lines.join("\n"), /researcher: .*timeout unlimited/);
+  assert.match(result.lines.join("\n"), /solver1: .*timeout 900000 ms/);
+  assert.doesNotMatch(result.lines.join("\n"), /timeout 0 ms/);
+  cfg.agents.researcher.timeoutMs = -1;
+  await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
+  const invalid = await doctor(cwd);
+  assert.equal(invalid.ok, false);
+  assert.match(invalid.lines.join("\n"), /Configuration: FAIL.*timeoutMs/s);
 });
 
 test("provider abort rejection caused by the timer remains a typed timeout", async () => {

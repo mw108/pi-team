@@ -8,7 +8,7 @@ import { StateStore } from "./persistence.ts";
 export type LogEvent = {
   type: string;
   at?: string;
-  [key: string]: string | number | boolean | undefined;
+  [key: string]: string | number | boolean | null | undefined;
 };
 
 export function redactVisibleText(text: string) {

@@ -19,6 +19,7 @@ import { git, dirtyPaths } from "../workflow/git.ts";
 import { checkAskCompatibility } from "./pi-ask.ts";
 import { packagePath } from "./resources.ts";
 import { assertTemperatureSupported } from "../agents/sampling.ts";
+import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -117,7 +118,7 @@ export async function doctor(cwd: string) {
       const present = Boolean(model),
         auth = runtime.hasConfiguredAuth(selection.provider);
       lines.push(
-        `${role}: ${selection.provider}/${selection.model}; model ${present ? "registered" : "MISSING"}; auth ${auth ? "configured" : "MISSING"}${selection.temperature === undefined ? "" : `; temperature ${selection.temperature}`}`,
+        `${role}: ${selection.provider}/${selection.model}; model ${present ? "registered" : "MISSING"}; auth ${auth ? "configured" : "MISSING"}${selection.temperature === undefined ? "" : `; temperature ${selection.temperature}`}; timeout ${formatAgentTimeout(getAgentTimeoutMs(config, role))}`,
       );
       if (!present || !auth) ok = false;
       if (model)

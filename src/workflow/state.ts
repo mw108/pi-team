@@ -102,7 +102,8 @@ export const stateSchema = z.object({
           agent: z.enum(roles),
           attempt: z.number().int().positive(),
           reason: z.string().optional(),
-          timeoutMs: z.number().int().optional(),
+          timeoutMs: z.number().int().nullable().optional(),
+          timeoutMode: z.enum(["limited", "unlimited"]).optional(),
           durationMs: z.number().int().optional(),
         })
         .optional(),

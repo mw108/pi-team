@@ -201,16 +201,21 @@ export class PiRunner implements AgentRunner {
     const evidence: CommandEvidence[] = [];
     const session = await this.createSession(role, state, evidence, activity);
     const timeoutMs = getAgentTimeoutMs(state.config, role);
-    const executionAbort = new AbortController();
+    const timeoutAbort =
+      timeoutMs === undefined ? undefined : new AbortController();
+    const executionSignal = timeoutAbort?.signal ?? signal;
     let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => {
-      executionAbort.abort();
+      if (timer) clearTimeout(timer);
+      timeoutAbort?.abort();
       void session.abort().catch(() => {});
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      abort();
-    }, timeoutMs);
+    if (timeoutMs !== undefined)
+      timer = setTimeout(() => {
+        timedOut = true;
+        abort();
+      }, timeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     try {
       if (signal?.aborted) throw new Error("Workflow interrupted");
@@ -222,9 +227,7 @@ export class PiRunner implements AgentRunner {
         for (const command of required) {
           activity?.(`validation_${command.purpose}`);
           try {
-            evidence.push(
-              await execute(command, state.cwd, executionAbort.signal),
-            );
+            evidence.push(await execute(command, state.cwd, executionSignal));
           } finally {
             activity?.(undefined);
           }
@@ -237,14 +240,14 @@ export class PiRunner implements AgentRunner {
             .filter((name) => name !== "team_command"),
         );
       }
-      if (timedOut || executionAbort.signal.aborted)
-        throw timedOut
-          ? new AgentTimeoutError(role, timeoutMs, attempt)
-          : new Error("Workflow interrupted");
+      if (timedOut && timeoutMs !== undefined)
+        throw new AgentTimeoutError(role, timeoutMs, attempt);
+      if (executionSignal?.aborted) throw new Error("Workflow interrupted");
       await session.prompt(JSON.stringify(input), {
         expandPromptTemplates: false,
       });
-      if (timedOut) throw new AgentTimeoutError(role, timeoutMs, attempt);
+      if (timedOut && timeoutMs !== undefined)
+        throw new AgentTimeoutError(role, timeoutMs, attempt);
       if (signal?.aborted) throw new Error("Workflow interrupted");
       const last = session.messages
         .filter((m) => m.role === "assistant")
@@ -262,10 +265,10 @@ export class PiRunner implements AgentRunner {
           `Your JSON DATA INSTANCE did not validate: ${String(error).slice(0, 3000)}. Correct it once, retaining factual evidence. Return a flat object with these fields: ${JSON.stringify(required)}. Do NOT return the schema itself or any wrapper object. Required instance schema: ${JSON.stringify(zodToJsonSchema(resultSchemas[role]))}. Do not perform further actions.`,
           { expandPromptTemplates: false },
         );
-        if (timedOut || signal?.aborted)
-          throw timedOut
-            ? new AgentTimeoutError(role, timeoutMs, attempt)
-            : new Error("Agent interrupted during schema correction");
+        if (timedOut && timeoutMs !== undefined)
+          throw new AgentTimeoutError(role, timeoutMs, attempt);
+        if (signal?.aborted)
+          throw new Error("Agent interrupted during schema correction");
         result = parseText(role, session.getLastAssistantText() ?? "");
       }
       if (role === "tester" && result.type !== "QUESTION_REQUEST") {
@@ -288,7 +291,8 @@ export class PiRunner implements AgentRunner {
       }
       return result;
     } catch (error) {
-      if (timedOut) throw new AgentTimeoutError(role, timeoutMs, attempt);
+      if (timedOut && timeoutMs !== undefined)
+        throw new AgentTimeoutError(role, timeoutMs, attempt);
       throw error;
     } finally {
       // Pi's helper extracts only assistant text blocks, never reasoning blocks.
@@ -298,7 +302,7 @@ export class PiRunner implements AgentRunner {
       } catch {
         // Diagnostics must not replace an agent result or error.
       }
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       await session.extensionRunner
         .emit({ type: "session_shutdown", reason: "quit" })
