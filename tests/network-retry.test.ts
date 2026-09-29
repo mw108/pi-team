@@ -17,8 +17,10 @@ import { teamRoot } from "../src/config/project.ts";
 import {
   classifyRequestFailure,
   configureNetworkRetry,
+  explainRequestFailure,
   resolveNetworkRetry,
   type NetworkRetryEvent,
+  type ProviderRequestEvent,
 } from "../src/agents/network-retry.ts";
 import { PiRunner } from "../src/agents/runner.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
@@ -85,6 +87,57 @@ function fixtureRuntime(failures: string[]) {
     runtime,
     contexts,
     options,
+    get requests() {
+      return requests;
+    },
+  };
+}
+
+function transportError(code: string): TypeError {
+  const cause = Object.assign(new Error(`read ${code}`), {
+    code,
+    syscall: "read",
+  });
+  return new TypeError("terminated", { cause });
+}
+
+function rawCauseRuntime(failures: unknown[]) {
+  let requests = 0;
+  const contexts: unknown[] = [];
+  const runtime = {
+    streamSimple: (_model: unknown, context: unknown, options: any) => {
+      requests++;
+      contexts.push(context);
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        try {
+          await options.fetch("http://localhost/fixture");
+          stream.push({
+            type: "done",
+            reason: "stop",
+            message: message("stop"),
+          });
+        } catch {
+          stream.push({
+            type: "error",
+            reason: "error",
+            error: message("error", "terminated"),
+          });
+        }
+        stream.end();
+      })();
+      return stream;
+    },
+  } as unknown as ModelRuntime;
+  const fetch = async () => {
+    const error = failures.shift();
+    if (error) throw error;
+    return new Response("ok");
+  };
+  return {
+    runtime,
+    contexts,
+    fetch,
     get requests() {
       return requests;
     },
@@ -218,6 +271,120 @@ test("request classifier limits retries to transport, 502-504, and 429", () => {
     "Tool request timed out",
   ])
     assert.equal(classifyRequestFailure(new Error(value)), undefined);
+});
+
+test("bounded classifier reports top-level and nested structured transport codes", () => {
+  for (const code of [
+    "ETIMEDOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ECONNABORTED",
+    "EPIPE",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
+    "EAI_AGAIN",
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+  ]) {
+    assert.deepEqual(explainRequestFailure({ code }), {
+      classification: "transport",
+      matchedRule: `error.code=${code}`,
+    });
+    assert.deepEqual(explainRequestFailure(transportError(code)), {
+      classification: "transport",
+      matchedRule: `cause.code=${code}`,
+    });
+  }
+  assert.deepEqual(explainRequestFailure(new TypeError("terminated")), {
+    classification: "other",
+    matchedRule: null,
+  });
+  const deep = { cause: { cause: { code: "UND_ERR_SOCKET" } } };
+  assert.equal(
+    explainRequestFailure(deep).matchedRule,
+    "cause.cause.code=UND_ERR_SOCKET",
+  );
+  const tooDeep = {
+    cause: { cause: { cause: { cause: { cause: { code: "ETIMEDOUT" } } } } },
+  };
+  assert.equal(classifyRequestFailure(tooDeep), undefined);
+  const circular: { cause?: unknown } = {};
+  circular.cause = circular;
+  assert.equal(classifyRequestFailure(circular), undefined);
+});
+
+test("nested ETIMEDOUT retries the same provider context and keeps diagnostic cause", async () => {
+  const fixture = rawCauseRuntime([transportError("ETIMEDOUT")]);
+  const network: NetworkRetryEvent[] = [];
+  const requests: ProviderRequestEvent[] = [];
+  configureNetworkRetry(
+    fixture.runtime,
+    { maxRetries: 10, delayMs: 1 },
+    () => undefined,
+    (event) => network.push(event),
+    (event) => requests.push(event),
+  );
+  const context = {
+    messages: [{ role: "user", content: "prior work" }],
+  } as any;
+  assert.equal(
+    (
+      await fixture.runtime
+        .streamSimple(model, context, { fetch: fixture.fetch })
+        .result()
+    ).stopReason,
+    "stop",
+  );
+  assert.equal(fixture.requests, 2);
+  assert.ok(fixture.contexts.every((value) => value === context));
+  assert.equal(
+    network.find((event) => event.type === "network_retry_scheduled")?.retry,
+    1,
+  );
+  assert.equal(network.at(-1)?.type, "network_recovered");
+  const failure = requests.find(
+    (event) => event.type === "provider_request_failure",
+  );
+  assert.equal(failure?.classification, "network");
+  assert.equal(failure?.matchedRule, "cause.code=ETIMEDOUT");
+  assert.equal(failure?.error?.message, "terminated");
+  assert.equal(failure?.error?.cause?.code, "ETIMEDOUT");
+  assert.equal(failure?.error?.cause?.syscall, "read");
+});
+
+test("abort takes precedence over a nested transport cause", async () => {
+  const controller = new AbortController();
+  const fixture = rawCauseRuntime([transportError("ETIMEDOUT")]);
+  const requests: ProviderRequestEvent[] = [];
+  const runtime = fixture.runtime;
+  configureNetworkRetry(
+    runtime,
+    { maxRetries: 10, delayMs: 1 },
+    () => controller.signal,
+    undefined,
+    (event) => requests.push(event),
+  );
+  const result = await runtime
+    .streamSimple(
+      model,
+      { messages: [] },
+      {
+        fetch: async () => {
+          controller.abort();
+          throw transportError("ETIMEDOUT");
+        },
+      },
+    )
+    .result();
+  assert.equal(result.stopReason, "error");
+  assert.equal(fixture.requests, 1);
+  const failure = requests.find(
+    (event) => event.type === "provider_request_failure",
+  );
+  assert.equal(failure?.classification, "other");
+  assert.equal(failure?.matchedRule, "signal=aborted");
 });
 
 test("recovery reissues one model request in the same session and disables provider retries", async () => {
@@ -434,6 +601,196 @@ test("temporary failure recovers within one engine attempt without agent failure
     await logs.timeline(state.id, "researcher"),
     /connection recovered/,
   );
+});
+
+function rawCauseRunner(
+  cfg: ReturnType<typeof config>,
+  fixture: ReturnType<typeof rawCauseRuntime>,
+) {
+  const runner = new PiRunner();
+  let sessions = 0;
+  runner.createSession = async (
+    _role,
+    _state,
+    _evidence,
+    _activity,
+    network,
+    getSignal,
+    _guard,
+    providerEvent,
+  ) => {
+    sessions++;
+    configureNetworkRetry(
+      fixture.runtime,
+      resolveNetworkRetry(cfg, "researcher"),
+      getSignal ?? (() => undefined),
+      network,
+      providerEvent,
+    );
+    const session: any = {
+      messages: [],
+      prompt: async () => {
+        session.messages.push(
+          await fixture.runtime
+            .streamSimple(
+              model,
+              { messages: session.messages },
+              { fetch: fixture.fetch },
+            )
+            .result(),
+        );
+      },
+      abort: async () => {},
+      getLastAssistantText: () => JSON.stringify(output("researcher")),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+    };
+    return session;
+  };
+  return {
+    runner,
+    get sessions() {
+      return sessions;
+    },
+  };
+}
+
+test("nested ETIMEDOUT recovers in one engine attempt and logs the matched cause", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.networkRetry = { maxRetries: 10, delayMs: 100 };
+  const fixture = rawCauseRuntime([transportError("ETIMEDOUT")]);
+  const setup = rawCauseRunner(cfg, fixture);
+  const engine = new WorkflowEngine(cwd, setup.runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Nested timeout recovery", cfg);
+  const result = await engine.invoke("researcher", state);
+  assert.equal(result.failures, 0);
+  assert.equal(state.agentFailures, 0);
+  assert.equal(setup.sessions, 1);
+  assert.equal(fixture.requests, 2);
+  const logs = new AgentLogStore(cwd);
+  assert.deepEqual(await logs.attempts(state.id, "researcher"), [1]);
+  const events = await logs.read(state.id, "researcher", 1);
+  const failure = events.find(
+    (event) => event.type === "provider_request_failure",
+  );
+  assert.equal(failure?.classification, "network");
+  assert.equal(failure?.matchedRule, "cause.code=ETIMEDOUT");
+  assert.equal((failure?.error as any)?.cause?.code, "ETIMEDOUT");
+  assert.equal(
+    events.filter((event) => event.type === "network_retry_started").length,
+    1,
+  );
+  assert.equal(
+    events.filter((event) => event.type === "network_recovered").length,
+    1,
+  );
+  assert.equal(
+    events.some((event) => event.type === "provider_error"),
+    false,
+  );
+  assert.match(
+    await logs.timeline(state.id, "researcher"),
+    /classification: network \(cause.code=ETIMEDOUT\)/,
+  );
+});
+
+test("nested ETIMEDOUT exhausts two retries in one engine attempt", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.networkRetry = { maxRetries: 2, delayMs: 100 };
+  const fixture = rawCauseRuntime(
+    Array.from({ length: 3 }, () => transportError("ETIMEDOUT")),
+  );
+  const setup = rawCauseRunner(cfg, fixture);
+  const engine = new WorkflowEngine(cwd, setup.runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Nested timeout exhaustion", cfg);
+  await assert.rejects(
+    () => engine.invoke("researcher", state),
+    /network retries exhausted; last provider code: ETIMEDOUT; Error: terminated/,
+  );
+  assert.equal(setup.sessions, 1);
+  assert.equal(fixture.requests, 3);
+  const logs = new AgentLogStore(cwd);
+  assert.deepEqual(await logs.attempts(state.id, "researcher"), [1]);
+  const events = await logs.read(state.id, "researcher", 1);
+  assert.equal(
+    events.filter((event) => event.type === "network_retry_started").length,
+    2,
+  );
+  assert.ok(events.some((event) => event.type === "network_retries_exhausted"));
+  const failure = events.find((event) => event.type === "provider_error");
+  assert.equal(failure?.classification, "network");
+  assert.equal(failure?.matchedRule, "cause.code=ETIMEDOUT");
+  assert.equal((failure?.networkRetry as any)?.currentRetry, 2);
+  assert.equal((failure?.error as any)?.cause?.code, "ETIMEDOUT");
+  assert.equal(
+    state.history.filter((event) => event.event === "agent_retry").length,
+    0,
+  );
+});
+
+test("abort cancels a nested ETIMEDOUT retry delay before another request", async () => {
+  const fixture = rawCauseRuntime([transportError("ETIMEDOUT")]);
+  const controller = new AbortController();
+  let scheduled!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    scheduled = resolve;
+  });
+  configureNetworkRetry(
+    fixture.runtime,
+    { maxRetries: 10, delayMs: 10000 },
+    () => controller.signal,
+    (event) => {
+      if (event.type === "network_retry_scheduled") scheduled();
+    },
+  );
+  const pending = fixture.runtime
+    .streamSimple(model, { messages: [] }, { fetch: fixture.fetch })
+    .result();
+  await waiting;
+  controller.abort();
+  assert.equal((await pending).stopReason, "aborted");
+  assert.equal(fixture.requests, 1);
+});
+
+test("agent wall-clock timeout wins over a later nested socket failure", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.agents.researcher.timeoutMs = 1000;
+  cfg.workflow.maxAgentFailures = 1;
+  const fixture = rawCauseRuntime([]);
+  fixture.fetch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    throw transportError("UND_ERR_SOCKET");
+  };
+  const setup = rawCauseRunner(cfg, fixture);
+  const engine = new WorkflowEngine(cwd, setup.runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Agent timeout precedence", cfg);
+  await assert.rejects(() => engine.invoke("researcher", state), /timed out/);
+  assert.equal(fixture.requests, 1);
+  const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  assert.equal(
+    events.some((event) => event.type === "network_retry_scheduled"),
+    false,
+  );
+  const request = events.find(
+    (event) => event.type === "provider_request_failure",
+  );
+  assert.equal(request?.classification, "other");
+  assert.equal(request?.matchedRule, "signal=aborted");
+  const failure = events.find((event) => event.type === "provider_error");
+  assert.equal(failure?.classification, "timeout");
+  assert.equal(failure?.matchedRule, "AgentTimeoutError");
 });
 
 test("unlimited retry recovers; abort interrupts delay promptly", async () => {

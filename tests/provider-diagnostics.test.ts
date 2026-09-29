@@ -24,6 +24,7 @@ import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { renderProgress } from "../src/ui/progress.ts";
 import type { AgentRunner } from "../src/agents/runner.ts";
+import { AgentDoomLoopError } from "../src/agents/errors.ts";
 
 test("unlimited tool budget is explicit in provider failure diagnostics", async () => {
   const cwd = await repository();
@@ -207,7 +208,7 @@ test("provider request numbers and durations identify the third 300-second failu
   assert.equal(failure?.matchedRule, null);
 });
 
-test("OpenAI-compatible stream keeps the raw body failure cause without adding a retry", async () => {
+test("OpenAI-compatible stream retries a raw body failure with nested socket cause", async () => {
   const localModel = {
     ...model,
     name: "Fixture",
@@ -264,13 +265,14 @@ test("OpenAI-compatible stream keeps the raw body failure cause without adding a
   await runtime
     .streamSimple(localModel, context, { apiKey: "local", fetch: fetchMock })
     .result();
-  assert.equal(fetches, 1);
+  assert.equal(fetches, 2);
   const failure = events.find(
     (event) => event.type === "provider_request_failure",
   );
   assert.equal(failure?.error?.message, "terminated");
   assert.equal(failure?.error?.cause?.code, "UND_ERR_SOCKET");
-  assert.equal(failure?.classification, "other");
+  assert.equal(failure?.classification, "network");
+  assert.equal(failure?.matchedRule, "cause.code=UND_ERR_SOCKET");
 });
 
 test("summary attempt log and status retain provider cause, timing and guard context", async () => {
@@ -514,4 +516,61 @@ test("provider failure retains Doom-Loop finalization and exhausted tool budget 
     2,
   );
   assert.equal(failure?.toolBudgetExhausted, true);
+});
+
+test("Doom-Loop finalization keeps precedence over a prior transport diagnostic", async () => {
+  const cwd = await repository();
+  const runner: AgentRunner = {
+    async run(
+      _role,
+      _state,
+      _signal,
+      _activity,
+      _attempt,
+      _output,
+      _network,
+      _registry,
+      _guard,
+      providerEvent,
+    ) {
+      providerEvent?.({
+        type: "provider_request_failure",
+        providerRequest: 1,
+        provider: "local",
+        model: "fixture",
+        api: "openai-completions",
+        networkRetry: 0,
+        requestStartedAt: new Date().toISOString(),
+        error: serializeErrorDiagnostics(
+          new TypeError("terminated", {
+            cause: Object.assign(new Error("socket closed"), {
+              code: "UND_ERR_SOCKET",
+            }),
+          }),
+        ),
+        classification: "network",
+        matchedRule: "cause.code=UND_ERR_SOCKET",
+        doomLoop: { interventions: 2, toolsDisabledForFinalization: true },
+        toolBudgetExhausted: true,
+      });
+      throw new AgentDoomLoopError("researcher", 1, 2);
+    },
+  };
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("doom transport precedence", config());
+  await assert.rejects(
+    () => engine.invoke("researcher", state),
+    AgentDoomLoopError,
+  );
+  const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  const failure = events.find((event) => event.type === "provider_error");
+  assert.equal(failure?.classification, "doom_loop");
+  assert.equal(failure?.matchedRule, "AgentDoomLoopError");
+  assert.equal(
+    events.some((event) => event.type === "network_retry_scheduled"),
+    false,
+  );
 });

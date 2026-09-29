@@ -59,7 +59,7 @@ export type ProviderRequestEvent = {
   timeSinceLastActivityMs?: number;
   success?: boolean;
   error?: ErrorDiagnostics;
-  classification?: NetworkRetryCategory | "other";
+  classification?: "network" | "provider" | "rate_limit" | "other";
   matchedRule?: string | null;
   providerTimeouts?: {
     requestTimeoutMs?: number;
@@ -86,27 +86,50 @@ const transportCodes = new Set([
 export function classifyRequestFailure(
   error: unknown,
 ): NetworkRetryCategory | undefined {
-  const value = error as {
-    status?: number;
-    statusCode?: number;
-    code?: string;
-    cause?: unknown;
-    message?: string;
-  } | null;
-  const status = value?.status ?? value?.statusCode;
-  if (status === 429) return "rate_limit";
-  if (status === 502 || status === 503 || status === 504) return "provider";
-  if (typeof status === "number") return undefined;
-  if (value?.code && transportCodes.has(value.code)) return "transport";
-  if (value?.cause && classifyRequestFailure(value.cause) === "transport")
-    return "transport";
-  const message = value?.message ?? String(error);
+  const category = explainRequestFailure(error).classification;
+  return category === "other" ? undefined : category;
+}
+
+/** Classify the same bounded, safe cause chain retained in provider diagnostics. */
+export function explainRequestFailure(error: unknown): {
+  classification: NetworkRetryCategory | "other";
+  matchedRule: string | null;
+} {
+  const diagnostic = serializeErrorDiagnostics(error);
+  let current: ErrorDiagnostics | undefined = diagnostic;
+  for (let depth = 0; current && depth < 5; depth++, current = current.cause) {
+    const path = depth === 0 ? "error" : `cause${".cause".repeat(depth - 1)}`;
+    const status = current.status ?? current.statusCode;
+    if (status === 429)
+      return {
+        classification: "rate_limit",
+        matchedRule: `${path}.status=429`,
+      };
+    if (status === 502 || status === 503 || status === 504)
+      return {
+        classification: "provider",
+        matchedRule: `${path}.status=${status}`,
+      };
+    if (typeof status === "number")
+      return { classification: "other", matchedRule: null };
+    if (typeof current.code === "string" && transportCodes.has(current.code))
+      return {
+        classification: "transport",
+        matchedRule: `${path}.code=${current.code}`,
+      };
+  }
+  const message = diagnostic.message ?? "";
   const http = /^(?:HTTP\s+)?(\d{3})\b/i.exec(message);
   if (http) {
     const code = Number(http[1]);
-    if (code === 429) return "rate_limit";
-    if ([502, 503, 504].includes(code)) return "provider";
-    return undefined;
+    if (code === 429)
+      return {
+        classification: "rate_limit",
+        matchedRule: "message=rate_limit",
+      };
+    if ([502, 503, 504].includes(code))
+      return { classification: "provider", matchedRule: "message=provider" };
+    return { classification: "other", matchedRule: null };
   }
   // Pi's provider adapters flatten SDK exceptions into assistant.errorMessage.
   // These exact SDK/adapter messages retain the transport meaning after codes are lost.
@@ -115,45 +138,14 @@ export function classifyRequestFailure(
       message.trim(),
     )
   )
-    return "transport";
+    return { classification: "transport", matchedRule: "message=transport" };
   if (
     /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|EAI_AGAIN|UND_ERR_(?:CONNECT_TIMEOUT|SOCKET|HEADERS_TIMEOUT|BODY_TIMEOUT))\b|socket hang up|connection reset|connection closed unexpectedly|network unreachable|fetch failed|websocket (?:disconnect|closed)|SSE connection interrupted|temporary DNS/i.test(
       message,
     )
   )
-    return "transport";
-  return undefined;
-}
-
-/** Explain a classification without changing the retry classifier's decision. */
-export function explainRequestFailure(error: unknown): {
-  classification: NetworkRetryCategory | "other";
-  matchedRule: string | null;
-} {
-  const category = classifyRequestFailure(error);
-  if (!category) return { classification: "other", matchedRule: null };
-  const walk = (value: unknown, depth = 0): string | null => {
-    if (depth >= 5 || !value || typeof value !== "object") return null;
-    const item = value as {
-      code?: string;
-      cause?: unknown;
-      status?: number;
-      statusCode?: number;
-    };
-    if (item.status === 429 || item.statusCode === 429) return "status=429";
-    if ([502, 503, 504].includes(item.status ?? item.statusCode ?? 0))
-      return `status=${item.status ?? item.statusCode}`;
-    if (item.code && transportCodes.has(item.code))
-      return `${depth ? "cause." : ""}code=${item.code}`;
-    return walk(item.cause, depth + 1);
-  };
-  const message =
-    typeof error === "string"
-      ? error
-      : (error as { message?: string })?.message;
-  const rule =
-    walk(error) ?? (typeof message === "string" ? `message=${category}` : null);
-  return { classification: category, matchedRule: rule };
+    return { classification: "transport", matchedRule: "message=transport" };
+  return { classification: "other", matchedRule: null };
 }
 
 function retryAfterMs(value: string | null): number | undefined {
@@ -296,14 +288,7 @@ export function configureNetworkRetry(
         } catch (error) {
           rawError ??= error;
           // A synchronous provider failure has no assistant event to forward.
-          const category = classifyRequestFailure(error);
-          if (!category || signal?.aborted) {
-            events = [
-              providerErrorEvent(model, String(error), signal?.aborted),
-            ];
-          } else {
-            events = [providerErrorEvent(model, String(error))];
-          }
+          events = [providerErrorEvent(model, String(error), signal?.aborted)];
         }
         const terminal = events.at(-1);
         const failed = terminal?.type === "error";
@@ -323,10 +308,15 @@ export function configureNetworkRetry(
                 new Error(terminal.error.errorMessage ?? "Provider error"),
             )
           : undefined;
-        // The retry decision below sees Pi's terminal errorMessage, which may
-        // have already lost a transport cause. Report that exact decision input.
+        // Pi may flatten the terminal message; prefer the original structured
+        // error and use that same evidence for the decision and diagnostics.
         const classification = failed
-          ? explainRequestFailure(terminal.error.errorMessage)
+          ? signal?.aborted
+            ? {
+                classification: "other" as const,
+                matchedRule: "signal=aborted",
+              }
+            : explainRequestFailure(rawError ?? terminal.error.errorMessage)
           : undefined;
         if (failed)
           observeRequest?.({
@@ -334,7 +324,11 @@ export function configureNetworkRetry(
             ...identity,
             ...timing,
             error: diagnosticError,
-            ...classification,
+            classification:
+              classification?.classification === "transport"
+                ? "network"
+                : classification?.classification,
+            matchedRule: classification?.matchedRule,
             providerTimeouts,
           });
         observeRequest?.({
@@ -345,7 +339,9 @@ export function configureNetworkRetry(
         });
         const category =
           terminal?.type === "error" && !signal?.aborted
-            ? classifyRequestFailure(terminal.error?.errorMessage)
+            ? classification?.classification === "other"
+              ? undefined
+              : classification?.classification
             : undefined;
         if (!category) {
           for (const event of events) result.push(event);

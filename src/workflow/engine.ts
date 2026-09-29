@@ -526,6 +526,7 @@ export class WorkflowEngine {
       let failedRequest:
         (ProviderRequestEvent & Record<string, unknown>) | undefined;
       let networkRetries = 0;
+      let networkRetriesExhausted = false;
       try {
         if (trigger === "manual_retry")
           logged?.logger.append({
@@ -616,6 +617,8 @@ export class WorkflowEngine {
               }),
             (event) => {
               networkRetries = Math.max(networkRetries, event.retry);
+              if (event.type === "network_retries_exhausted")
+                networkRetriesExhausted = true;
               logged?.logger.append({
                 ...event,
                 agentAttempt: attemptNumber,
@@ -835,7 +838,14 @@ export class WorkflowEngine {
           throw new AgentAbortedByUserError(role, attemptNumber);
         }
         const failure = classifyFailure(e);
-        const failureRule = explainFailure(e).matchedRule;
+        const transportFailure = failedRequest?.classification === "network";
+        const failureRule =
+          transportFailure &&
+          !(e instanceof AgentTimeoutError) &&
+          !(e instanceof AgentDoomLoopError) &&
+          !signal?.aborted
+            ? (failedRequest?.matchedRule ?? null)
+            : explainFailure(e).matchedRule;
         if (e instanceof AgentDoomLoopError) {
           logged?.logger.append({
             type: "doom_loop_failed",
@@ -850,11 +860,15 @@ export class WorkflowEngine {
           );
         }
         const category =
-          e instanceof AgentTimeoutError
-            ? "timeout"
-            : signal?.aborted
-              ? "cancelled"
-              : failure;
+          e instanceof AgentDoomLoopError
+            ? "doom_loop"
+            : e instanceof AgentTimeoutError
+              ? "timeout"
+              : signal?.aborted
+                ? "cancelled"
+                : transportFailure
+                  ? "network"
+                  : failure;
         const agentTimeoutMs =
           e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
         const label = safeFailureLabel(category, agentTimeoutMs);
@@ -960,12 +974,16 @@ export class WorkflowEngine {
           !transient
         ) {
           this.emitAgentEvent({ type: "fail", role, error: String(e) });
-          const error =
+          const terminalError =
             e instanceof AgentTimeoutError || e instanceof AgentDoomLoopError
               ? e
-              : new Error(String(e));
-          Object.assign(error, { failures });
-          throw error;
+              : new Error(
+                  category === "network" && networkRetriesExhausted
+                    ? `network retries exhausted; last provider code: ${firstErrorCode(error) ?? "unknown"}; ${String(e)}`
+                    : String(e),
+                );
+          Object.assign(terminalError, { failures });
+          throw terminalError;
         }
         logged?.logger.append({
           type: "retry",
