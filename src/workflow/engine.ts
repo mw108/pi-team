@@ -43,7 +43,8 @@ import {
   type Phase,
   type ApprovalRequest,
 } from "./state.ts";
-import { transition } from "./router.ts";
+import { phaseRoles, transition } from "./router.ts";
+import { getWorkflowRecoveryPlan } from "./recovery.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -74,20 +75,6 @@ import {
   fallbackReport,
   type CompletionReportInput,
 } from "./report.ts";
-const phaseRoles: Partial<Record<Phase, Role[]>> = {
-  ORCHESTRATE: ["orchestrator"],
-  RESEARCH: ["researcher"],
-  SOLVE: ["solver1", "solver2", "solver3"],
-  CRITIQUE: ["critic"],
-  REVIEW: ["reviewer"],
-  IMPLEMENT: ["implementor"],
-  CODE_REVIEW: ["codeReviewer"],
-  PENTEST: ["pentester"],
-  SECURITY_REVIEW: ["securityReviewer"],
-  TEST: ["tester"],
-  COMMIT: ["commitAgent"],
-  REPORT: ["reporter"],
-};
 const mutatingRoles: Role[] = [
   "implementor",
   "tester",
@@ -117,6 +104,7 @@ export class WorkflowEngine {
   private pendingRewind?: { workflowId: string; role: Role; phase: Phase };
   private running = false;
   private runningWorkflowId?: string;
+  private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
   private async persistAttempt(
     state: WorkflowState,
@@ -484,10 +472,13 @@ export class WorkflowEngine {
   ) {
     let failures = 0;
     let automaticRetries = 0;
-    let trigger: "initial" | "automatic_retry" | "manual_retry" =
+    let trigger:
+      "initial" | "automatic_retry" | "manual_retry" | "manual_continue" =
       manualStart || authoritative.manualRetry?.agent === role
         ? "manual_retry"
-        : "initial";
+        : authoritative.phase === this.continuingPhase
+          ? "manual_continue"
+          : "initial";
     for (;;) {
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
@@ -1044,8 +1035,39 @@ export class WorkflowEngine {
     delete s.blocker;
     await this.store.save(s);
   }
-  async run(s: WorkflowState, signal?: AbortSignal) {
+  async continueBlocked(s: WorkflowState, signal?: AbortSignal) {
     const unlock = await this.store.lock();
+    let handedToRun = false;
+    try {
+      const latest = await this.store.load(s.id);
+      const plan = await getWorkflowRecoveryPlan(
+        latest,
+        this.cwd,
+        this.running || this.activeAttempts.size > 0,
+      );
+      if (plan.kind !== "continue") throw new Error(plan.reason);
+      for (const key of Object.keys(s))
+        delete (s as Record<string, unknown>)[key];
+      Object.assign(s, latest);
+      record(s, "workflow_continue_requested", "", undefined);
+      s.phase = plan.nextPhase;
+      delete s.blocker;
+      record(s, "workflow_continued", plan.nextPhase);
+      this.continuingPhase = plan.nextPhase;
+      await this.store.save(s);
+      handedToRun = true;
+      return await this.run(s, signal, unlock);
+    } finally {
+      this.continuingPhase = undefined;
+      if (!handedToRun) await unlock();
+    }
+  }
+  async run(
+    s: WorkflowState,
+    signal?: AbortSignal,
+    existingUnlock?: () => Promise<void>,
+  ) {
+    const unlock = existingUnlock ?? (await this.store.lock());
     this.running = true;
     this.runningWorkflowId = s.id;
     try {
@@ -1467,6 +1489,7 @@ export class WorkflowEngine {
             };
           }),
         );
+        if (this.continuingPhase === s.phase) this.continuingPhase = undefined;
         // Failure accounting belongs to the authoritative parent, not the isolated snapshots.
         let error: string | undefined;
         let aborted: Role | undefined;

@@ -15,6 +15,10 @@ import type { WorkflowState } from "./workflow/state.ts";
 import { initTeam } from "./config/init.ts";
 import { projectRoot } from "./config/project.ts";
 import { AgentLogStore } from "./workflow/agent-logs.ts";
+import {
+  getWorkflowRecoveryPlan,
+  recoveryAction,
+} from "./workflow/recovery.ts";
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
 import { getAgentDisplayName } from "./ui/agent-name.ts";
 import {
@@ -35,7 +39,11 @@ async function completionText(state: WorkflowState) {
 }
 async function finalText(state: WorkflowState) {
   if (state.phase === "DONE") return completionText(state);
-  if (state.phase === "BLOCKED") return renderBlocked(state);
+  if (state.phase === "BLOCKED")
+    return renderBlocked(
+      state,
+      await getWorkflowRecoveryPlan(state, state.cwd),
+    );
   return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
 }
 export default function teamExtension(pi: ExtensionAPI) {
@@ -47,6 +55,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         engine?: WorkflowEngine;
       }
     | undefined;
+  let continuationPending = false;
   pi.on("session_start", async (_event, ctx) => {
     try {
       await checkAskCompatibility();
@@ -227,6 +236,57 @@ export default function teamExtension(pi: ExtensionAPI) {
       }
     },
   });
+  pi.registerCommand("team-continue", {
+    description:
+      "Continue a blocked workflow from the next safe incomplete phase.",
+    handler: async (args, ctx) => {
+      if (args.trim()) {
+        ctx.ui.notify("Usage: /team-continue", "error");
+        return;
+      }
+      if (continuationPending || active) {
+        ctx.ui.notify("Workflow is already continuing/running.", "warning");
+        return;
+      }
+      continuationPending = true;
+      let runtime: ProgressRuntime | undefined;
+      try {
+        const root = await projectRoot(ctx.cwd);
+        const state = await new StateStore(root).latest();
+        if (!state) throw new Error("No team workflow in this repository.");
+        const plan = await getWorkflowRecoveryPlan(state, root);
+        if (plan.kind !== "continue") throw new Error(plan.reason);
+        await ctx.waitForIdle();
+        runtime = new ProgressRuntime(() => {
+          if (runtime?.state) progress(ctx, runtime.state, runtime);
+        });
+        const controller = new AbortController();
+        const engine = new WorkflowEngine(root, new PiRunner(), {
+          progress: (s) => runtime!.bind(s),
+          ask: (q) => askUser(pi, ctx, q),
+          approve: (request) => askApproval(pi, ctx, request),
+          agentEvent: (event) => runtime!.event(event),
+        });
+        active = { controller, runtime, state, engine };
+        runtime.configure(
+          state.config.ui.progress.refreshMs,
+          state.config.ui.progress.enabled,
+        );
+        runtime.bind(state);
+        const finished = await engine.continueBlocked(state, controller.signal);
+        ctx.ui.notify(
+          await finalText(finished),
+          finished.phase === "BLOCKED" ? "error" : "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(String(error), "error");
+      } finally {
+        runtime?.dispose();
+        active = undefined;
+        continuationPending = false;
+      }
+    },
+  });
   pi.registerCommand("team-status", {
     description: "Show the latest persisted team workflow",
     handler: async (args, ctx) => {
@@ -238,11 +298,19 @@ export default function teamExtension(pi: ExtensionAPI) {
             ? await store.load(args.trim())
             : (live?.state ?? (await store.latest()));
         if (state) {
+          const recovery =
+            state.phase === "BLOCKED"
+              ? await getWorkflowRecoveryPlan(
+                  state,
+                  root,
+                  Boolean(live?.state?.id === state.id && live.engine),
+                )
+              : undefined;
           const runtime =
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id>`,
+            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
@@ -274,7 +342,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           state.phase === "DONE"
             ? await completionText(state)
             : state.phase === "BLOCKED"
-              ? renderBlocked(state)
+              ? renderBlocked(state, await getWorkflowRecoveryPlan(state, root))
               : `Report is not final yet.\nCurrent phase: ${state.phase}`,
           "info",
         );

@@ -123,7 +123,12 @@ export const stateSchema = z.object({
             })
             .optional(),
           trigger: z
-            .enum(["initial", "automatic_retry", "manual_retry"])
+            .enum([
+              "initial",
+              "automatic_retry",
+              "manual_retry",
+              "manual_continue",
+            ])
             .optional(),
         })
         .optional(),

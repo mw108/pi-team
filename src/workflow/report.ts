@@ -2,6 +2,7 @@ import { completionReportSchema, roles, type Role } from "../agents/schemas.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { dirtyPaths } from "./git.ts";
 import type { WorkflowState } from "./state.ts";
+import { recoveryAction, type WorkflowRecoveryPlan } from "./recovery.ts";
 
 export type CompletionReport = ReturnType<typeof completionReportSchema.parse>;
 export interface ValidationCommandResult {
@@ -304,7 +305,10 @@ export function renderReport(report: CompletionReport, failure?: string) {
   return lines.join("\n");
 }
 
-export function renderBlocked(s: WorkflowState) {
+export function renderBlocked(
+  s: WorkflowState,
+  recovery?: WorkflowRecoveryPlan,
+) {
   const stopped =
     s.history.findLast((entry) => entry.event === "blocked")?.phase ?? s.phase;
   const failed = s.history.findLast(
@@ -331,15 +335,17 @@ export function renderBlocked(s: WorkflowState) {
       entry.event === "agent_attempt_failed" &&
       (!role || entry.meta?.agent === role),
   )?.meta;
-  const next = s.pendingQuestion
-    ? "Answer the pending question."
-    : s.blocker?.includes("repository") ||
-        s.blocker?.includes("commit") ||
-        s.blocker?.includes("mutating")
-      ? "Inspect repository changes before retrying."
-      : role && s.blocker?.startsWith("Agent execution failed:")
-        ? `/team-retry ${role}`
-        : "Use /team-status and /team-log for details.";
+  const next = recovery
+    ? recoveryAction(recovery)
+    : s.pendingQuestion
+      ? "Answer the pending question."
+      : s.blocker?.includes("repository") ||
+          s.blocker?.includes("commit") ||
+          s.blocker?.includes("mutating")
+        ? "Inspect repository changes before retrying."
+        : role && s.blocker?.startsWith("Agent execution failed:")
+          ? `/team-retry ${role}`
+          : "Use /team-status and /team-log for details.";
   const reason =
     role && s.blocker
       ? s.blocker

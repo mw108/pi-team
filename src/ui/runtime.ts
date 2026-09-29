@@ -34,7 +34,8 @@ export type AgentEvent =
       type: "start" | "complete";
       role: Role;
       attempt?: number;
-      trigger?: "initial" | "automatic_retry" | "manual_retry";
+      trigger?:
+        "initial" | "automatic_retry" | "manual_retry" | "manual_continue";
     }
   | { type: "fail"; role: Role; error: string }
   | { type: "retry"; role: Role; attempt: number; reason: string }

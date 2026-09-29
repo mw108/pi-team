@@ -1,4 +1,19 @@
 import { block, record, type WorkflowState, type Phase } from "./state.ts";
+import type { Role } from "../agents/schemas.ts";
+export const phaseRoles: Partial<Record<Phase, Role[]>> = {
+  ORCHESTRATE: ["orchestrator"],
+  RESEARCH: ["researcher"],
+  SOLVE: ["solver1", "solver2", "solver3"],
+  CRITIQUE: ["critic"],
+  REVIEW: ["reviewer"],
+  IMPLEMENT: ["implementor"],
+  CODE_REVIEW: ["codeReviewer"],
+  PENTEST: ["pentester"],
+  SECURITY_REVIEW: ["securityReviewer"],
+  TEST: ["tester"],
+  COMMIT: ["commitAgent"],
+  REPORT: ["reporter"],
+};
 export function afterCodeReview(s: WorkflowState): Phase {
   return s.config.qualityGates.pentest.enabled ? "PENTEST" : afterSecurity(s);
 }
