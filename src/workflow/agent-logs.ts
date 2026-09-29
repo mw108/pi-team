@@ -4,11 +4,12 @@ import { join } from "node:path";
 import { roles, type Role } from "../agents/schemas.ts";
 import { elapsed } from "../ui/progress.ts";
 import { StateStore } from "./persistence.ts";
+import type { ErrorDiagnostics } from "../agents/error-diagnostics.ts";
 
 export type LogEvent = {
   type: string;
   at?: string;
-  [key: string]: string | number | boolean | null | undefined;
+  [key: string]: unknown;
 };
 
 export function redactVisibleText(text: string) {
@@ -193,6 +194,24 @@ export class AgentLogStore {
       return `No log for ${role}${attempt ? ` attempt ${attempt}` : ""}.`;
     const events = await this.read(id, role, selected);
     const lines = [`${role} · attempt ${selected}`];
+    const seconds = (value: unknown) =>
+      typeof value === "number"
+        ? `${(value / 1000).toFixed(1)}s`
+        : "unknown duration";
+    const errorLines = (value: unknown) => {
+      const result: string[] = [];
+      let error = value as ErrorDiagnostics | undefined;
+      let depth = 0;
+      while (error && depth < 5) {
+        result.push(
+          `  ${depth ? "cause: " : ""}${error.name ?? error.constructor ?? "Error"}: ${error.message ?? "unknown"}`,
+        );
+        if (error.code) result.push(`  code: ${error.code}`);
+        error = error.cause;
+        depth++;
+      }
+      return result;
+    };
     for (const event of events) {
       const time =
         typeof event.at === "string" ? event.at.slice(11, 19) : "--:--:--";
@@ -201,32 +220,74 @@ export class AgentLogStore {
           ? event.trigger === "manual_retry"
             ? "manual retry started"
             : "started"
-          : event.type === "agent_steer"
-            ? "steering message queued"
-            : event.type === "agent_aborted_by_user"
-              ? "aborted by user"
-              : event.type === "agent_superseded_by_upstream_retry"
-                ? "stopped for upstream retry"
-                : event.type === "agent_retry_requested_by_user"
-                  ? `manual retry → attempt ${event.nextAttempt}`
-                  : event.type === "tool_start"
-                    ? event.activity
-                    : event.type === "network_error"
-                      ? "network connection lost"
-                      : event.type === "network_retry_started"
-                        ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
-                        : event.type === "network_recovered"
-                          ? "connection recovered"
-                          : event.type === "network_retries_exhausted"
-                            ? "network retries exhausted"
-                            : event.type === "provider_error"
-                              ? event.label
-                              : event.type === "retry"
-                                ? `retry → attempt ${event.nextAttempt}`
-                                : event.type === "agent_complete"
-                                  ? "completed"
-                                  : undefined;
+          : event.type === "provider_request_start"
+            ? `provider request ${event.providerRequest} started`
+            : event.type === "provider_request_failure"
+              ? `provider request ${event.providerRequest} failed after ${seconds(event.requestDurationMs)}`
+              : event.type === "agent_steer"
+                ? "steering message queued"
+                : event.type === "doom_loop_detected"
+                  ? `repeated tool pattern detected: ${event.tool}`
+                  : event.type === "doom_loop_steer"
+                    ? `automatic steering ${event.intervention}`
+                    : event.type === "doom_loop_finalization"
+                      ? "loop persisted; tools disabled, final response requested"
+                      : event.type === "tool_budget_finalization"
+                        ? "tool budget reached; tools disabled, final response requested"
+                        : event.type === "doom_loop_failed"
+                          ? "final response invalid after repeated tool loop"
+                          : event.type === "agent_aborted_by_user"
+                            ? "aborted by user"
+                            : event.type ===
+                                "agent_superseded_by_upstream_retry"
+                              ? "stopped for upstream retry"
+                              : event.type === "agent_retry_requested_by_user"
+                                ? `manual retry → attempt ${event.nextAttempt}`
+                                : event.type === "tool_start"
+                                  ? event.activity
+                                  : event.type === "network_error"
+                                    ? "network connection lost"
+                                    : event.type === "network_retry_scheduled"
+                                      ? `network retry ${event.retry} scheduled`
+                                      : event.type === "network_retry_started"
+                                        ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
+                                        : event.type === "network_recovered"
+                                          ? "connection recovered"
+                                          : event.type ===
+                                              "network_retries_exhausted"
+                                            ? "network retries exhausted"
+                                            : event.type === "provider_error"
+                                              ? event.label
+                                              : event.type === "retry"
+                                                ? `retry → attempt ${event.nextAttempt}`
+                                                : event.type ===
+                                                    "agent_complete"
+                                                  ? "completed"
+                                                  : undefined;
       if (label) lines.push(`${time} ${label}`);
+      if (event.type === "provider_request_failure") {
+        lines.push(...errorLines(event.error));
+        if (event.agentTimeoutMs !== undefined)
+          lines.push(
+            `  agent timeout: ${event.agentTimeoutMs === null ? "unlimited" : seconds(event.agentTimeoutMs)}`,
+          );
+        lines.push(`  agent elapsed: ${seconds(event.attemptElapsedMs)}`);
+        lines.push(
+          `  abort requested: ${event.abortSignalAborted ? "yes" : "no"}${event.abortReason ? ` (${event.abortReason})` : ""}`,
+        );
+        lines.push(
+          `  tool calls: ${event.toolCalls ?? 0}/${event.maxToolCalls ?? "?"}`,
+        );
+        const doom = event.doomLoop as
+          | { interventions?: number; toolsDisabledForFinalization?: boolean }
+          | undefined;
+        lines.push(
+          `  doom-loop interventions: ${doom?.interventions ?? 0}${doom?.toolsDisabledForFinalization ? " · tools disabled for finalization" : ""}`,
+        );
+        lines.push(
+          `  classification: ${event.classification ?? "other"}${event.matchedRule ? ` (${event.matchedRule})` : ""}`,
+        );
+      }
     }
     if (
       !events.length ||

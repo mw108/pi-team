@@ -52,6 +52,33 @@ The in-place progress widget shows each agent as `○` pending, `●` running, `
 
 Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`. `/team-status` shows current attempts and these commands. A manual retry starts a new wall-clock timeout and cancels any reconnect wait in the old attempt. One aborted Solver can be skipped when at least two valid proposals remain; otherwise the workflow blocks with the proposal count. A manually aborted non-Solver blocks until you retry that agent. `/team-retry` can recover a workflow blocked by the target agent without starting a new workflow.
 
+## Doom-loop detection
+
+Pi Team detects repeated tool calls from normalized tool names and arguments. `read(A)` four times, or `A → B → A → B → A → B`, triggers the detector at the default thresholds. Successful and failed calls count the same. Read ranges, search patterns, symbol names, and resource identities stay in the signature, so reads of successive file ranges do not look identical. Signatures remain in memory; attempt logs record only safe tool names and detector events.
+
+The first two detections steer the current agent to change approach. A further loop disables tools and asks for a final structured result. If finalization still produces invalid output, the attempt fails with `AgentDoomLoopError`. Pi's `AgentSession.steer()` injects the control message as a user-role message. Pi Team intentionally uses this path for Qwen compatibility; the message role cannot be configured. `/team-steer` clears the current pattern history without using an automatic intervention, `/team-abort` clears queued steering through session cancellation, and `/team-retry` starts a fresh detector with the new session. Network reconnects leave the detector intact.
+
+`workflow.maxToolCalls` retains its call-count limit. On the first call beyond the budget, Pi Team blocks that call, disables tools, and steers the agent to finalize with existing information. It queues this steering only once. `agents.<id>.maxToolCalls` can override the workflow budget. `/team-status`, the live widget, and `/team-log` show detector interventions and finalization state.
+
+```yaml
+workflow:
+  doomLoop:
+    enabled: true
+    windowSize: 12
+    maxIdenticalCalls: 4
+    maxRepeatedPattern: 3
+    maxInterventions: 2
+    # steerPrompt: "Stop repeating tool calls and finalize."
+agents:
+  researcher:
+    doomLoop:
+      maxIdenticalCalls: 6
+      # steerPrompt: "Use the evidence collected and finish the research result."
+    # maxToolCalls: 150
+```
+
+Each agent override inherits omitted fields from `workflow.doomLoop`. The window accepts 4–100 calls. The identical threshold and repeated-pattern threshold are at least 2; interventions are 1–10. `maxInterventions: 0` is invalid, so automatic steering cannot continue without a bound. The optional prompt changes only the steering text.
+
 For a repeated failing tool call, try `/team-steer solver1 Stop repeating failed reads and finalize.` If it remains stuck, use `/team-retry solver1` for a fresh conversation. Use `/team-abort solver1` when no replacement is wanted.
 
 Retrying a completed result asks for confirmation. The old result remains available while the replacement runs and remains in place if the replacement fails. A successful upstream retry invalidates dependent reasoning: Researcher invalidates Solvers onward; one Solver invalidates Critic onward; Critic invalidates Reviewer onward; Reviewer invalidates implementation and gates; Implementor invalidates review and validation gates. If a later read-only phase is running, its active agent is stopped before the upstream retry and downstream reasoning is recomputed. When implementation has already changed the repository, an upstream reasoning retry is refused so existing changes are preserved. A completed Implementor retry requires confirmation and starts on the current working tree without resetting files. Retry requests during a mutating downstream phase are refused; stop the workflow and inspect the repository before retrying.
@@ -427,7 +454,20 @@ Each agent inherits `maxRetries` and `delayMs` independently from `workflow.netw
 
 Pi Team owns transport and HTTP 502/503/504 request retries at `ModelRuntime.streamSimple()`, with fixed delay. It also owns HTTP 429 retries there and uses `Retry-After` when the provider uses the request's `fetch` hook; otherwise the configured delay applies. Pi's session retry is disabled for isolated agents, and provider request retries are set to zero to avoid multiplied loops. Hard agent retry remains in the workflow engine. Reconnect events appear in the active `/team-status`, the same attempt JSONL file, and `/team-log`; summary start/recovery/exhaustion events enter workflow history.
 
-With `logging.agentLogs.level: summary` (the default), each attempt has an append-only JSONL file at `.pi/team/state/<workflow-id>.logs/<agent>/attempt-N.jsonl`. `/team-log` lists attempts, `/team-log researcher` shows all attempts in order, and `--attempt N` selects one. Steering, user abort, and manual retry have distinct events in the timeline and concise workflow history. `/team-status` shows the last failure and points to the logs. Summary events contain lifecycle, safe tool names/categories, duration, success or failure, and the final visible assistant text available from Pi before session disposal, capped at 64 KiB with known credential patterns redacted. They never include reasoning blocks, tool arguments, tool results, headers, queries or full provider errors. `logging.agentLogs.level: off` disables new attempt files; history still records retries. Treat logs as private because visible assistant output can contain repository data. Logs are retained after completion and tied to their state file: remove `<workflow-id>.json` and its matching `<workflow-id>.logs/` together during manual retention cleanup; Pi Team does not silently delete either.
+With `logging.agentLogs.level: summary` (the default), each attempt has an append-only JSONL file at `.pi/team/state/<workflow-id>.logs/<agent>/attempt-N.jsonl`. `/team-log` lists attempts, `/team-log researcher` shows all attempts in order, and `--attempt N` selects one. Steering, user abort, and manual retry have distinct events in the timeline and concise workflow history. `/team-status` shows a concise final provider error and points to the logs. Summary events contain lifecycle, safe tool names/categories, duration, success or failure, and the final visible assistant text available from Pi before session disposal, capped at 64 KiB with known credential patterns redacted. They never include reasoning blocks, tool arguments, tool results, request bodies, headers, or query strings. `logging.agentLogs.level: off` disables new attempt files; history still records retries. Treat logs as private because visible assistant output can contain repository data. Logs are retained after completion and tied to their state file: remove `<workflow-id>.json` and its matching `<workflow-id>.logs/` together during manual retention cleanup; Pi Team does not silently delete either.
+
+Provider request diagnostics in each attempt file number individual model invocations from 1, including those made after a network reconnect. Start and end events record the request duration; failure events add time to first stream event, time since last stream activity, effective timeout values, current retry number, abort state, tool count, and Doom-Loop finalization state. An agent timeout measures the session's wall-clock guard; a provider request duration measures one model invocation. Pi 0.87.1 supplies `httpIdleTimeoutMs` (300,000 ms in the in-memory default settings) as the request timeout unless an explicit provider timeout overrides it. The request event records the effective `requestTimeoutMs` supplied to `ModelRuntime.streamSimple()`. The wrapper does not expose Undici headers or body timeout settings, so the log does not invent them.
+
+For example, `/team-log researcher --attempt 1` may show:
+
+```text
+provider request 6 failed after 300.0s
+  TypeError: terminated
+  cause: SocketError: other side closed
+  code: UND_ERR_SOCKET
+```
+
+The JSONL failure event stores an allowlisted error class/name/message/code/status and up to five cause levels, ten aggregate children, and fifteen sanitized stack lines. It does not serialize arbitrary error properties, credentials, request contents, tool arguments, or endpoint URLs. `terminated` alone remains `other`; it is not automatically treated as a retryable network error. `classification` and `matchedRule` show why the existing classifier chose its result. A separate `terminated_diagnostic` event makes these failures easy to find.
 
 A repository lock prevents concurrent team engines. A stale lock is reclaimed only if its process no longer exists. Corrupted states fail closed and remain untouched.
 

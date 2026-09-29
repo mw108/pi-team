@@ -11,6 +11,12 @@ workflow:
     maxRetries: 10 # 0 means unlimited reconnects
     delayMs: 3000 # fixed delay, 100–60000 ms
   maxToolCalls: 80
+  doomLoop:
+    enabled: true
+    windowSize: 12
+    maxIdenticalCalls: 4
+    maxRepeatedPattern: 3
+    maxInterventions: 2
 qualityGates:
   codeReview:
     enabled: true

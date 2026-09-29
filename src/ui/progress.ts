@@ -127,6 +127,10 @@ function displayAgent(
     status === "running" && live?.controlActivity
       ? `  ↳ ${live.controlActivity}`
       : undefined;
+  const guardStatus =
+    status === "running" && live
+      ? `  ↳ doom-loop interventions: ${live.doomLoopInterventions ?? 0}/${state.config.agents[role].doomLoop?.maxInterventions ?? state.config.workflow.doomLoop.maxInterventions} · tool calls: ${live.toolCalls ?? 0}/${state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls}${live.toolsDisabledForFinalization ? " · tools: disabled for finalization" : ""}`
+      : undefined;
   const persistedRetry = state.history.findLast(
     (entry) => entry.meta?.agent === role && entry.event === "agent_retry",
   );
@@ -141,9 +145,30 @@ function displayAgent(
       : status === "failed" && last
         ? `  ↳ Final error: ${last.detail.split(": ").at(-1)} · attempt ${last.meta?.attempt}`
         : undefined;
-  return [label, control ?? reconnect ?? activity, reason ?? error].filter(
-    (line): line is string => !!line,
-  );
+  const finalError =
+    status === "failed" &&
+    typeof last?.meta?.finalError?.requestDurationMs === "number"
+      ? last.meta.finalError
+      : undefined;
+  const detail = finalError
+    ? [
+        finalError.code || finalError.causeMessage
+          ? `  ↳ Cause: ${[finalError.code, finalError.causeMessage].filter(Boolean).join(" · ")}`
+          : undefined,
+        typeof finalError.requestDurationMs === "number"
+          ? `  ↳ Provider request: ${(finalError.requestDurationMs / 1000).toFixed(1)}s`
+          : undefined,
+      ].filter((line): line is string => !!line)
+    : [];
+  return [
+    label,
+    control ?? reconnect ?? activity,
+    guardStatus,
+    finalError?.message
+      ? `  ↳ Final error: ${finalError.name ?? "Error"}: ${finalError.message}`
+      : (reason ?? error),
+    ...detail,
+  ].filter((line): line is string => !!line);
 }
 export function renderProgress(
   state: WorkflowState,

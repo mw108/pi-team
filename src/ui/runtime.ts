@@ -1,6 +1,7 @@
 import type { Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { formatToolActivity } from "./activity.ts";
+import type { GuardEvent } from "../agents/runner.ts";
 
 export type AgentRuntimeStatus =
   "pending" | "running" | "completed" | "failed" | "stopped" | "aborted";
@@ -17,6 +18,9 @@ export interface AgentProgress {
   attempt?: number;
   controlActivity?: string;
   manualRetry?: boolean;
+  toolCalls?: number;
+  doomLoopInterventions?: number;
+  toolsDisabledForFinalization?: boolean;
   networkRetry?: {
     retry: number;
     maxRetries: number;
@@ -57,7 +61,8 @@ export type AgentEvent =
       toolCallId?: string;
       innerToolName?: string;
     }
-  | { type: "activityEnd"; role: Role; toolCallId?: string };
+  | { type: "activityEnd"; role: Role; toolCallId?: string }
+  | { type: "guard"; role: Role; event: GuardEvent };
 
 function interval(callback: () => void, ms: number) {
   const timer = setInterval(callback, ms);
@@ -132,6 +137,8 @@ export class ProgressRuntime {
         status: "running",
         startedAt: this.now(),
         attempt: event.attempt,
+        toolCalls: 0,
+        doomLoopInterventions: 0,
         manualRetry: event.trigger === "manual_retry",
         previousFailure:
           event.trigger === "automatic_retry"
@@ -140,7 +147,20 @@ export class ProgressRuntime {
       };
     else if (event.type === "steer" && existing)
       existing.controlActivity = "Steering message queued";
-    else if (
+    else if (event.type === "guard" && existing) {
+      if (event.event.type === "doom_loop_steer") {
+        existing.doomLoopInterventions = event.event.intervention;
+        existing.controlActivity = `Repeated tool pattern detected · steering ${event.event.intervention}/${event.event.maxInterventions}`;
+      } else if (event.event.type === "doom_loop_finalization") {
+        existing.toolsDisabledForFinalization = true;
+        existing.controlActivity =
+          "Tool loop persisted · finalizing without tools";
+      } else if (event.event.type === "tool_budget_finalization") {
+        existing.toolsDisabledForFinalization = true;
+        existing.controlActivity =
+          "Tool budget reached · finalizing without tools";
+      }
+    } else if (
       event.type === "steerClear" &&
       existing &&
       existing.controlActivity === "Steering message queued"
@@ -193,7 +213,9 @@ export class ProgressRuntime {
     } else if (event.type === "networkClear" && existing) {
       existing.networkRetry = undefined;
     } else if (event.type === "activity" && existing?.status === "running") {
-      existing.controlActivity = undefined;
+      existing.toolCalls = (existing.toolCalls ?? 0) + 1;
+      if (!existing.toolsDisabledForFinalization)
+        existing.controlActivity = undefined;
       existing.activity = formatToolActivity(
         event.toolName,
         this.state?.config,

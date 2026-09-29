@@ -8,6 +8,12 @@ export interface ActiveAgentSession {
   session: AgentSession;
   startedAt: number;
   state: "running" | "steering" | "aborting" | "retrying";
+  resetDoomLoop?: () => void;
+  doomLoopInterventions?: number;
+  doomLoopMaxInterventions?: number;
+  toolCalls?: number;
+  maxToolCalls?: number;
+  toolsDisabledForFinalization?: boolean;
 }
 
 /** Live Pi objects are deliberately never written to workflow state. */

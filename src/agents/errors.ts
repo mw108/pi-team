@@ -25,6 +25,20 @@ export class AgentTimeoutError extends Error {
   }
 }
 
+export class AgentDoomLoopError extends Error {
+  readonly category = "doom_loop";
+  constructor(
+    readonly agentId: Role,
+    readonly attempt: number,
+    readonly interventions: number,
+  ) {
+    super(
+      `${agentId} attempt ${attempt} could not finalize after ${interventions} doom-loop interventions`,
+    );
+    this.name = "AgentDoomLoopError";
+  }
+}
+
 export class AgentAbortedByUserError extends Error {
   readonly failures = 0;
   constructor(
@@ -48,6 +62,7 @@ export class AgentSupersededForRetryError extends Error {
 }
 
 export type FailureCategory =
+  | "doom_loop"
   | "cancelled"
   | "timeout"
   | "http_503"
@@ -58,6 +73,7 @@ export type FailureCategory =
   | "other";
 
 export function classifyFailure(error: unknown): FailureCategory {
+  if (error instanceof AgentDoomLoopError) return "doom_loop";
   if (error instanceof AgentTimeoutError) return "timeout";
   const value = error as { status?: number; code?: string; name?: string };
   if (value?.status === 429 || value?.code === "429") return "rate_limit";
@@ -77,11 +93,49 @@ export function classifyFailure(error: unknown): FailureCategory {
   return "other";
 }
 
+/** Mirror the existing workflow classifier for log provenance only. */
+export function explainFailure(error: unknown): {
+  category: FailureCategory;
+  matchedRule: string | null;
+} {
+  const category = classifyFailure(error);
+  if (category === "other") return { category, matchedRule: null };
+  if (error instanceof AgentDoomLoopError)
+    return { category, matchedRule: "AgentDoomLoopError" };
+  if (error instanceof AgentTimeoutError)
+    return { category, matchedRule: "AgentTimeoutError" };
+  const value = error as { status?: number; code?: string };
+  if (value?.status === 429 || value?.code === "429")
+    return { category, matchedRule: "status/code=429" };
+  if (value?.status === 503 || value?.code === "503")
+    return { category, matchedRule: "status/code=503" };
+  if (
+    typeof value?.code === "string" &&
+    /^(ECONN|ENET|ETIMEDOUT|EAI_)/.test(value.code)
+  )
+    return { category, matchedRule: `code=${value.code}` };
+  const message = String(error);
+  const rules: [RegExp, string][] = [
+    [/\b429\b|rate limit/i, "message=rate_limit"],
+    [/\b503\b/, "message=http_503"],
+    [/timeout|timed out/i, "message=timeout"],
+    [/ECONN|fetch failed|network/i, "message=network"],
+    [/json|schema|validat/i, "message=schema"],
+    [/tool|command/i, "message=tool"],
+  ];
+  return {
+    category,
+    matchedRule: rules.find(([pattern]) => pattern.test(message))?.[1] ?? null,
+  };
+}
+
 export function safeFailureLabel(
   category: FailureCategory,
   timeoutMs?: number,
 ) {
   switch (category) {
+    case "doom_loop":
+      return "doom loop persisted";
     case "cancelled":
       return "cancelled";
     case "timeout":

@@ -47,8 +47,10 @@ import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
   AgentSupersededForRetryError,
+  AgentDoomLoopError,
   AgentTimeoutError,
   classifyFailure,
+  explainFailure,
   getAgentTimeoutMs,
   safeFailureLabel,
 } from "../agents/errors.ts";
@@ -59,6 +61,12 @@ import {
   redactVisibleText,
 } from "./agent-logs.ts";
 import { classifyToolActivity } from "../ui/activity.ts";
+import {
+  containsTerminated,
+  firstErrorCode,
+  serializeErrorDiagnostics,
+} from "../agents/error-diagnostics.ts";
+import type { ProviderRequestEvent } from "../agents/network-retry.ts";
 const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
@@ -142,6 +150,7 @@ export class WorkflowEngine {
     )
       throw new Error(`Agent "${role}" is not currently running.`);
     const entry = await this.sessions.steer(state.id, role, message);
+    entry.resetDoomLoop?.();
     const logger = new AttemptLogger(
       this.logs.path(state.id, role, attempt.attempt),
     );
@@ -492,6 +501,10 @@ export class WorkflowEngine {
       const started = Date.now();
       const calls = new Map<string, { name: string; started: number }>();
       const networkHistoryWrites: Promise<void>[] = [];
+      let providerRequests = 0;
+      let failedRequest:
+        (ProviderRequestEvent & Record<string, unknown>) | undefined;
+      let networkRetries = 0;
       try {
         if (trigger === "manual_retry")
           logged?.logger.append({
@@ -581,6 +594,7 @@ export class WorkflowEngine {
                 text: redactVisibleText(text),
               }),
             (event) => {
+              networkRetries = Math.max(networkRetries, event.retry);
               logged?.logger.append({
                 ...event,
                 agentAttempt: attemptNumber,
@@ -624,6 +638,87 @@ export class WorkflowEngine {
                 );
             },
             this.sessions,
+            (event) => {
+              if (control.intention || control.settled) return;
+              const safeTool =
+                event.type === "doom_loop_detected" &&
+                /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(event.tool)
+                  ? event.tool
+                  : "unknown_tool";
+              logged?.logger.append({
+                ...event,
+                ...(event.type === "doom_loop_detected"
+                  ? { tool: safeTool }
+                  : {}),
+                agentAttempt: attemptNumber,
+              });
+              const label =
+                event.type === "doom_loop_detected"
+                  ? `${role} repeated ${safeTool} tool pattern detected`
+                  : event.type === "doom_loop_steer"
+                    ? `${role} automatic steering ${event.intervention}/${event.maxInterventions}`
+                    : event.type === "doom_loop_finalization"
+                      ? `${role} tool loop persisted; finalizing without tools`
+                      : `${role} tool budget exhausted; finalizing without tools`;
+              networkHistoryWrites.push(
+                this.persistAttempt(authoritative, event.type, label, {
+                  agent: role,
+                  attempt: attemptNumber,
+                }),
+              );
+              this.emitAgentEvent({ type: "guard", role, event });
+            },
+            (event) => {
+              providerRequests = Math.max(
+                providerRequests,
+                event.providerRequest,
+              );
+              if (
+                event.type === "provider_request_start" ||
+                (event.type === "provider_request_end" && event.success)
+              )
+                failedRequest = undefined;
+              const abortReason =
+                control.intention === "abort"
+                  ? "team-abort"
+                  : control.intention === "retry"
+                    ? "manual retry"
+                    : control.intention === "superseded"
+                      ? "manual retry"
+                      : signal?.aborted
+                        ? "team-stop"
+                        : event.agentTimeoutTriggered
+                          ? "agent timeout"
+                          : event.abortSignalAborted
+                            ? "agent timeout or workflow abort"
+                            : null;
+              const record = {
+                ...event,
+                agent: role,
+                attempt: attemptNumber,
+                attemptElapsedMs: Date.now() - started,
+                abortReason,
+              };
+              if (event.type === "provider_request_failure")
+                failedRequest = record;
+              logged?.logger.append(record);
+              if (
+                event.type === "provider_request_failure" &&
+                event.error &&
+                containsTerminated(event.error)
+              )
+                logged?.logger.append({
+                  type: "terminated_diagnostic",
+                  agent: role,
+                  attempt: attemptNumber,
+                  providerRequest: event.providerRequest,
+                  requestDurationMs: event.requestDurationMs,
+                  attemptElapsedMs: Date.now() - started,
+                  causeCode: firstErrorCode(event.error) ?? null,
+                  abortSignalAborted: event.abortSignalAborted,
+                  abortReason,
+                });
+            },
           ),
         );
         if (control.intention)
@@ -635,6 +730,8 @@ export class WorkflowEngine {
         logged?.logger.append({
           type: "agent_complete",
           durationMs: Date.now() - started,
+          providerRequests,
+          networkRetries,
         });
         await logged?.logger.flush();
         await this.persistAttempt(
@@ -717,6 +814,20 @@ export class WorkflowEngine {
           throw new AgentAbortedByUserError(role, attemptNumber);
         }
         const failure = classifyFailure(e);
+        const failureRule = explainFailure(e).matchedRule;
+        if (e instanceof AgentDoomLoopError) {
+          logged?.logger.append({
+            type: "doom_loop_failed",
+            agentAttempt: attemptNumber,
+            intervention: e.interventions,
+          });
+          await this.persistAttempt(
+            authoritative,
+            "doom_loop_failed",
+            `${role} could not finalize after repeated tool loops`,
+            { agent: role, attempt: attemptNumber },
+          );
+        }
         const category =
           e instanceof AgentTimeoutError
             ? "timeout"
@@ -727,11 +838,66 @@ export class WorkflowEngine {
           e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
         const label = safeFailureLabel(category, agentTimeoutMs);
         const durationMs = Date.now() - started;
+        const error = failedRequest?.error ?? serializeErrorDiagnostics(e);
+        const abortReason =
+          control.intention === "abort"
+            ? "team-abort"
+            : control.intention === "retry" ||
+                control.intention === "superseded"
+              ? "manual retry"
+              : signal?.aborted
+                ? "team-stop"
+                : e instanceof AgentTimeoutError
+                  ? "agent timeout"
+                  : null;
         logged?.logger.append({
           type: "provider_error",
+          agent: role,
+          attempt: attemptNumber,
           category,
+          classification: category,
+          matchedRule:
+            category === "cancelled" ? "workflow signal aborted" : failureRule,
           label,
           durationMs,
+          attemptElapsedMs: durationMs,
+          providerRequest: failedRequest?.providerRequest ?? null,
+          requestDurationMs: failedRequest?.requestDurationMs ?? null,
+          timeToFirstEventMs: failedRequest?.timeToFirstEventMs,
+          timeSinceLastActivityMs: failedRequest?.timeSinceLastActivityMs,
+          error,
+          agentTimeoutMs: timeoutMs ?? null,
+          agentTimeoutMode: timeoutMode,
+          agentTimeoutElapsedMs: failedRequest?.agentTimeoutElapsedMs,
+          agentTimeoutRemainingMs: failedRequest?.agentTimeoutRemainingMs,
+          abortSignalAborted:
+            failedRequest?.abortSignalAborted ??
+            (e instanceof AgentTimeoutError ||
+              control.controller.signal.aborted),
+          abortReason,
+          doomLoop: failedRequest?.doomLoop ?? {
+            interventions:
+              this.sessions.get(s.id, role)?.doomLoopInterventions ?? 0,
+            toolsDisabledForFinalization:
+              this.sessions.get(s.id, role)?.toolsDisabledForFinalization ??
+              false,
+          },
+          toolCalls:
+            failedRequest?.toolCalls ??
+            this.sessions.get(s.id, role)?.toolCalls ??
+            0,
+          maxToolCalls:
+            s.config.agents[role].maxToolCalls ??
+            s.config.workflow.maxToolCalls,
+          toolBudgetExhausted: failedRequest?.toolBudgetExhausted ?? false,
+          networkRetry: failedRequest?.networkRetryState ?? {
+            currentRetry: networkRetries,
+            maxRetries:
+              s.config.agents[role].networkRetry?.maxRetries ??
+              s.config.workflow.networkRetry.maxRetries,
+            waiting: false,
+          },
+          providerTimeouts: failedRequest?.providerTimeouts,
           ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
         });
         await logged?.logger.flush();
@@ -744,6 +910,19 @@ export class WorkflowEngine {
             attempt: attemptNumber,
             reason: category,
             durationMs,
+            finalError: {
+              ...(typeof error.name === "string" ? { name: error.name } : {}),
+              ...(typeof error.message === "string"
+                ? { message: error.message }
+                : {}),
+              ...(firstErrorCode(error) ? { code: firstErrorCode(error) } : {}),
+              ...(typeof error.cause?.message === "string"
+                ? { causeMessage: error.cause.message }
+                : {}),
+              ...(typeof failedRequest?.requestDurationMs === "number"
+                ? { requestDurationMs: failedRequest.requestDurationMs }
+                : {}),
+            },
             ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
           },
         );
@@ -758,7 +937,9 @@ export class WorkflowEngine {
         ) {
           this.emitAgentEvent({ type: "fail", role, error: String(e) });
           const error =
-            e instanceof AgentTimeoutError ? e : new Error(String(e));
+            e instanceof AgentTimeoutError || e instanceof AgentDoomLoopError
+              ? e
+              : new Error(String(e));
           Object.assign(error, { failures });
           throw error;
         }

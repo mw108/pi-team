@@ -36,12 +36,23 @@ import {
 import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { effectiveConfig } from "./discovery.ts";
-import { AgentTimeoutError, getAgentTimeoutMs } from "./errors.ts";
+import {
+  AgentDoomLoopError,
+  AgentTimeoutError,
+  getAgentTimeoutMs,
+} from "./errors.ts";
+import {
+  ToolUseGuard,
+  resolveDoomLoop,
+  toolInvocation,
+  type GuardEvent,
+} from "./doom-loop.ts";
 import { configureAgentSampling } from "./sampling.ts";
 import {
   configureNetworkRetry,
   resolveNetworkRetry,
   type NetworkRetryEvent,
+  type ProviderRequestEvent,
 } from "./network-retry.ts";
 import {
   ActiveSessionRegistry,
@@ -55,6 +66,7 @@ export type ActivityObserver = (
   success?: boolean,
 ) => void;
 export type OutputObserver = (text: string) => void;
+export type { GuardEvent } from "./doom-loop.ts";
 
 export interface AgentRunner {
   run(
@@ -66,6 +78,10 @@ export interface AgentRunner {
     output?: OutputObserver,
     network?: (event: NetworkRetryEvent) => void,
     registry?: ActiveSessionRegistry,
+    guardEvent?: (event: GuardEvent) => void,
+    providerEvent?: (
+      event: ProviderRequestEvent & Record<string, unknown>,
+    ) => void,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -76,6 +92,13 @@ export class PiRunner implements AgentRunner {
     activity?: ActivityObserver,
     network?: (event: NetworkRetryEvent) => void,
     getSignal: () => AbortSignal | undefined = () => undefined,
+    guardState?: {
+      entry: ActiveAgentSession;
+      guard: ToolUseGuard;
+    },
+    providerEvent?: (
+      event: ProviderRequestEvent & Record<string, unknown>,
+    ) => void,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
       selected = config.agents[role];
@@ -93,12 +116,6 @@ export class PiRunner implements AgentRunner {
         `Provider ${selected.provider} has no configured authentication`,
       );
     configureAgentSampling(runtime, model, selected);
-    configureNetworkRetry(
-      runtime,
-      resolveNetworkRetry(config, role),
-      getSignal,
-      network,
-    );
     const settings = SettingsManager.inMemory({
       packages: [],
       extensions: [],
@@ -106,9 +123,26 @@ export class PiRunner implements AgentRunner {
       retry: { enabled: false, maxRetries: 0 },
       cacheWarming: "off",
     });
+    const httpIdleTimeoutMs = settings.getHttpIdleTimeoutMs();
+    configureNetworkRetry(
+      runtime,
+      resolveNetworkRetry(config, role),
+      getSignal,
+      network,
+      (event) =>
+        providerEvent?.({
+          ...event,
+          providerTimeouts: {
+            ...event.providerTimeouts,
+            httpIdleTimeoutMs: {
+              value: httpIdleTimeoutMs,
+              source: "pi-default",
+            },
+          },
+        }),
+    );
     const paths: string[] = [],
       factories: any[] = [];
-    let calls = 0;
     if (
       config.integrations.serena.enabled &&
       !["orchestrator", "tester", "commitAgent"].includes(role)
@@ -123,8 +157,21 @@ export class PiRunner implements AgentRunner {
       paths.push(packagePath("pi-web-access", "dist/index.js"));
     const guard = (pi: ExtensionAPI) => {
       pi.on("tool_call", async (event) => {
-        if (++calls > config.workflow.maxToolCalls)
-          return { block: true, reason: "Agent tool-call limit reached" };
+        const { tool, input } = toolInvocation(event.toolName, event.input);
+        const guarded = await guardState?.guard.call(
+          tool,
+          input,
+          getSignal()?.aborted,
+          event.toolCallId,
+        );
+        if (guardState) {
+          guardState.entry.toolCalls = guardState.guard.toolCalls;
+          guardState.entry.doomLoopInterventions =
+            guardState.guard.interventions;
+          guardState.entry.toolsDisabledForFinalization =
+            guardState.guard.toolsDisabledForFinalization;
+        }
+        if (guarded) return guarded;
         try {
           await checkTool(
             role,
@@ -141,6 +188,7 @@ export class PiRunner implements AgentRunner {
             },
           );
         } catch (e) {
+          guardState?.guard.discard(event.toolCallId);
           return { block: true, reason: String(e) };
         }
       });
@@ -154,6 +202,7 @@ export class PiRunner implements AgentRunner {
         );
       });
       pi.on("tool_execution_end", (event) => {
+        guardState?.guard.complete(event.toolCallId, !event.isError);
         activity?.(undefined, event.toolCallId, undefined, !event.isError);
       });
     };
@@ -222,9 +271,41 @@ export class PiRunner implements AgentRunner {
     output?: OutputObserver,
     network?: (event: NetworkRetryEvent) => void,
     registry?: ActiveSessionRegistry,
+    guardEvent?: (event: GuardEvent) => void,
+    providerEvent?: (
+      event: ProviderRequestEvent & Record<string, unknown>,
+    ) => void,
   ) {
     const evidence: CommandEvidence[] = [];
     let executionSignal: AbortSignal | undefined;
+    let timeoutStartedAt: number | undefined;
+    let timedOut = false;
+    const doomConfig = resolveDoomLoop(effectiveConfig(state), role);
+    const entry: ActiveAgentSession = {
+      workflowId: state.id,
+      agentId: role,
+      attempt,
+      session: undefined as unknown as AgentSession,
+      startedAt: Date.now(),
+      state: "running",
+      doomLoopInterventions: 0,
+      doomLoopMaxInterventions: doomConfig.maxInterventions,
+      toolCalls: 0,
+      maxToolCalls:
+        effectiveConfig(state).agents[role].maxToolCalls ??
+        effectiveConfig(state).workflow.maxToolCalls,
+      toolsDisabledForFinalization: false,
+    };
+    const guard = new ToolUseGuard(
+      doomConfig,
+      entry.maxToolCalls!,
+      () => entry.session,
+      guardEvent,
+    );
+    const guardState = { entry, guard };
+    entry.resetDoomLoop = () => guard.resetHistory();
+    const agentTimeoutMs = getAgentTimeoutMs(state.config, role);
+    const retryPolicy = resolveNetworkRetry(effectiveConfig(state), role);
     const session = await this.createSession(
       role,
       state,
@@ -232,15 +313,40 @@ export class PiRunner implements AgentRunner {
       activity,
       network,
       () => executionSignal,
+      guardState,
+      (event) =>
+        providerEvent?.({
+          ...event,
+          abortSignalAborted: executionSignal?.aborted ?? false,
+          agentTimeoutMs: agentTimeoutMs ?? null,
+          agentTimeoutMode:
+            agentTimeoutMs === undefined ? "unlimited" : "limited",
+          agentTimeoutElapsedMs:
+            timeoutStartedAt === undefined
+              ? null
+              : Date.now() - timeoutStartedAt,
+          agentTimeoutRemainingMs:
+            agentTimeoutMs === undefined || timeoutStartedAt === undefined
+              ? null
+              : Math.max(0, agentTimeoutMs - (Date.now() - timeoutStartedAt)),
+          agentTimeoutTriggered: timedOut,
+          doomLoop: {
+            interventions: entry.doomLoopInterventions ?? 0,
+            toolsDisabledForFinalization:
+              entry.toolsDisabledForFinalization ?? false,
+          },
+          toolCalls: entry.toolCalls ?? 0,
+          maxToolCalls: entry.maxToolCalls ?? 0,
+          toolBudgetExhausted:
+            (entry.toolCalls ?? 0) >= (entry.maxToolCalls ?? Infinity),
+          networkRetryState: {
+            currentRetry: event.networkRetry,
+            maxRetries: retryPolicy.maxRetries,
+            waiting: false,
+          },
+        }),
     );
-    const entry: ActiveAgentSession = {
-      workflowId: state.id,
-      agentId: role,
-      attempt,
-      session,
-      startedAt: Date.now(),
-      state: "running",
-    };
+    entry.session = session;
     try {
       registry?.register(entry);
     } catch (error) {
@@ -250,13 +356,19 @@ export class PiRunner implements AgentRunner {
     const timeoutMs = getAgentTimeoutMs(state.config, role);
     const executionAbort = new AbortController();
     executionSignal = executionAbort.signal;
-    let timedOut = false;
+    timeoutStartedAt = Date.now();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abortTask: Promise<void> | undefined;
     const abort = () => {
       if (abortTask) return;
       if (timer) clearTimeout(timer);
       executionAbort.abort();
+      guard.resetHistory();
+      try {
+        session.clearQueue?.();
+      } catch {
+        // Queue cleanup must not prevent cancellation.
+      }
       abortTask = session.abort().catch(() => {});
     };
     if (timeoutMs !== undefined)
@@ -319,7 +431,13 @@ export class PiRunner implements AgentRunner {
           throw new AgentTimeoutError(role, timeoutMs, attempt);
         if (signal?.aborted)
           throw new Error("Agent interrupted during schema correction");
-        result = parseText(role, session.getLastAssistantText() ?? "");
+        try {
+          result = parseText(role, session.getLastAssistantText() ?? "");
+        } catch (finalError) {
+          if (guard.finalizationReason === "doom_loop")
+            throw new AgentDoomLoopError(role, attempt, guard.interventions);
+          throw finalError;
+        }
         if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
           await validateContractPaths(state.cwd, result);
       }

@@ -7,6 +7,12 @@ workflow:
   maxQuestions: 5
   agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout
   maxToolCalls: 80
+  doomLoop:
+    enabled: true
+    windowSize: 12
+    maxIdenticalCalls: 4
+    maxRepeatedPattern: 3
+    maxInterventions: 2
 qualityGates:
   codeReview:
     enabled: true

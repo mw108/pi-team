@@ -4,6 +4,10 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessageEvent, Api, Model } from "@earendil-works/pi-ai";
 import type { Role } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
+import {
+  serializeErrorDiagnostics,
+  type ErrorDiagnostics,
+} from "./error-diagnostics.ts";
 
 export interface ResolvedNetworkRetry {
   maxRetries: number; // 0 means unlimited.
@@ -37,6 +41,31 @@ export type NetworkRetryEvent = {
   message: string;
   delayMs?: number;
   maxRetries: number;
+};
+
+export type ProviderRequestEvent = {
+  type:
+    | "provider_request_start"
+    | "provider_request_end"
+    | "provider_request_failure";
+  providerRequest: number;
+  provider: string;
+  model: string;
+  api: string;
+  networkRetry: number;
+  requestStartedAt: string;
+  requestDurationMs?: number;
+  timeToFirstEventMs?: number;
+  timeSinceLastActivityMs?: number;
+  success?: boolean;
+  error?: ErrorDiagnostics;
+  classification?: NetworkRetryCategory | "other";
+  matchedRule?: string | null;
+  providerTimeouts?: {
+    requestTimeoutMs?: number;
+    maxRetries?: number;
+    httpIdleTimeoutMs?: { value: number; source: string };
+  };
 };
 
 const transportCodes = new Set([
@@ -96,6 +125,37 @@ export function classifyRequestFailure(
   return undefined;
 }
 
+/** Explain a classification without changing the retry classifier's decision. */
+export function explainRequestFailure(error: unknown): {
+  classification: NetworkRetryCategory | "other";
+  matchedRule: string | null;
+} {
+  const category = classifyRequestFailure(error);
+  if (!category) return { classification: "other", matchedRule: null };
+  const walk = (value: unknown, depth = 0): string | null => {
+    if (depth >= 5 || !value || typeof value !== "object") return null;
+    const item = value as {
+      code?: string;
+      cause?: unknown;
+      status?: number;
+      statusCode?: number;
+    };
+    if (item.status === 429 || item.statusCode === 429) return "status=429";
+    if ([502, 503, 504].includes(item.status ?? item.statusCode ?? 0))
+      return `status=${item.status ?? item.statusCode}`;
+    if (item.code && transportCodes.has(item.code))
+      return `${depth ? "cause." : ""}code=${item.code}`;
+    return walk(item.cause, depth + 1);
+  };
+  const message =
+    typeof error === "string"
+      ? error
+      : (error as { message?: string })?.message;
+  const rule =
+    walk(error) ?? (typeof message === "string" ? `message=${category}` : null);
+  return { classification: category, matchedRule: rule };
+}
+
 function retryAfterMs(value: string | null): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
@@ -137,8 +197,11 @@ export function configureNetworkRetry(
   policy: ResolvedNetworkRetry,
   getSignal: () => AbortSignal | undefined,
   observe?: (event: NetworkRetryEvent) => void,
+  observeRequest?: (event: ProviderRequestEvent) => void,
+  now: () => number = Date.now,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
+  let requestNumber = 0;
   runtime.streamSimple = (model, context, options) => {
     const result = createAssistantMessageEventStream();
     void (async () => {
@@ -151,35 +214,135 @@ export function configureNetworkRetry(
           return;
         }
         let retryAfter: number | undefined;
+        const providerRequest = ++requestNumber;
+        const requestStarted = now();
+        const requestStartedAt = new Date(requestStarted).toISOString();
+        const identity = {
+          providerRequest,
+          provider: model.provider,
+          model: model.id,
+          api: model.api,
+          networkRetry: retry,
+          requestStartedAt,
+        };
+        const providerTimeouts = {
+          ...(typeof options?.timeoutMs === "number"
+            ? { requestTimeoutMs: options.timeoutMs }
+            : {}),
+          maxRetries: 0,
+        };
+        observeRequest?.({
+          type: "provider_request_start",
+          ...identity,
+          providerTimeouts,
+        });
+        let rawError: unknown;
+        let firstEventAt: number | undefined;
+        let lastActivityAt: number | undefined;
         const requestOptions = {
           ...options,
           signal,
           maxRetries: 0,
           fetch: async (...args: Parameters<typeof fetch>) => {
-            const response = await (options?.fetch ?? globalThis.fetch)(
-              ...args,
-            );
+            let response: Response;
+            try {
+              response = await (options?.fetch ?? globalThis.fetch)(...args);
+            } catch (error) {
+              rawError = error;
+              throw error;
+            }
             if (response.status === 429)
               retryAfter = retryAfterMs(response.headers.get("retry-after"));
-            return response;
+            if (!response.ok || !response.body) return response;
+            const reader = response.body.getReader();
+            const body = new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                try {
+                  const next = await reader.read();
+                  if (next.done) controller.close();
+                  else controller.enqueue(next.value);
+                } catch (error) {
+                  rawError = error;
+                  controller.error(error);
+                }
+              },
+              cancel(reason) {
+                return reader.cancel(reason);
+              },
+            });
+            return new Response(body, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            });
           },
         };
         let events: AssistantMessageEvent[] = [];
         try {
-          for await (const event of original(model, context, requestOptions))
+          for await (const event of original(model, context, requestOptions)) {
+            const at = now();
+            // Pi's "start" is emitted before an HTTP response. Terminal
+            // "error"/"done" events are outcomes, not stream activity.
+            if (
+              event.type !== "start" &&
+              event.type !== "error" &&
+              event.type !== "done"
+            ) {
+              firstEventAt ??= at;
+              lastActivityAt = at;
+            }
             events.push(event);
+          }
         } catch (error) {
+          rawError ??= error;
           // A synchronous provider failure has no assistant event to forward.
           const category = classifyRequestFailure(error);
           if (!category || signal?.aborted) {
-            result.push(
+            events = [
               providerErrorEvent(model, String(error), signal?.aborted),
-            );
-            return;
+            ];
+          } else {
+            events = [providerErrorEvent(model, String(error))];
           }
-          events = [providerErrorEvent(model, String(error))];
         }
         const terminal = events.at(-1);
+        const failed = terminal?.type === "error";
+        const requestDurationMs = now() - requestStarted;
+        const timing = {
+          requestDurationMs,
+          ...(firstEventAt === undefined
+            ? {}
+            : { timeToFirstEventMs: firstEventAt - requestStarted }),
+          ...(lastActivityAt === undefined
+            ? {}
+            : { timeSinceLastActivityMs: now() - lastActivityAt }),
+        };
+        const diagnosticError = failed
+          ? serializeErrorDiagnostics(
+              rawError ??
+                new Error(terminal.error.errorMessage ?? "Provider error"),
+            )
+          : undefined;
+        // The retry decision below sees Pi's terminal errorMessage, which may
+        // have already lost a transport cause. Report that exact decision input.
+        const classification = failed
+          ? explainRequestFailure(terminal.error.errorMessage)
+          : undefined;
+        if (failed)
+          observeRequest?.({
+            type: "provider_request_failure",
+            ...identity,
+            ...timing,
+            error: diagnosticError,
+            ...classification,
+            providerTimeouts,
+          });
+        observeRequest?.({
+          type: "provider_request_end",
+          ...identity,
+          ...timing,
+          success: !failed,
+        });
         const category =
           terminal?.type === "error" && !signal?.aborted
             ? classifyRequestFailure(terminal.error?.errorMessage)

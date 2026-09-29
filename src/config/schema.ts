@@ -42,6 +42,18 @@ const agent = z
     timeoutMs: z
       .union([z.literal(0), z.number().int().min(1000).max(3600000)])
       .optional(),
+    maxToolCalls: z.number().int().min(1).optional(),
+    doomLoop: z
+      .object({
+        enabled: z.boolean().optional(),
+        windowSize: z.number().int().min(4).max(100).optional(),
+        maxIdenticalCalls: z.number().int().min(2).max(100).optional(),
+        maxRepeatedPattern: z.number().int().min(2).max(20).optional(),
+        maxInterventions: z.number().int().min(1).max(10).optional(),
+        steerPrompt: z.string().trim().min(1).max(4000).optional(),
+      })
+      .strict()
+      .optional(),
     networkRetry: z
       .object({
         maxRetries: z.number().int().min(0).optional(),
@@ -130,6 +142,17 @@ export const configSchema = z
           .strict()
           .default({}),
         maxToolCalls: z.number().int().min(1).default(80),
+        doomLoop: z
+          .object({
+            enabled: z.boolean().default(true),
+            windowSize: z.number().int().min(4).max(100).default(12),
+            maxIdenticalCalls: z.number().int().min(2).max(100).default(4),
+            maxRepeatedPattern: z.number().int().min(2).max(20).default(3),
+            maxInterventions: z.number().int().min(1).max(10).default(2),
+            steerPrompt: z.string().trim().min(1).max(4000).optional(),
+          })
+          .strict()
+          .default({}),
       })
       .default({}),
     qualityGates: z

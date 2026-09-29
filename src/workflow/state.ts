@@ -112,6 +112,15 @@ export const stateSchema = z.object({
           timeoutMode: z.enum(["limited", "unlimited"]).optional(),
           durationMs: z.number().int().optional(),
           networkRetry: z.number().int().nonnegative().optional(),
+          finalError: z
+            .object({
+              name: z.string().optional(),
+              message: z.string().optional(),
+              code: z.string().optional(),
+              causeMessage: z.string().optional(),
+              requestDurationMs: z.number().int().nonnegative().optional(),
+            })
+            .optional(),
           trigger: z
             .enum(["initial", "automatic_retry", "manual_retry"])
             .optional(),

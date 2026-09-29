@@ -21,6 +21,7 @@ import { packagePath } from "./resources.ts";
 import { assertTemperatureSupported } from "../agents/sampling.ts";
 import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
 import { resolveNetworkRetry } from "../agents/network-retry.ts";
+import { resolveDoomLoop } from "../agents/doom-loop.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -109,6 +110,10 @@ export async function doctor(cwd: string) {
         `Agent ${role}: ${config.agents[role].role} → ${config.agents[role].prompt}`,
       );
     configSchema.parse(config);
+    const doom = config.workflow.doomLoop;
+    lines.push(
+      `Doom-loop detector: enabled ${doom.enabled ? "yes" : "no"}; window ${doom.windowSize} calls; identical threshold ${doom.maxIdenticalCalls}; repeated-pattern threshold ${doom.maxRepeatedPattern}; interventions ${doom.maxInterventions}`,
+    );
     const runtime = await ModelRuntime.create({
       authPath: `${agentDir()}/auth.json`,
       modelsPath: `${agentDir()}/models.json`,
@@ -124,6 +129,10 @@ export async function doctor(cwd: string) {
       const retry = resolveNetworkRetry(config, role);
       lines.push(
         `  network retry: ${retry.maxRetries === 0 ? "unlimited" : retry.maxRetries} max retries; ${retry.delayMs} ms delay`,
+      );
+      const agentDoom = resolveDoomLoop(config, role);
+      lines.push(
+        `  doom-loop: ${agentDoom.enabled ? "enabled" : "disabled"}; window ${agentDoom.windowSize}; identical ${agentDoom.maxIdenticalCalls}; pattern ${agentDoom.maxRepeatedPattern}; interventions ${agentDoom.maxInterventions}`,
       );
       if (!present || !auth) ok = false;
       if (model)
