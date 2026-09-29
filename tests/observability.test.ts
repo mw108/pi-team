@@ -129,7 +129,7 @@ test("deterministic runner fixture: positive timeout, unlimited completion, canc
   assert.equal(aborts, 2);
 });
 
-test("unlimited attempts log clear mode, cancellation, and provider retry", async () => {
+test("unlimited attempts log clear mode, cancellation, and provider failures do not hard retry", async () => {
   const cwd = await repository();
   const cfg = config();
   cfg.workflow.agentTimeoutMs = 0;
@@ -140,13 +140,16 @@ test("unlimited attempts log clear mode, cancellation, and provider retry", asyn
   });
   const engine = new WorkflowEngine(cwd, retryRunner, ui);
   const state = await engine.start("Retry fixture", cfg);
-  await engine.invoke("researcher", state);
-  assert.equal(retryRunner.counts.researcher, 2);
+  await assert.rejects(
+    () => engine.invoke("researcher", state),
+    /provider unavailable/,
+  );
+  assert.equal(retryRunner.counts.researcher, 1);
   assert.deepEqual(
     state.history
       .filter((entry) => entry.event === "agent_retry")
       .map((entry) => entry.meta?.reason),
-    ["http_503"],
+    [],
   );
   assert.equal(
     state.history.find((entry) => entry.event === "agent_attempt_started")?.meta
@@ -182,12 +185,15 @@ test("unlimited attempts log clear mode, cancellation, and provider retry", asyn
     "Provider timeout fixture",
     cfg,
   );
-  await providerTimeoutEngine.invoke("researcher", providerTimeoutState);
+  await assert.rejects(
+    () => providerTimeoutEngine.invoke("researcher", providerTimeoutState),
+    /provider request timed out/,
+  );
   assert.deepEqual(
     providerTimeoutState.history
       .filter((entry) => entry.event === "agent_retry")
       .map((entry) => entry.meta?.reason),
-    ["network"],
+    [],
   );
 
   const pi = new PiRunner();
@@ -243,10 +249,15 @@ test("doctor displays unlimited and positive agent timeouts", async () => {
   const cwd = await repository();
   const cfg = config();
   cfg.agents.researcher.timeoutMs = 0;
+  cfg.agents.researcher.networkRetry = { maxRetries: 0 };
   cfg.agents.solver1.timeoutMs = 900000;
   await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
   const result = await doctor(cwd);
   assert.match(result.lines.join("\n"), /researcher: .*timeout unlimited/);
+  assert.match(
+    result.lines.join("\n"),
+    /network retry: unlimited max retries; 3000 ms delay/,
+  );
   assert.match(result.lines.join("\n"), /solver1: .*timeout 900000 ms/);
   assert.doesNotMatch(result.lines.join("\n"), /timeout 0 ms/);
   cfg.agents.researcher.timeoutMs = -1;

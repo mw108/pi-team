@@ -29,6 +29,9 @@ Then enter:
 /team-log
 /team-log researcher
 /team-log researcher --attempt 1
+/team-steer solver1 Stop repeating failed reads and finalize.
+/team-abort solver1
+/team-retry solver1
 /team-stop
 /team resume
 /team resume <workflow-id>
@@ -37,6 +40,21 @@ Then enter:
 Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection.
 
 The in-place progress widget shows each agent as `○` pending, `●` running, `✓` completed, or `✗` failed; `◉` marks a pause for user input. Parallel Solvers update independently. Running agents show elapsed time, refreshed every two seconds by default, and a short activity label such as “Serena: references,” “Context7,” “Running tests,” or “Creating commit.” Tool arguments, source text, credentials and private reasoning are never included. Completed phases remain visible without adding permanent log lines. `/team-status` shows the same live information while this Pi session is running; after a restart it reports persisted state and says live timing is unavailable. `/team-stop` immediately marks running agents stopped and clears the heartbeat.
+
+### Runtime controls
+
+| Command                            | Behavior                                                                                                                                                                                                                                                  |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/team-steer <agent-id> <message>` | Queue guidance in the same Pi session and attempt. Delivery waits until Pi finishes the current tool calls. The existing timeout keeps running.                                                                                                           |
+| `/team-abort <agent-id>`           | Stop only that attempt, without a replacement or failure-budget charge. Other agents continue.                                                                                                                                                            |
+| `/team-retry <agent-id>`           | Stop the current attempt if needed, dispose its session, and start a fresh session with the same phase input and a new attempt number. The request does not use the automatic retry or failure budget. A genuine failure in the new attempt still counts. |
+| `/team-stop`                       | Stop the entire workflow.                                                                                                                                                                                                                                 |
+
+Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`. `/team-status` shows current attempts and these commands. A manual retry starts a new wall-clock timeout and cancels any reconnect wait in the old attempt. One aborted Solver can be skipped when at least two valid proposals remain; otherwise the workflow blocks with the proposal count. A manually aborted non-Solver blocks until you retry that agent. `/team-retry` can recover a workflow blocked by the target agent without starting a new workflow.
+
+For a repeated failing tool call, try `/team-steer solver1 Stop repeating failed reads and finalize.` If it remains stuck, use `/team-retry solver1` for a fresh conversation. Use `/team-abort solver1` when no replacement is wanted.
+
+Retrying a completed result asks for confirmation. The old result remains available while the replacement runs and remains in place if the replacement fails. A successful upstream retry invalidates dependent reasoning: Researcher invalidates Solvers onward; one Solver invalidates Critic onward; Critic invalidates Reviewer onward; Reviewer invalidates implementation and gates; Implementor invalidates review and validation gates. If a later read-only phase is running, its active agent is stopped before the upstream retry and downstream reasoning is recomputed. When implementation has already changed the repository, an upstream reasoning retry is refused so existing changes are preserved. A completed Implementor retry requires confirmation and starts on the current working tree without resetting files. Retry requests during a mutating downstream phase are refused; stop the workflow and inspect the repository before retrying.
 
 “Design cycle” counts full research/design attempts; “Local fixes” counts implementation repairs. The Pentest cycle and Pen Tester/Security Reviewer appear only when pentesting is enabled. Disabled quality gates are identified explicitly. Project teams can tune the widget in `.pi/team/team.yaml`:
 
@@ -379,9 +397,37 @@ agents:
     timeoutMs: 900000
 ```
 
-Unlimited time can help slow local models, large repositories, long-running tool-heavy research, and implementation agents. It does not disable `maxToolCalls`, `maxAgentFailures`, `maxQuestions`, `maxFullCycles`, `maxLocalFixCycles`, `maxPentestCycles`, schema validation, tool permissions, command approval, Git safeguards, quality gates, provider failure handling, or manual cancellation. Keep prompts focused, preserve loop protection, and use `/team-stop` to interrupt an agent when needed. Tester validation commands retain their separate `commands[].timeoutMs` budgets. Existing project YAML is never rewritten. Counters are global to the workflow and persist through resume. One likely transient read-only failure may retry once; `retry 1/1` means the second and final attempt, and the widget shows the prior failure reason. Every attempt start/failure and retry is persisted in workflow history. Malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
+Unlimited time can help slow local models, large repositories, long-running tool-heavy research, and implementation agents. It does not disable `maxToolCalls`, `maxAgentFailures`, `maxQuestions`, `maxFullCycles`, `maxLocalFixCycles`, `maxPentestCycles`, schema validation, tool permissions, command approval, Git safeguards, quality gates, provider failure handling, or manual cancellation. Keep prompts focused, preserve loop protection, and use `/team-abort` for one agent or `/team-stop` for the workflow when needed. Tester validation commands retain their separate `commands[].timeoutMs` budgets. Existing project YAML is never rewritten. Counters are global to the workflow and persist through resume. A read-only agent wall-clock timeout may trigger one hard retry; `retry 1/1` means the second and final attempt, and the widget shows the prior failure reason. Every attempt start/failure and retry is persisted in workflow history. Malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
 
-With `logging.agentLogs.level: summary` (the default), each attempt has an append-only JSONL file at `.pi/team/state/<workflow-id>.logs/<agent>/attempt-N.jsonl`. `/team-log` lists attempts, `/team-log researcher` shows the latest timeline, and `--attempt N` selects an earlier one. `/team-status` shows the last failure and points to the logs. Summary events contain lifecycle, safe tool names/categories, duration, success or failure, and the final visible assistant text available from Pi before session disposal, capped at 64 KiB with known credential patterns redacted. They never include reasoning blocks, tool arguments, tool results, headers, queries or full provider errors. `logging.agentLogs.level: off` disables new attempt files; history still records retries. Treat logs as private because visible assistant output can contain repository data. Logs are retained after completion and tied to their state file: remove `<workflow-id>.json` and its matching `<workflow-id>.logs/` together during manual retention cleanup; Pi Team does not silently delete either.
+### Network reconnects vs agent retries
+
+A network reconnect reissues the current model request inside the same Pi agent session and agent attempt. Earlier conversation and tool results remain in that session. A broken token stream cannot resume at the exact token: Pi Team discards partial events from that request and sends the same request again. A hard agent retry creates a new attempt; it remains available for a read-only agent wall-clock timeout, subject to the existing failure budget. Connectivity failures, HTTP 502/503/504 and HTTP 429 do not consume that hard retry budget. Exhausted reconnects surface as a normal invocation failure.
+
+```yaml
+workflow:
+  agentTimeoutMs: 0
+  networkRetry:
+    maxRetries: 10
+    delayMs: 3000
+agents:
+  researcher:
+    timeoutMs: 0
+    networkRetry:
+      maxRetries: 0
+      delayMs: 3000
+  solver1:
+    timeoutMs: 0
+  solver2:
+    timeoutMs: 0
+  solver3:
+    timeoutMs: 0
+```
+
+Each agent inherits `maxRetries` and `delayMs` independently from `workflow.networkRetry` (defaults: 10 retries, 3000 ms). `networkRetry.maxRetries: 0` means unlimited reconnects; `timeoutMs: 0` independently disables the agent wall-clock timeout. `delayMs` must be an integer from 100 to 60000 ms; zero is invalid. `/team-stop` interrupts reconnect waits. Existing project-local `.pi/team/team.yaml` files are not rewritten; add these keys manually to opt in to overrides. `/team doctor` shows effective values.
+
+Pi Team owns transport and HTTP 502/503/504 request retries at `ModelRuntime.streamSimple()`, with fixed delay. It also owns HTTP 429 retries there and uses `Retry-After` when the provider uses the request's `fetch` hook; otherwise the configured delay applies. Pi's session retry is disabled for isolated agents, and provider request retries are set to zero to avoid multiplied loops. Hard agent retry remains in the workflow engine. Reconnect events appear in the active `/team-status`, the same attempt JSONL file, and `/team-log`; summary start/recovery/exhaustion events enter workflow history.
+
+With `logging.agentLogs.level: summary` (the default), each attempt has an append-only JSONL file at `.pi/team/state/<workflow-id>.logs/<agent>/attempt-N.jsonl`. `/team-log` lists attempts, `/team-log researcher` shows all attempts in order, and `--attempt N` selects one. Steering, user abort, and manual retry have distinct events in the timeline and concise workflow history. `/team-status` shows the last failure and points to the logs. Summary events contain lifecycle, safe tool names/categories, duration, success or failure, and the final visible assistant text available from Pi before session disposal, capped at 64 KiB with known credential patterns redacted. They never include reasoning blocks, tool arguments, tool results, headers, queries or full provider errors. `logging.agentLogs.level: off` disables new attempt files; history still records retries. Treat logs as private because visible assistant output can contain repository data. Logs are retained after completion and tied to their state file: remove `<workflow-id>.json` and its matching `<workflow-id>.logs/` together during manual retention cleanup; Pi Team does not silently delete either.
 
 A repository lock prevents concurrent team engines. A stale lock is reclaimed only if its process no longer exists. Corrupted states fail closed and remain untouched.
 

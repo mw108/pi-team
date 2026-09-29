@@ -12,6 +12,7 @@ import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, head } from "../src/workflow/git.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
+import { AgentTimeoutError } from "../src/agents/errors.ts";
 const ui = { progress: () => {}, ask: async () => undefined };
 test("complete team pipeline executes real tests and creates intended commit", async () => {
   const cwd = await repository();
@@ -100,14 +101,14 @@ test("one solver failure preserves successful siblings and prevents implementati
   assert.ok(s.results.solver3);
   assert.equal(runner.counts.implementor, undefined);
 });
-test("transient read-only failure retries once and is accounted globally", async () => {
+test("read-only agent timeout retries once and is accounted globally", async () => {
   const cwd = await repository(),
     cfg = config();
   cfg.qualityGates.commit.enabled = false;
   cfg.workflow.maxAgentFailures = 3;
   const runner = new FixtureRunner(async (role, _s, count) => {
     if (role === "researcher" && count === 1)
-      throw new Error("503 transient provider error");
+      throw new AgentTimeoutError("researcher", 1000, 1);
   });
   const engine = new WorkflowEngine(cwd, runner, ui),
     s = await engine.start("Fix", cfg);
@@ -116,7 +117,7 @@ test("transient read-only failure retries once and is accounted globally", async
   assert.equal(runner.counts.researcher, 2);
   assert.equal(s.agentFailures, 1);
 });
-test("agent failure limit stops a repeatedly failing provider", async () => {
+test("provider failure stops without consuming a hard retry", async () => {
   const cwd = await repository();
   const runner = new FixtureRunner(async (role) => {
     if (role === "researcher") throw new Error("503 provider unavailable");
@@ -125,8 +126,8 @@ test("agent failure limit stops a repeatedly failing provider", async () => {
     s = await engine.start("Fix", config());
   await engine.run(s);
   assert.equal(s.phase, "BLOCKED");
-  assert.equal(s.agentFailures, 2);
-  assert.equal(runner.counts.researcher, 2);
+  assert.equal(s.agentFailures, 1);
+  assert.equal(runner.counts.researcher, 1);
   assert.equal(runner.counts.commitAgent, undefined);
 });
 test("read-only interruption resumes; mutating interruption stops for inspection", async () => {

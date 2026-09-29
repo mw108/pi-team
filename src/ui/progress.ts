@@ -25,6 +25,7 @@ const symbols = {
   completed: "✓",
   failed: "✗",
   stopped: "–",
+  aborted: "⊘",
 };
 function agentName(role: Role, state: WorkflowState) {
   if (!role.startsWith("solver")) return names[role];
@@ -68,13 +69,28 @@ function displayAgent(
     (entry) =>
       entry.meta?.agent === role && entry.event === "agent_attempt_failed",
   );
+  const latestLifecycle = state.history.findLast(
+    (entry) =>
+      entry.meta?.agent === role &&
+      [
+        "agent_attempt_started",
+        "agent_attempt_completed",
+        "agent_attempt_failed",
+        "agent_aborted_by_user",
+        "agent_superseded_by_upstream_retry",
+      ].includes(entry.event),
+  );
   const status =
     live?.status ??
     (state.results[role]
       ? "completed"
-      : state.phase === "BLOCKED" && last
-        ? "failed"
-        : "pending");
+      : latestLifecycle?.event === "agent_aborted_by_user"
+        ? "aborted"
+        : latestLifecycle?.event === "agent_superseded_by_upstream_retry"
+          ? "stopped"
+          : state.phase === "BLOCKED" && last
+            ? "failed"
+            : "pending");
   const modelId = state.config.agents[role].model;
   const model = state.config.ui.progress.showModels
     ? ` [${/^[A-Za-z0-9._:/-]{1,80}$/.test(modelId) && !modelId.includes("://") ? modelId.slice(0, 24) : "model configured"}]`
@@ -83,15 +99,34 @@ function displayAgent(
     live?.startedAt !== undefined ? `  ${elapsed(runtime!.elapsed(live))}` : "";
   const retry =
     live?.retry && status === "running" ? ` · retry ${live.retry}/1` : "";
-  const label = `${symbols[status]} ${agentName(role, state)}${model}${duration}${retry}`;
+  const attempt =
+    live?.attempt && (live.manualRetry || live.attempt > 1)
+      ? ` · attempt ${live.attempt}`
+      : "";
+  const label = `${symbols[status]} ${agentName(role, state)}${model}${duration}${retry}${attempt}`;
   const activity =
     status === "running" &&
     live?.activity &&
     state.config.ui.progress.showToolActivity
       ? `  ↳ ${live.activity}`
       : undefined;
+  const reconnect =
+    status === "running" && live?.networkRetry
+      ? `  ↳ Reconnecting · ${live.networkRetry.category === "transport" ? "network error" : live.networkRetry.category === "rate_limit" ? "rate limited" : "provider temporarily unavailable"} · ${live.networkRetry.maxRetries === 0 ? `attempt ${live.networkRetry.retry}` : `${live.networkRetry.retry}/${live.networkRetry.maxRetries}`}${live.networkRetry.retryAt === undefined ? "" : ` · retry in ${Math.ceil(Math.max(0, live.networkRetry.retryAt - Date.now()) / 1000)}s`}`
+      : undefined;
   const error =
-    status === "failed" && live?.error ? `  ↳ ${live.error}` : undefined;
+    status === "aborted"
+      ? "  ↳ Aborted by user"
+      : status === "stopped" &&
+          latestLifecycle?.event === "agent_superseded_by_upstream_retry"
+        ? "  ↳ Stopped for upstream retry"
+        : status === "failed" && live?.error
+          ? `  ↳ ${live.error}`
+          : undefined;
+  const control =
+    status === "running" && live?.controlActivity
+      ? `  ↳ ${live.controlActivity}`
+      : undefined;
   const persistedRetry = state.history.findLast(
     (entry) => entry.meta?.agent === role && entry.event === "agent_retry",
   );
@@ -106,7 +141,7 @@ function displayAgent(
       : status === "failed" && last
         ? `  ↳ Final error: ${last.detail.split(": ").at(-1)} · attempt ${last.meta?.attempt}`
         : undefined;
-  return [label, activity, reason ?? error].filter(
+  return [label, control ?? reconnect ?? activity, reason ?? error].filter(
     (line): line is string => !!line,
   );
 }

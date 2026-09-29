@@ -27,7 +27,13 @@ const exactPath = z.string().superRefine((path, ctx) => {
   }
 });
 export const approvalSchema = z.object({
-  kind: z.enum(["commands", "dirtyPaths", "manualCommit", "configDrift"]),
+  kind: z.enum([
+    "commands",
+    "dirtyPaths",
+    "manualCommit",
+    "configDrift",
+    "manualRetry",
+  ]),
   title: z.string(),
   prompt: z.string(),
   options: z.array(
@@ -105,6 +111,10 @@ export const stateSchema = z.object({
           timeoutMs: z.number().int().nullable().optional(),
           timeoutMode: z.enum(["limited", "unlimited"]).optional(),
           durationMs: z.number().int().optional(),
+          networkRetry: z.number().int().nonnegative().optional(),
+          trigger: z
+            .enum(["initial", "automatic_retry", "manual_retry"])
+            .optional(),
         })
         .optional(),
     }),
@@ -119,6 +129,9 @@ export const stateSchema = z.object({
   pendingApproval: approvalSchema.optional(),
   inFlight: z
     .object({ phase: z.enum(phases), roles: z.array(z.enum(roles)) })
+    .optional(),
+  manualRetry: z
+    .object({ agent: z.enum(roles), phase: z.enum(phases) })
     .optional(),
   blocker: z.string().optional(),
   gateHashes: z.record(z.string()).optional(),

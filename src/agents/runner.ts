@@ -38,6 +38,15 @@ import type { WorkflowState } from "../workflow/state.ts";
 import { effectiveConfig } from "./discovery.ts";
 import { AgentTimeoutError, getAgentTimeoutMs } from "./errors.ts";
 import { configureAgentSampling } from "./sampling.ts";
+import {
+  configureNetworkRetry,
+  resolveNetworkRetry,
+  type NetworkRetryEvent,
+} from "./network-retry.ts";
+import {
+  ActiveSessionRegistry,
+  type ActiveAgentSession,
+} from "./active-sessions.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -55,6 +64,8 @@ export interface AgentRunner {
     activity?: ActivityObserver,
     attempt?: number,
     output?: OutputObserver,
+    network?: (event: NetworkRetryEvent) => void,
+    registry?: ActiveSessionRegistry,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -63,6 +74,8 @@ export class PiRunner implements AgentRunner {
     s: WorkflowState,
     evidence: CommandEvidence[] = [],
     activity?: ActivityObserver,
+    network?: (event: NetworkRetryEvent) => void,
+    getSignal: () => AbortSignal | undefined = () => undefined,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
       selected = config.agents[role];
@@ -80,6 +93,12 @@ export class PiRunner implements AgentRunner {
         `Provider ${selected.provider} has no configured authentication`,
       );
     configureAgentSampling(runtime, model, selected);
+    configureNetworkRetry(
+      runtime,
+      resolveNetworkRetry(config, role),
+      getSignal,
+      network,
+    );
     const settings = SettingsManager.inMemory({
       packages: [],
       extensions: [],
@@ -201,19 +220,44 @@ export class PiRunner implements AgentRunner {
     activity?: ActivityObserver,
     attempt = 1,
     output?: OutputObserver,
+    network?: (event: NetworkRetryEvent) => void,
+    registry?: ActiveSessionRegistry,
   ) {
     const evidence: CommandEvidence[] = [];
-    const session = await this.createSession(role, state, evidence, activity);
+    let executionSignal: AbortSignal | undefined;
+    const session = await this.createSession(
+      role,
+      state,
+      evidence,
+      activity,
+      network,
+      () => executionSignal,
+    );
+    const entry: ActiveAgentSession = {
+      workflowId: state.id,
+      agentId: role,
+      attempt,
+      session,
+      startedAt: Date.now(),
+      state: "running",
+    };
+    try {
+      registry?.register(entry);
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
     const timeoutMs = getAgentTimeoutMs(state.config, role);
-    const timeoutAbort =
-      timeoutMs === undefined ? undefined : new AbortController();
-    const executionSignal = timeoutAbort?.signal ?? signal;
+    const executionAbort = new AbortController();
+    executionSignal = executionAbort.signal;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortTask: Promise<void> | undefined;
     const abort = () => {
+      if (abortTask) return;
       if (timer) clearTimeout(timer);
-      timeoutAbort?.abort();
-      void session.abort().catch(() => {});
+      executionAbort.abort();
+      abortTask = session.abort().catch(() => {});
     };
     if (timeoutMs !== undefined)
       timer = setTimeout(() => {
@@ -312,6 +356,8 @@ export class PiRunner implements AgentRunner {
       }
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      registry?.remove(entry);
+      await abortTask;
       await session.extensionRunner
         .emit({ type: "session_shutdown", reason: "quit" })
         .catch(() => {});

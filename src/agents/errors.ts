@@ -25,6 +25,28 @@ export class AgentTimeoutError extends Error {
   }
 }
 
+export class AgentAbortedByUserError extends Error {
+  readonly failures = 0;
+  constructor(
+    readonly agentId: Role,
+    readonly attempt: number,
+  ) {
+    super(`${agentId} attempt ${attempt} aborted by user`);
+    this.name = "AgentAbortedByUserError";
+  }
+}
+
+export class AgentSupersededForRetryError extends Error {
+  readonly failures = 0;
+  constructor(
+    readonly agentId: Role,
+    readonly attempt: number,
+  ) {
+    super(`${agentId} attempt ${attempt} stopped for an upstream manual retry`);
+    this.name = "AgentSupersededForRetryError";
+  }
+}
+
 export type FailureCategory =
   | "cancelled"
   | "timeout"

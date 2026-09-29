@@ -20,6 +20,7 @@ import { checkAskCompatibility } from "./pi-ask.ts";
 import { packagePath } from "./resources.ts";
 import { assertTemperatureSupported } from "../agents/sampling.ts";
 import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
+import { resolveNetworkRetry } from "../agents/network-retry.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -119,6 +120,10 @@ export async function doctor(cwd: string) {
         auth = runtime.hasConfiguredAuth(selection.provider);
       lines.push(
         `${role}: ${selection.provider}/${selection.model}; model ${present ? "registered" : "MISSING"}; auth ${auth ? "configured" : "MISSING"}${selection.temperature === undefined ? "" : `; temperature ${selection.temperature}`}; timeout ${formatAgentTimeout(getAgentTimeoutMs(config, role))}`,
+      );
+      const retry = resolveNetworkRetry(config, role);
+      lines.push(
+        `  network retry: ${retry.maxRetries === 0 ? "unlimited" : retry.maxRetries} max retries; ${retry.delayMs} ms delay`,
       );
       if (!present || !auth) ok = false;
       if (model)

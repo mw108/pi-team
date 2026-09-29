@@ -22,6 +22,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         controller: AbortController;
         runtime: ProgressRuntime;
         state?: WorkflowState;
+        engine?: WorkflowEngine;
       }
     | undefined;
   pi.on("session_start", async (_event, ctx) => {
@@ -72,6 +73,128 @@ export default function teamExtension(pi: ExtensionAPI) {
       );
     },
   });
+  const target = (args: string, command: string): Role => {
+    const role = args.trim();
+    if (!roles.includes(role as Role))
+      throw new Error(`Usage: /${command} <agent-id>`);
+    return role as Role;
+  };
+  pi.registerCommand("team-steer", {
+    description:
+      "Guide one running agent in its current session: /team-steer <agent-id> <message>",
+    handler: async (args, ctx) => {
+      try {
+        const match = /^\s*(\S+)\s+/.exec(args);
+        const message = match ? args.slice(match[0].length) : "";
+        if (!match || !roles.includes(match[1] as Role) || !message.trim())
+          throw new Error("Usage: /team-steer <agent-id> <message>");
+        const root = await projectRoot(ctx.cwd);
+        if (!active?.state || active.state.cwd !== root || !active.engine)
+          throw new Error(`Agent "${match[1]}" is not currently running.`);
+        await active.engine.steer(active.state, match[1] as Role, message);
+        ctx.ui.notify(`Steering message queued for ${match[1]}.`, "info");
+      } catch (e) {
+        ctx.ui.notify(String(e), "error");
+      }
+    },
+  });
+  pi.registerCommand("team-abort", {
+    description:
+      "Stop one running agent without replacement: /team-abort <agent-id>",
+    handler: async (args, ctx) => {
+      try {
+        const role = target(args, "team-abort");
+        const root = await projectRoot(ctx.cwd);
+        if (!active?.state || active.state.cwd !== root || !active.engine)
+          throw new Error(`Agent "${role}" is not currently running.`);
+        await active.engine.abortAgent(active.state, role);
+        ctx.ui.notify(`${role} abort requested.`, "info");
+      } catch (e) {
+        ctx.ui.notify(String(e), "error");
+      }
+    },
+  });
+  pi.registerCommand("team-retry", {
+    description: "Start a fresh attempt for one agent: /team-retry <agent-id>",
+    handler: async (args, ctx) => {
+      let ownedRuntime: ProgressRuntime | undefined;
+      try {
+        const role = target(args, "team-retry");
+        const root = await projectRoot(ctx.cwd);
+        if (active?.state && active.state.cwd !== root)
+          throw new Error("Another repository has an active team workflow.");
+        const state = active?.state ?? (await new StateStore(root).latest());
+        if (!state) throw new Error("No team workflow in this repository.");
+        const runtime =
+          active?.runtime ??
+          new ProgressRuntime(() => {
+            if (runtime.state) progress(ctx, runtime.state, runtime);
+          });
+        const engine =
+          active?.engine ??
+          new WorkflowEngine(root, new PiRunner(), {
+            progress: (s) => runtime.bind(s),
+            ask: (q) => askUser(pi, ctx, q),
+            approve: (request) => askApproval(pi, ctx, request),
+            agentEvent: (event) => runtime.event(event),
+          });
+        if (!active) ownedRuntime = runtime;
+        const message = engine.retryConfirmation(state, role);
+        let confirmed = false;
+        if (message) {
+          const selected = await askApproval(pi, ctx, {
+            kind: "manualRetry",
+            title: `Retry ${role}?`,
+            prompt: message,
+            options: [
+              {
+                value: "retry",
+                label: "Retry",
+                description: "Start a fresh agent attempt",
+              },
+              {
+                value: "cancel",
+                label: "Cancel",
+                description: "Keep the current result",
+              },
+            ],
+          });
+          if (!selected?.includes("retry")) {
+            ctx.ui.notify("Retry cancelled.", "info");
+            return;
+          }
+          confirmed = true;
+        }
+        const result = await engine.retryAgent(state, role, confirmed);
+        ctx.ui.notify(
+          `${role} ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
+          "info",
+        );
+        if (result !== "prepared") return;
+        const controller = new AbortController();
+        active = { controller, runtime, state, engine };
+        runtime.configure(
+          state.config.ui.progress.refreshMs,
+          state.config.ui.progress.enabled,
+        );
+        runtime.bind(state);
+        try {
+          const finished = await engine.run(state, controller.signal);
+          ctx.ui.notify(
+            `Team ${finished.phase}${finished.blocker ? ` · ${finished.blocker}` : ""}`,
+            finished.phase === "BLOCKED" ? "error" : "info",
+          );
+        } finally {
+          runtime.dispose();
+          active = undefined;
+        }
+      } catch (e) {
+        ctx.ui.notify(String(e), "error");
+      } finally {
+        ownedRuntime?.dispose();
+      }
+    },
+  });
   pi.registerCommand("team-status", {
     description: "Show the latest persisted team workflow",
     handler: async (args, ctx) => {
@@ -87,7 +210,7 @@ export default function teamExtension(pi: ExtensionAPI) {
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `${renderProgress(state, runtime).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}`,
+            `${renderProgress(state, runtime).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id>`,
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
@@ -172,6 +295,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           approve: (request) => askApproval(pi, ctx, request),
           agentEvent: (event) => runtime.event(event),
         });
+        active.engine = engine;
         const [verb, id] = args.trim().split(/\s+/);
         let state;
         if (verb === "resume") {

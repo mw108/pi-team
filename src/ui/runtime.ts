@@ -3,7 +3,7 @@ import type { WorkflowState } from "../workflow/state.ts";
 import { formatToolActivity } from "./activity.ts";
 
 export type AgentRuntimeStatus =
-  "pending" | "running" | "completed" | "failed" | "stopped";
+  "pending" | "running" | "completed" | "failed" | "stopped" | "aborted";
 export interface AgentProgress {
   instanceId: Role;
   status: AgentRuntimeStatus;
@@ -14,11 +14,42 @@ export interface AgentProgress {
   error?: string;
   retry?: number;
   previousFailure?: string;
+  attempt?: number;
+  controlActivity?: string;
+  manualRetry?: boolean;
+  networkRetry?: {
+    retry: number;
+    maxRetries: number;
+    delayMs: number;
+    retryAt?: number;
+    category: string;
+  };
 }
 export type AgentEvent =
-  | { type: "start" | "complete"; role: Role }
+  | {
+      type: "start" | "complete";
+      role: Role;
+      attempt?: number;
+      trigger?: "initial" | "automatic_retry" | "manual_retry";
+    }
   | { type: "fail"; role: Role; error: string }
   | { type: "retry"; role: Role; attempt: number; reason: string }
+  | {
+      type: "steer" | "steerClear" | "aborting" | "aborted" | "superseded";
+      role: Role;
+    }
+  | { type: "restarting"; role: Role; attempt: number }
+  | {
+      type: "networkRetry";
+      role: Role;
+      retry: number;
+      maxRetries: number;
+      delayMs: number;
+      retryAt: number;
+      category: string;
+    }
+  | { type: "networkStarted"; role: Role }
+  | { type: "networkClear"; role: Role }
   | {
       type: "activity";
       role: Role;
@@ -100,8 +131,37 @@ export class ProgressRuntime {
         instanceId: event.role,
         status: "running",
         startedAt: this.now(),
+        attempt: event.attempt,
+        manualRetry: event.trigger === "manual_retry",
+        previousFailure:
+          event.trigger === "automatic_retry"
+            ? existing?.previousFailure
+            : undefined,
       };
-    else if (event.type === "complete" || event.type === "fail") {
+    else if (event.type === "steer" && existing)
+      existing.controlActivity = "Steering message queued";
+    else if (
+      event.type === "steerClear" &&
+      existing &&
+      existing.controlActivity === "Steering message queued"
+    )
+      existing.controlActivity = undefined;
+    else if (event.type === "aborting" && existing)
+      existing.controlActivity = "Aborting...";
+    else if (event.type === "restarting" && existing) {
+      existing.controlActivity = `Restarting as attempt ${event.attempt}`;
+      existing.networkRetry = undefined;
+    } else if (event.type === "aborted" && existing) {
+      existing.status = "aborted";
+      existing.completedAt = this.now();
+      existing.controlActivity = undefined;
+      existing.error = "Aborted by user";
+    } else if (event.type === "superseded" && existing) {
+      existing.status = "stopped";
+      existing.completedAt = this.now();
+      existing.controlActivity = undefined;
+      existing.error = "Stopped for upstream retry";
+    } else if (event.type === "complete" || event.type === "fail") {
       this.agents[event.role] = {
         ...existing,
         instanceId: event.role,
@@ -109,6 +169,7 @@ export class ProgressRuntime {
         completedAt: this.now(),
         activity: undefined,
         toolCallId: undefined,
+        controlActivity: undefined,
         error:
           event.type === "fail"
             ? "Agent or provider error; see workflow state"
@@ -119,7 +180,20 @@ export class ProgressRuntime {
       existing.previousFailure = event.reason;
       existing.activity = undefined;
       existing.toolCallId = undefined;
+    } else if (event.type === "networkRetry" && existing) {
+      existing.networkRetry = {
+        retry: event.retry,
+        maxRetries: event.maxRetries,
+        delayMs: event.delayMs,
+        retryAt: event.retryAt,
+        category: event.category,
+      };
+    } else if (event.type === "networkStarted" && existing?.networkRetry) {
+      existing.networkRetry.retryAt = undefined;
+    } else if (event.type === "networkClear" && existing) {
+      existing.networkRetry = undefined;
     } else if (event.type === "activity" && existing?.status === "running") {
+      existing.controlActivity = undefined;
       existing.activity = formatToolActivity(
         event.toolName,
         this.state?.config,

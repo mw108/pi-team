@@ -48,6 +48,11 @@ export async function contextFor(role: Role, s: WorkflowState) {
       "previous_securityReviewer",
       "previous_tester",
     );
+  if (role === "implementor" && s.manualRetry?.agent === "implementor")
+    context.manualRetry = {
+      instruction:
+        "This is a fresh attempt on the existing working tree. Inspect current files and diff before editing. Preserve all existing changes; do not reset or revert them.",
+    };
   if (role === "implementor" && s.approvedDirtyPaths.length)
     context.preExistingChanges = {
       approvedExactPaths: s.approvedDirtyPaths,

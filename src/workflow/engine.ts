@@ -45,12 +45,19 @@ import {
 import { transition } from "./router.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
+  AgentAbortedByUserError,
+  AgentSupersededForRetryError,
   AgentTimeoutError,
   classifyFailure,
   getAgentTimeoutMs,
   safeFailureLabel,
 } from "../agents/errors.ts";
-import { AgentLogStore, redactVisibleText } from "./agent-logs.ts";
+import { ActiveSessionRegistry } from "../agents/active-sessions.ts";
+import {
+  AgentLogStore,
+  AttemptLogger,
+  redactVisibleText,
+} from "./agent-logs.ts";
 import { classifyToolActivity } from "../ui/activity.ts";
 const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
@@ -71,6 +78,13 @@ const mutatingRoles: Role[] = [
   "pentester",
   "commitAgent",
 ];
+type AttemptControl = {
+  workflowId: string;
+  controller: AbortController;
+  attempt: number;
+  intention?: "abort" | "retry" | "superseded";
+  settled?: boolean;
+};
 export interface EngineUI {
   progress(state: WorkflowState): void;
   ask(question: Question): Promise<string | undefined>;
@@ -80,6 +94,13 @@ export interface EngineUI {
 export class WorkflowEngine {
   readonly store: StateStore;
   readonly logs: AgentLogStore;
+  readonly sessions = new ActiveSessionRegistry();
+  private readonly activeAttempts = new Map<Role, AttemptControl>();
+  private readonly retryRequests = new Set<Role>();
+  private readonly manualReruns = new Set<Role>();
+  private pendingRewind?: { workflowId: string; role: Role; phase: Phase };
+  private running = false;
+  private runningWorkflowId?: string;
   private historyWrite = Promise.resolve();
   private async persistAttempt(
     state: WorkflowState,
@@ -106,6 +127,282 @@ export class WorkflowEngine {
     this.cwd = projectRootSync(cwd);
     this.store = new StateStore(this.cwd);
     this.logs = new AgentLogStore(this.cwd);
+  }
+  activeAttempt(role: Role) {
+    return this.activeAttempts.get(role);
+  }
+  async steer(state: WorkflowState, role: Role, message: string) {
+    if (!message.trim()) throw new Error("Steering message is required.");
+    const attempt = this.activeAttempts.get(role);
+    if (
+      !attempt ||
+      attempt.workflowId !== state.id ||
+      attempt.intention ||
+      attempt.settled
+    )
+      throw new Error(`Agent "${role}" is not currently running.`);
+    const entry = await this.sessions.steer(state.id, role, message);
+    const logger = new AttemptLogger(
+      this.logs.path(state.id, role, attempt.attempt),
+    );
+    logger.append({
+      type: "agent_steer",
+      agent: role,
+      attempt: attempt.attempt,
+      message: redactVisibleText(message),
+    });
+    await logger.flush();
+    await this.persistAttempt(
+      state,
+      "agent_steered",
+      `${role} steering message queued`,
+      { agent: role, attempt: attempt.attempt },
+    );
+    this.emitAgentEvent({ type: "steer", role });
+    const clearWhenConsumed = () => {
+      if (
+        this.sessions.get(state.id, role) !== entry ||
+        entry.session.getSteeringMessages().length === 0
+      ) {
+        this.emitAgentEvent({ type: "steerClear", role });
+        return;
+      }
+      setTimeout(clearWhenConsumed, 250).unref?.();
+    };
+    setTimeout(clearWhenConsumed, 250).unref?.();
+  }
+  async abortAgent(state: WorkflowState, role: Role) {
+    const control = this.activeAttempts.get(role);
+    if (
+      !control ||
+      control.workflowId !== state.id ||
+      control.intention ||
+      control.settled
+    )
+      throw new Error(`Agent "${role}" is not currently running.`);
+    control.intention = "abort";
+    const session = this.sessions.get(state.id, role);
+    if (session) session.state = "aborting";
+    this.emitAgentEvent({ type: "aborting", role });
+    control.controller.abort();
+  }
+  retryConfirmation(state: WorkflowState, role: Role) {
+    const settled = this.activeAttempts.get(role);
+    if (
+      !state.results[role] &&
+      !(settled?.workflowId === state.id && settled.settled)
+    )
+      return undefined;
+    const downstream = this.dependentRoles(role).filter(
+      (key) => state.results[key],
+    );
+    return `${role} already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.join(", ")}` : ""}. Continue?`;
+  }
+  async retryAgent(state: WorkflowState, role: Role, confirmed = false) {
+    if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
+      throw new Error("Workflow mismatch for agent retry.");
+    const control = this.activeAttempts.get(role);
+    if (control && control.workflowId !== state.id)
+      throw new Error("Workflow mismatch for agent retry.");
+    if (control && control.workflowId === state.id && !control.settled) {
+      if (control.intention)
+        throw new Error(
+          `Agent ${role} is already ${control.intention === "retry" ? "restarting" : "aborting"}.`,
+        );
+      control.intention = "retry";
+      this.retryRequests.add(role);
+      const session = this.sessions.get(state.id, role);
+      if (session) session.state = "retrying";
+      this.emitAgentEvent({
+        type: "restarting",
+        role,
+        attempt: control.attempt + 1,
+      });
+      control.controller.abort();
+      return "restarting";
+    }
+    if (this.retryRequests.has(role))
+      throw new Error(`Agent ${role} is already restarting.`);
+    if (state.manualRetry && state.manualRetry.agent !== role)
+      throw new Error(
+        `Agent ${state.manualRetry.agent} already has a pending manual retry.`,
+      );
+    if (this.retryConfirmation(state, role) && !confirmed)
+      throw new Error(`Retrying completed ${role} requires confirmation.`);
+    const targetPhase = (Object.entries(phaseRoles) as [Phase, Role[]][]).find(
+      ([, roles]) => roles.includes(role),
+    )?.[0];
+    if (!targetPhase) throw new Error(`Unknown agent ${role}`);
+    if (this.nextAttempt(state, role) === 1 && !state.results[role])
+      throw new Error(`Agent ${role} has no attempt to retry yet.`);
+    if (this.running && state.phase !== targetPhase) {
+      if (
+        targetPhase === "SOLVE" &&
+        state.phase === "CRITIQUE" &&
+        !state.inFlight &&
+        !state.results.critic &&
+        this.activeAttempts.size === 0
+      ) {
+        this.prepareManualRetry(state, role, targetPhase);
+        await this.store.save(state);
+        return "queued";
+      }
+      const currentRoles = phaseRoles[state.phase] ?? [];
+      if (
+        this.pendingRewind ||
+        !state.inFlight ||
+        this.activeAttempts.size === 0 ||
+        currentRoles.some((currentRole) =>
+          mutatingRoles.includes(currentRole),
+        ) ||
+        ![
+          "ORCHESTRATE",
+          "RESEARCH",
+          "SOLVE",
+          "CRITIQUE",
+          "REVIEW",
+          "CODE_REVIEW",
+          "SECURITY_REVIEW",
+        ].includes(state.phase)
+      )
+        throw new Error(
+          `Cannot retry ${role} while ${state.phase} is running. Stop the workflow before rewinding this agent.`,
+        );
+      const order = Object.keys(phaseRoles) as Phase[];
+      if (order.indexOf(state.phase) <= order.indexOf(targetPhase))
+        throw new Error(
+          `Agent ${role} is not available in the current workflow phase.`,
+        );
+      if (
+        state.results.implementor ||
+        state.history.some(
+          (event) =>
+            event.phase === "IMPLEMENT" && event.event === "phase_started",
+        )
+      )
+        throw new Error(
+          `Cannot rewind ${role} after implementation; inspect repository changes and start a new workflow.`,
+        );
+      this.pendingRewind = { workflowId: state.id, role, phase: targetPhase };
+      for (const [activeRole, active] of this.activeAttempts)
+        if (active.workflowId === state.id && !active.settled) {
+          active.intention = "superseded";
+          this.emitAgentEvent({ type: "aborting", role: activeRole });
+          active.controller.abort();
+        }
+      return "queued";
+    }
+    if (this.running && state.phase === targetPhase) {
+      this.retryRequests.add(role);
+      this.manualReruns.add(role);
+      state.manualRetry = { agent: role, phase: targetPhase };
+      await this.persistAttempt(
+        state,
+        "agent_retry_requested_by_user",
+        `${role} manual retry queued`,
+        {
+          agent: role,
+          attempt: Math.max(1, this.nextAttempt(state, role) - 1),
+        },
+      );
+      return "queued";
+    }
+    this.prepareManualRetry(state, role, targetPhase);
+    await this.store.save(state);
+    return "prepared";
+  }
+  private prepareManualRetry(state: WorkflowState, role: Role, phase: Phase) {
+    if (state.commit || state.phase === "DONE")
+      throw new Error(
+        "Completed workflow cannot be retried after commit or completion.",
+      );
+    const order = Object.keys(phaseRoles) as Phase[];
+    const current =
+      state.phase === "BLOCKED"
+        ? state.history.findLast((e) => e.event === "blocked")?.phase
+        : state.phase;
+    if (!current || order.indexOf(current) < order.indexOf(phase))
+      throw new Error(
+        `Agent ${role} is not available in the current workflow phase.`,
+      );
+    if (state.phase === "BLOCKED") {
+      const failure = state.history.findLast(
+        (e) => e.event === "agent_failure",
+      );
+      if (state.blocker?.startsWith("Agent execution failed:")) {
+        if (failure?.detail.startsWith(`${role}:`))
+          state.agentFailures = Math.max(0, state.agentFailures - 1);
+        else if (!state.blocker.includes(`Agent ${role} aborted by user`))
+          throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
+      } else if (!(
+        state.blocker?.startsWith("Insufficient Solver proposals") &&
+        role.startsWith("solver")
+      ))
+        throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
+    }
+    if (
+      ["ORCHESTRATE", "RESEARCH", "SOLVE", "CRITIQUE", "REVIEW"].includes(
+        phase,
+      ) &&
+      (state.results.implementor ||
+        state.history.some(
+          (event) =>
+            event.phase === "IMPLEMENT" && event.event === "phase_started",
+        ))
+    )
+      throw new Error(
+        `Cannot rewind ${role} after implementation; inspect repository changes and start a new workflow.`,
+      );
+    state.phase = phase;
+    delete state.blocker;
+    state.manualRetry = { agent: role, phase };
+    this.manualReruns.add(role);
+    record(state, "agent_retry_requested_by_user", `${role} manual retry`, {
+      agent: role,
+      attempt: Math.max(1, this.nextAttempt(state, role) - 1),
+    });
+  }
+  private dependentRoles(role: Role): Role[] {
+    const all: Role[] = [
+      "orchestrator",
+      "researcher",
+      "solver1",
+      "solver2",
+      "solver3",
+      "critic",
+      "reviewer",
+      "implementor",
+      "codeReviewer",
+      "pentester",
+      "securityReviewer",
+      "tester",
+      "commitAgent",
+    ];
+    if (role.startsWith("solver")) return all.slice(all.indexOf("critic"));
+    return all.slice(all.indexOf(role) + 1);
+  }
+  private invalidateDependents(state: WorkflowState, role: Role) {
+    for (const dependent of this.dependentRoles(role)) {
+      if (state.results[dependent])
+        state.results[`previous_${dependent}`] = state.results[dependent];
+      delete state.results[dependent];
+    }
+    delete state.gateHashes;
+    delete state.commitIntent;
+    record(state, "downstream_invalidated", `After manual retry of ${role}`);
+  }
+  private nextAttempt(state: WorkflowState, role: Role) {
+    return (
+      Math.max(
+        0,
+        ...state.history
+          .filter(
+            (h) =>
+              h.event === "agent_attempt_started" && h.meta?.agent === role,
+          )
+          .map((h) => h.meta!.attempt),
+      ) + 1
+    );
   }
   async start(task: string, config: TeamConfig, definition?: TeamDefinition) {
     const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
@@ -151,10 +448,15 @@ export class WorkflowEngine {
     s: WorkflowState,
     signal?: AbortSignal,
     authoritative = s,
+    manualStart = false,
   ) {
     let failures = 0;
-    this.emitAgentEvent({ type: "start", role });
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let automaticRetries = 0;
+    let trigger: "initial" | "automatic_retry" | "manual_retry" =
+      manualStart || authoritative.manualRetry?.agent === role
+        ? "manual_retry"
+        : "initial";
+    for (;;) {
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
       const prior = authoritative.history
@@ -169,33 +471,61 @@ export class WorkflowEngine {
               .create(s.id, role, Math.max(0, ...prior) + 1)
               .catch(() => undefined);
       const attemptNumber = logged?.attempt ?? Math.max(0, ...prior) + 1;
-      const started = Date.now();
-      logged?.logger.append({
-        type: "agent_start",
-        agent: role,
+      const control: AttemptControl = {
+        workflowId: s.id,
+        controller: new AbortController(),
         attempt: attemptNumber,
-        timeoutMs: timeoutMs ?? null,
-        timeoutMode,
+      };
+      if (this.activeAttempts.has(role))
+        throw new Error(`${role} already has an active attempt`);
+      this.activeAttempts.set(role, control);
+      const abortForWorkflow = () => control.controller.abort();
+      signal?.addEventListener("abort", abortForWorkflow, { once: true });
+      if (signal?.aborted) control.controller.abort();
+      this.retryRequests.delete(role);
+      this.emitAgentEvent({
+        type: "start",
+        role,
+        attempt: attemptNumber,
+        trigger,
       });
-      await this.persistAttempt(
-        authoritative,
-        "agent_attempt_started",
-        `${role} attempt ${attemptNumber} started`,
-        {
+      const started = Date.now();
+      const calls = new Map<string, { name: string; started: number }>();
+      const networkHistoryWrites: Promise<void>[] = [];
+      try {
+        if (trigger === "manual_retry")
+          logged?.logger.append({
+            type: "agent_retry_requested_by_user",
+            agent: role,
+            previousAttempt: Math.max(0, attemptNumber - 1),
+            nextAttempt: attemptNumber,
+          });
+        logged?.logger.append({
+          type: "agent_start",
           agent: role,
           attempt: attemptNumber,
           timeoutMs: timeoutMs ?? null,
           timeoutMode,
-        },
-      );
-      const calls = new Map<string, { name: string; started: number }>();
-      try {
+          trigger,
+        });
+        await this.persistAttempt(
+          authoritative,
+          "agent_attempt_started",
+          `${role} attempt ${attemptNumber} started`,
+          {
+            agent: role,
+            attempt: attemptNumber,
+            timeoutMs: timeoutMs ?? null,
+            timeoutMode,
+            trigger,
+          },
+        );
         const result = parseResult(
           role,
           await this.runner.run(
             role,
             s,
-            signal,
+            control.controller.signal,
             (toolName, toolCallId, innerToolName, success) => {
               const key = toolCallId ?? "single";
               if (toolName) {
@@ -250,8 +580,58 @@ export class WorkflowEngine {
                 type: "assistant_output",
                 text: redactVisibleText(text),
               }),
+            (event) => {
+              logged?.logger.append({
+                ...event,
+                agentAttempt: attemptNumber,
+                networkRetry: event.retry,
+                message: redactVisibleText(event.message),
+              });
+              if (event.type === "network_retry_scheduled")
+                this.emitAgentEvent({
+                  type: "networkRetry",
+                  role,
+                  retry: event.retry,
+                  maxRetries: event.maxRetries,
+                  delayMs: event.delayMs!,
+                  category: event.category,
+                  retryAt: Date.now() + event.delayMs!,
+                });
+              if (event.type === "network_retry_started")
+                this.emitAgentEvent({ type: "networkStarted", role });
+              if (
+                event.type === "network_recovered" ||
+                event.type === "network_retries_exhausted"
+              )
+                this.emitAgentEvent({ type: "networkClear", role });
+              if (
+                (event.type === "network_retry_started" && event.retry === 1) ||
+                event.type === "network_recovered" ||
+                event.type === "network_retries_exhausted"
+              )
+                networkHistoryWrites.push(
+                  this.persistAttempt(
+                    authoritative,
+                    event.type,
+                    `${role} ${event.type.replaceAll("_", " ")} ${event.retry}`,
+                    {
+                      agent: role,
+                      attempt: attemptNumber,
+                      networkRetry: event.retry,
+                      reason: event.category,
+                    },
+                  ),
+                );
+            },
+            this.sessions,
           ),
         );
+        if (control.intention)
+          throw new Error("Agent operation superseded by user");
+        control.settled = true;
+        await Promise.all(networkHistoryWrites);
+        if (control.intention)
+          throw new Error("Agent operation superseded by user");
         logged?.logger.append({
           type: "agent_complete",
           durationMs: Date.now() - started,
@@ -267,6 +647,8 @@ export class WorkflowEngine {
             durationMs: Date.now() - started,
           },
         );
+        if (control.intention)
+          throw new Error("Agent operation superseded by user");
         if (role !== "commitAgent" || result.type === "QUESTION_REQUEST")
           this.emitAgentEvent({ type: "complete", role });
         return {
@@ -274,15 +656,73 @@ export class WorkflowEngine {
           failures,
         };
       } catch (e) {
+        await Promise.all(networkHistoryWrites);
+        if (control.intention === "superseded") {
+          logged?.logger.append({
+            type: "agent_superseded_by_upstream_retry",
+            agent: role,
+            attempt: attemptNumber,
+            durationMs: Date.now() - started,
+          });
+          await logged?.logger.flush();
+          await this.persistAttempt(
+            authoritative,
+            "agent_superseded_by_upstream_retry",
+            `${role} stopped for upstream manual retry`,
+            {
+              agent: role,
+              attempt: attemptNumber,
+              durationMs: Date.now() - started,
+            },
+          );
+          this.emitAgentEvent({ type: "superseded", role });
+          throw new AgentSupersededForRetryError(role, attemptNumber);
+        }
+        if (control.intention === "abort" || control.intention === "retry") {
+          const restarting = control.intention === "retry";
+          logged?.logger.append({
+            type: restarting
+              ? "agent_retry_requested_by_user"
+              : "agent_aborted_by_user",
+            agent: role,
+            attempt: attemptNumber,
+            ...(restarting
+              ? {
+                  previousAttempt: attemptNumber,
+                  nextAttempt: attemptNumber + 1,
+                }
+              : {}),
+          });
+          await logged?.logger.flush();
+          await this.persistAttempt(
+            authoritative,
+            restarting
+              ? "agent_retry_requested_by_user"
+              : "agent_aborted_by_user",
+            restarting
+              ? `${role} manual retry requested`
+              : `${role} aborted by user`,
+            { agent: role, attempt: attemptNumber },
+          );
+          if (restarting) {
+            trigger = "manual_retry";
+            this.emitAgentEvent({
+              type: "restarting",
+              role,
+              attempt: attemptNumber + 1,
+            });
+            continue;
+          }
+          this.emitAgentEvent({ type: "aborted", role });
+          throw new AgentAbortedByUserError(role, attemptNumber);
+        }
         const failure = classifyFailure(e);
         const category =
           e instanceof AgentTimeoutError
             ? "timeout"
             : signal?.aborted
               ? "cancelled"
-              : timeoutMs === undefined && failure === "timeout"
-                ? "network"
-                : failure;
+              : failure;
         const agentTimeoutMs =
           e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
         const label = safeFailureLabel(category, agentTimeoutMs);
@@ -309,15 +749,10 @@ export class WorkflowEngine {
         );
         if (signal?.aborted) throw e;
         failures++;
-        const transient = [
-          "timeout",
-          "http_503",
-          "rate_limit",
-          "network",
-        ].includes(category);
+        const transient = e instanceof AgentTimeoutError;
         if (
           s.agentFailures + failures >= s.config.workflow.maxAgentFailures ||
-          attempt === 1 ||
+          automaticRetries === 1 ||
           mutatingRoles.includes(role) ||
           !transient
         ) {
@@ -337,7 +772,7 @@ export class WorkflowEngine {
         await this.persistAttempt(
           authoritative,
           "agent_retry",
-          `${role} retry ${attempt + 1}/1: ${label}`,
+          `${role} retry ${automaticRetries + 1}/1: ${label}`,
           {
             agent: role,
             attempt: attemptNumber,
@@ -348,12 +783,17 @@ export class WorkflowEngine {
         this.emitAgentEvent({
           type: "retry",
           role,
-          attempt: attempt + 1,
+          attempt: automaticRetries + 1,
           reason: label,
         });
+        automaticRetries++;
+        trigger = "automatic_retry";
+      } finally {
+        signal?.removeEventListener("abort", abortForWorkflow);
+        if (this.activeAttempts.get(role) === control)
+          this.activeAttempts.delete(role);
       }
     }
-    throw new Error("Agent failed");
   }
   async recover(s: WorkflowState) {
     if (s.cwd !== this.cwd)
@@ -402,6 +842,8 @@ export class WorkflowEngine {
   }
   async run(s: WorkflowState, signal?: AbortSignal) {
     const unlock = await this.store.lock();
+    this.running = true;
+    this.runningWorkflowId = s.id;
     try {
       await this.recover(s);
       while (!["DONE", "BLOCKED"].includes(s.phase)) {
@@ -760,24 +1202,44 @@ export class WorkflowEngine {
           break;
         }
         const runRoles = allRoles.filter(
-          (r) => s.phase !== "SOLVE" || !s.results[r],
+          (r) =>
+            s.phase !== "SOLVE" || !s.results[r] || s.manualRetry?.agent === r,
         );
+        const manualAtStart = new Set(this.manualReruns);
+        this.manualReruns.clear();
         s.inFlight = { phase: s.phase, roles: runRoles };
         record(s, "phase_started", runRoles.join(", "));
         await this.store.save(s);
         // Use isolated snapshots. A solver can never observe a sibling's initial output.
         const results = await Promise.allSettled(
-          runRoles.map(async (role) => ({
-            role,
-            ...(await this.invoke(role, structuredClone(s), signal, s)),
-          })),
+          runRoles.map(async (role) => {
+            const snapshot = structuredClone(s);
+            if (snapshot.manualRetry?.agent === role)
+              delete snapshot.results[role];
+            return {
+              role,
+              ...(await this.invoke(
+                role,
+                snapshot,
+                signal,
+                s,
+                manualAtStart.has(role),
+              )),
+            };
+          }),
         );
         // Failure accounting belongs to the authoritative parent, not the isolated snapshots.
         let error: string | undefined;
+        let aborted: Role | undefined;
         let pending: Question | undefined;
         for (let i = 0; i < results.length; i++) {
           const item = results[i];
           if (item.status === "rejected") {
+            if (item.reason instanceof AgentAbortedByUserError) {
+              aborted = runRoles[i];
+              continue;
+            }
+            if (item.reason instanceof AgentSupersededForRetryError) continue;
             s.agentFailures += item.reason?.failures ?? 1;
             record(
               s,
@@ -804,8 +1266,35 @@ export class WorkflowEngine {
                 }
               : result;
           } else {
+            if (s.manualRetry?.agent === role && !this.manualReruns.has(role)) {
+              this.invalidateDependents(s, role);
+              delete s.manualRetry;
+            }
             s.results[role] = result;
             if (role !== "commitAgent") record(s, "agent_completed", role);
+          }
+        }
+        for (const role of [...this.manualReruns]) {
+          if (!allRoles.includes(role)) continue;
+          this.manualReruns.delete(role);
+          this.retryRequests.delete(role);
+          try {
+            const snapshot = structuredClone(s);
+            delete snapshot.results[role];
+            const replay = await this.invoke(role, snapshot, signal, s, true);
+            s.agentFailures += replay.failures;
+            if (replay.result.type !== "QUESTION_REQUEST") {
+              this.invalidateDependents(s, role);
+              s.results[role] = replay.result;
+              delete s.manualRetry;
+              record(s, "agent_completed", role);
+            } else pending = replay.result;
+          } catch (retryError) {
+            if (retryError instanceof AgentAbortedByUserError) aborted = role;
+            else {
+              s.agentFailures += (retryError as any)?.failures ?? 1;
+              error = String(retryError);
+            }
           }
         }
         delete s.inFlight;
@@ -819,6 +1308,29 @@ export class WorkflowEngine {
           await this.store.save(s);
           break;
         }
+        if (this.pendingRewind?.workflowId === s.id) {
+          const rewind = this.pendingRewind;
+          this.pendingRewind = undefined;
+          this.prepareManualRetry(s, rewind.role, rewind.phase);
+          await this.store.save(s);
+          continue;
+        }
+        if (s.phase === "SOLVE") {
+          const valid = ["solver1", "solver2", "solver3"].filter(
+            (role) => !!s.results[role],
+          ).length;
+          if (valid >= 2 && aborted && !error) {
+            aborted = undefined;
+          } else if (valid < 2 && (aborted || error)) {
+            block(
+              s,
+              `Insufficient Solver proposals. Need at least 2, have ${valid}.`,
+            );
+            await this.store.save(s);
+            break;
+          }
+        }
+        if (aborted && !error) error = `Agent ${aborted} aborted by user`;
         if (error) {
           block(s, `Agent execution failed: ${error}`);
           await this.store.save(s);
@@ -843,7 +1355,7 @@ export class WorkflowEngine {
         }
         if (s.phase === "SOLVE")
           for (const role of ["solver1", "solver2", "solver3"])
-            if ((s.results[role] as any)?.solverId !== role)
+            if (s.results[role] && (s.results[role] as any)?.solverId !== role)
               throw new Error(`Solver identity mismatch: ${role}`);
         if (
           s.phase === "TEST" &&
@@ -899,6 +1411,10 @@ export class WorkflowEngine {
       this.ui.progress(s);
       return s;
     } finally {
+      this.running = false;
+      this.runningWorkflowId = undefined;
+      if (this.pendingRewind?.workflowId === s.id)
+        this.pendingRewind = undefined;
       await unlock();
     }
   }

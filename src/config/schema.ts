@@ -42,6 +42,13 @@ const agent = z
     timeoutMs: z
       .union([z.literal(0), z.number().int().min(1000).max(3600000)])
       .optional(),
+    networkRetry: z
+      .object({
+        maxRetries: z.number().int().min(0).optional(),
+        delayMs: z.number().int().min(100).max(60000).optional(),
+      })
+      .strict()
+      .optional(),
     thinking: z
       .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
       .default("off"),
@@ -115,6 +122,13 @@ export const configSchema = z
         agentTimeoutMs: z
           .union([z.literal(0), z.number().int().min(1000).max(3600000)])
           .default(300000),
+        networkRetry: z
+          .object({
+            maxRetries: z.number().int().min(0).default(10),
+            delayMs: z.number().int().min(100).max(60000).default(3000),
+          })
+          .strict()
+          .default({}),
         maxToolCalls: z.number().int().min(1).default(80),
       })
       .default({}),

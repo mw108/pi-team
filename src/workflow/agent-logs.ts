@@ -142,14 +142,33 @@ export class AgentLogStore {
         const status =
           last?.type === "agent_complete"
             ? "✓ completed"
-            : events.some((e) => e.type === "provider_error")
-              ? `✗ ${events.findLast((e) => e.type === "provider_error")?.category ?? "failed"}`
-              : "● running";
+            : events.some((e) => e.type === "agent_aborted_by_user")
+              ? "⊘ aborted by user"
+              : events.some(
+                    (e) => e.type === "agent_superseded_by_upstream_retry",
+                  )
+                ? "↻ stopped for upstream retry"
+                : events.some((e) => e.type === "agent_retry_requested_by_user")
+                  ? "↻ manually retried"
+                  : events.some((e) => e.type === "provider_error")
+                    ? `✗ ${events.findLast((e) => e.type === "provider_error")?.category ?? "failed"}`
+                    : "● running";
         const duration = events.findLast(
-          (e) => e.type === "agent_complete" || e.type === "provider_error",
+          (e) =>
+            e.type === "agent_complete" ||
+            e.type === "provider_error" ||
+            e.type === "agent_aborted_by_user" ||
+            e.type === "agent_retry_requested_by_user" ||
+            e.type === "agent_superseded_by_upstream_retry",
         )?.durationMs;
         const runningMs =
           last?.type !== "agent_complete" &&
+          !events.some(
+            (e) =>
+              e.type === "agent_aborted_by_user" ||
+              e.type === "agent_retry_requested_by_user" ||
+              e.type === "agent_superseded_by_upstream_retry",
+          ) &&
           !events.some((e) => e.type === "provider_error") &&
           typeof events[0]?.at === "string"
             ? Math.max(0, Date.now() - Date.parse(events[0].at))
@@ -161,8 +180,14 @@ export class AgentLogStore {
     }
     return lines.join("\n");
   }
-  async timeline(id: string, role: Role, attempt?: number) {
+  async timeline(id: string, role: Role, attempt?: number): Promise<string> {
     const attempts = await this.attempts(id, role);
+    if (attempt === undefined && attempts.length)
+      return (
+        await Promise.all(
+          attempts.map((number) => this.timeline(id, role, number)),
+        )
+      ).join("\n\n");
     const selected = attempt ?? attempts.at(-1);
     if (!selected || !attempts.includes(selected))
       return `No log for ${role}${attempt ? ` attempt ${attempt}` : ""}.`;
@@ -173,22 +198,45 @@ export class AgentLogStore {
         typeof event.at === "string" ? event.at.slice(11, 19) : "--:--:--";
       const label =
         event.type === "agent_start"
-          ? "started"
-          : event.type === "tool_start"
-            ? event.activity
-            : event.type === "provider_error"
-              ? event.label
-              : event.type === "retry"
-                ? `retry → attempt ${event.nextAttempt}`
-                : event.type === "agent_complete"
-                  ? "completed"
-                  : undefined;
+          ? event.trigger === "manual_retry"
+            ? "manual retry started"
+            : "started"
+          : event.type === "agent_steer"
+            ? "steering message queued"
+            : event.type === "agent_aborted_by_user"
+              ? "aborted by user"
+              : event.type === "agent_superseded_by_upstream_retry"
+                ? "stopped for upstream retry"
+                : event.type === "agent_retry_requested_by_user"
+                  ? `manual retry → attempt ${event.nextAttempt}`
+                  : event.type === "tool_start"
+                    ? event.activity
+                    : event.type === "network_error"
+                      ? "network connection lost"
+                      : event.type === "network_retry_started"
+                        ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
+                        : event.type === "network_recovered"
+                          ? "connection recovered"
+                          : event.type === "network_retries_exhausted"
+                            ? "network retries exhausted"
+                            : event.type === "provider_error"
+                              ? event.label
+                              : event.type === "retry"
+                                ? `retry → attempt ${event.nextAttempt}`
+                                : event.type === "agent_complete"
+                                  ? "completed"
+                                  : undefined;
       if (label) lines.push(`${time} ${label}`);
     }
     if (
       !events.length ||
       !events.some(
-        (e) => e.type === "provider_error" || e.type === "agent_complete",
+        (e) =>
+          e.type === "provider_error" ||
+          e.type === "agent_complete" ||
+          e.type === "agent_aborted_by_user" ||
+          e.type === "agent_retry_requested_by_user" ||
+          e.type === "agent_superseded_by_upstream_retry",
       )
     )
       lines.push("running or interrupted; no terminal event recorded");
