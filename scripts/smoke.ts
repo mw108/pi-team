@@ -25,16 +25,16 @@ async function check(name: string, run: () => Promise<unknown>) {
 }
 const session = await runner.createSession("researcher", state);
 try {
-  const ctx = session.extensionRunner.createContext();
   const call = async (name: string, args: any) => {
     const tool = session.getToolDefinition(name);
     if (!tool) throw new Error(`Missing tool: ${name}`);
+    const toolCallId = `smoke-${name}`;
     const result = await tool.execute(
-      `smoke-${name}`,
+      toolCallId,
       args,
       AbortSignal.timeout(60000),
       undefined,
-      ctx,
+      session.extensionRunner.createToolContext(toolCallId, undefined),
     );
     const content = result.content
       .filter((c) => c.type === "text")

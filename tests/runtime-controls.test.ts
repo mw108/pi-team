@@ -71,7 +71,7 @@ test("session registry keys by workflow and agent, steers the same object, and r
     steer: async (message: string) => {
       steered.push(message);
     },
-  } as AgentSession;
+  } as unknown as AgentSession;
   const first = {
     workflowId: "one",
     agentId: "solver1" as const,

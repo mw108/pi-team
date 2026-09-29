@@ -1,5 +1,6 @@
 import type {
   ExtensionAPI,
+  ExtensionToolContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { writeFile } from "node:fs/promises";
@@ -66,7 +67,7 @@ export default async function smoke(pi: ExtensionAPI) {
         },
         undefined,
         undefined,
-        ctx,
+        ctx as unknown as ExtensionToolContext,
       );
       const details = result.details as any;
       const passed =

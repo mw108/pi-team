@@ -229,7 +229,7 @@ export class ToolUseGuard {
     private readonly config: ReturnType<typeof resolveDoomLoop>,
     private readonly maxToolCalls: number,
     private readonly session: () => {
-      steer(text: string): Promise<void>;
+      steer(text: string): Promise<unknown>;
       setActiveToolsByName(names: string[]): void;
     },
     private readonly event?: (event: GuardEvent) => void,
@@ -266,7 +266,7 @@ export class ToolUseGuard {
       this.finalizationReason = "tool_budget";
       this.toolsDisabledForFinalization = true;
       this.event?.({ type: "tool_budget_finalization" });
-      // Pi 0.87.1 AgentSession.steer() queues a role=user message via _queueSteer().
+      // AgentSession.steer() queues a role=user message.
       await this.session().steer(TOOL_BUDGET_FINALIZE);
       this.session().setActiveToolsByName([]);
       return {

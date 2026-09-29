@@ -159,7 +159,7 @@ A clean Git status means there are no uncommitted changes. Existing changes are 
 ## Install from scratch
 
 ```bash
-npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@0.87.1
+npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@0.99.0
 export PATH="$HOME/.local/bin:$PATH"
 cd /path/to/pi-team
 npm ci --ignore-scripts
@@ -169,6 +169,8 @@ pi install /absolute/path/to/pi-team/node_modules/@bacnh85/pi-serena
 pi install /absolute/path/to/pi-team/node_modules/pi-mcp-adapter
 pi install /absolute/path/to/pi-team/node_modules/pi-web-access
 ```
+
+Pi host-provided extension packages are declared as `peerDependencies` with `"*"` so Pi supplies them at runtime. Pinned versions in `devDependencies` support local typechecking and tests.
 
 These local registrations reuse the locked, inspected copies. The integrations also support their documented npm installation form:
 

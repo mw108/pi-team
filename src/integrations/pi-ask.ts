@@ -1,6 +1,7 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ExtensionToolContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { pathToFileURL } from "node:url";
@@ -68,7 +69,8 @@ async function invoke(
     params,
     undefined,
     undefined,
-    ctx,
+    // pi-ask 1.2 uses the base extension context only; Pi 0.99 types tool contexts separately.
+    ctx as ExtensionToolContext,
   );
   const details = result.details as any;
   return !details?.cancelled && details?.mode === "submit"
