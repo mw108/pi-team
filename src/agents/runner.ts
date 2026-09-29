@@ -345,8 +345,10 @@ export class PiRunner implements AgentRunner {
           },
           toolCalls: entry.toolCalls ?? 0,
           maxToolCalls: entry.maxToolCalls ?? 0,
+          toolBudgetUnlimited: entry.maxToolCalls === 0,
           toolBudgetExhausted:
-            (entry.toolCalls ?? 0) >= (entry.maxToolCalls ?? Infinity),
+            (entry.maxToolCalls ?? 0) > 0 &&
+            (entry.toolCalls ?? 0) >= entry.maxToolCalls!,
           networkRetryState: {
             currentRetry: event.networkRetry,
             maxRetries: retryPolicy.maxRetries,

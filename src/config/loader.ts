@@ -5,6 +5,7 @@ import YAML from "yaml";
 import { configSchema, type TeamConfig } from "./schema.ts";
 import { contained, projectRoot, teamRoot } from "./project.ts";
 import { digest, promptHashes } from "../agents/registry.ts";
+import { semanticConfigHash } from "./drift.ts";
 function compatibleConfig(source: string): TeamConfig {
   const value = YAML.parse(source, { uniqueKeys: true });
   if (value?.agents && !value.agents.reporter && value.agents.orchestrator) {
@@ -30,6 +31,7 @@ export interface TeamDefinition {
   path: string;
   config: TeamConfig;
   configHash: string;
+  semanticConfigHash: string;
   agentPromptHashes: Record<string, string>;
 }
 export async function loadConfig(cwd: string): Promise<TeamDefinition> {
@@ -63,6 +65,7 @@ export async function loadConfig(cwd: string): Promise<TeamDefinition> {
       path,
       config,
       configHash: digest(source),
+      semanticConfigHash: semanticConfigHash(config),
       agentPromptHashes: await promptHashes(root, config),
     };
   } catch (error) {
@@ -78,9 +81,12 @@ export async function snapshotDefinition(
 ) {
   const actual = path ?? join(teamRoot(root), "team.yaml");
   const source = await readFile(actual, "utf8");
+  const sourceConfig = compatibleConfig(source);
   return {
     path: actual,
     configHash: digest(source),
+    config: sourceConfig,
+    semanticConfigHash: semanticConfigHash(sourceConfig),
     agentPromptHashes: await promptHashes(root, config),
   };
 }

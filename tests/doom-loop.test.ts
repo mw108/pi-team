@@ -340,6 +340,45 @@ test("tool budget queues one finalization steer and blocks further tools", async
   assert.deepEqual(disabled, [[]]);
 });
 
+test("zero tool budget permits over 1000 distinct calls while Doom-Loop remains active", async () => {
+  const messages: string[] = [];
+  const events: GuardEvent[] = [];
+  const guard = new ToolUseGuard(
+    options(),
+    0,
+    () => ({
+      async steer(message: string) {
+        messages.push(message);
+      },
+      setActiveToolsByName(_names: string[]) {},
+    }),
+    (event) => events.push(event),
+  );
+  for (let i = 0; i < 1001; i++)
+    assert.equal(await guard.call("read", { path: `${i}.ts` }), undefined);
+  assert.equal(guard.toolCalls, 1001);
+  assert.equal(guard.finalizationReason, undefined);
+  assert.equal(
+    events.some((event) => event.type === "tool_budget_finalization"),
+    false,
+  );
+  for (let i = 0; i < 4; i++) await guard.call("read", { path: "same.ts" });
+  assert.ok(events.some((event) => event.type === "doom_loop_detected"));
+  assert.equal(messages.length, 1);
+});
+
+test("tool budget schema accepts zero and positive integers only", () => {
+  const cfg = config();
+  for (const value of [0, 3]) {
+    cfg.workflow.maxToolCalls = value;
+    assert.equal(configSchema.parse(cfg).workflow.maxToolCalls, value);
+  }
+  for (const value of [-1, 1.5, Number.NaN, "0"]) {
+    cfg.workflow.maxToolCalls = value as number;
+    assert.equal(configSchema.safeParse(cfg).success, false);
+  }
+});
+
 test("aborted attempts cannot queue automatic steering", async () => {
   const messages: string[] = [];
   const guard = new ToolUseGuard(options(), 80, () => ({

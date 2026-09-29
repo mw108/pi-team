@@ -262,7 +262,7 @@ export class ToolUseGuard {
         reason:
           "Tools disabled for finalization; produce your final structured result now",
       };
-    if (this.toolCalls > this.maxToolCalls) {
+    if (this.maxToolCalls > 0 && this.toolCalls > this.maxToolCalls) {
       this.finalizationReason = "tool_budget";
       this.toolsDisabledForFinalization = true;
       this.event?.({ type: "tool_budget_finalization" });

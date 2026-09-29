@@ -73,7 +73,7 @@ export const baselineSchema = z.object({
   cachedDiff: z.string(),
 });
 export const stateSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   id: z.string().uuid(),
   cwd: z.string(),
   task: z.string().min(1),
@@ -82,6 +82,8 @@ export const stateSchema = z.object({
   config: configSchema,
   teamConfigPath: z.string().optional(),
   teamConfigHash: z.string().optional(),
+  semanticConfigHash: z.string().optional(),
+  driftConfigSnapshot: configSchema.optional(),
   agentPromptHashes: z.record(z.string()).optional(),
   driftCandidate: z
     .object({
@@ -167,7 +169,7 @@ function migrateState(value: unknown): unknown {
   if (value && typeof value === "object") {
     const old = value as Record<string, any>;
     if (
-      (old.version === 1 || old.version === 2) &&
+      (old.version === 1 || old.version === 2 || old.version === 3) &&
       old.config?.agents &&
       !old.config.agents.reporter
     )
@@ -190,8 +192,9 @@ function migrateState(value: unknown): unknown {
         },
       };
   }
-  if (!value || typeof value !== "object" || (value as any).version !== 1)
-    return value;
+  if (!value || typeof value !== "object") return value;
+  if ((value as any).version === 2) return { ...(value as object), version: 3 };
+  if ((value as any).version !== 1) return value;
   const old = value as Record<string, unknown>;
   const results = { ...((old.results ?? {}) as Record<string, unknown>) };
   for (const key of ["reviewer", "previous_reviewer"]) {
@@ -208,7 +211,7 @@ function migrateState(value: unknown): unknown {
       ),
     };
   }
-  return { ...old, version: 2, results };
+  return { ...old, version: 3, results };
 }
 export function validateState(value: unknown): WorkflowState {
   const state = stateSchema.parse(migrateState(value));
@@ -234,7 +237,7 @@ export function newState(
   baseline: z.infer<typeof baselineSchema>,
 ): WorkflowState {
   return {
-    version: 2,
+    version: 3,
     id: randomUUID(),
     cwd,
     task,

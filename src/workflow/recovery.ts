@@ -1,4 +1,5 @@
 import { loadConfig } from "../config/loader.ts";
+import { analyzeConfigDrift, driftSummary } from "../config/drift.ts";
 import { contractSchema, type Role } from "../agents/schemas.ts";
 import { contractPaths } from "../agents/permissions.ts";
 import { dirtyPaths, hashes, head } from "./git.ts";
@@ -64,16 +65,9 @@ export async function getWorkflowRecoveryPlan(
   } catch (error) {
     return unsafe(`Cannot validate project configuration: ${String(error)}`);
   }
-  if (
-    current.path !== state.teamConfigPath ||
-    current.configHash !== state.teamConfigHash ||
-    Object.entries(current.agentPromptHashes).some(
-      ([role, hash]) => state.agentPromptHashes?.[role] !== hash,
-    )
-  )
-    return unsafe(
-      "Project configuration or agent prompts changed; resolve configuration drift before continuing.",
-    );
+  const drift = analyzeConfigDrift(state, current);
+  if (drift.blocking)
+    return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
 
   // Follow the ordinary router, on copies, through the current valid results.
   // Each copy starts from the original results because RESEARCH's transition
@@ -215,7 +209,12 @@ export async function getWorkflowRecoveryPlan(
     return unsafe(
       `Blocker requires inspection: ${state.blocker ?? "unknown blocker"}`,
     );
-  if (state.agentFailures >= state.config.workflow.maxAgentFailures)
+  if (
+    state.agentFailures >=
+    (drift.changed
+      ? current.config.workflow.maxAgentFailures
+      : state.config.workflow.maxAgentFailures)
+  )
     return unsafe("Agent failure limit reached.");
   if (phase !== "REPORT" && (await head(cwd)) !== state.baseline.head)
     return unsafe(

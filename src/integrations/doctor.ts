@@ -113,6 +113,9 @@ export async function doctor(cwd: string) {
     configSchema.parse(config);
     const doom = config.workflow.doomLoop;
     lines.push(
+      `maxToolCalls: ${config.workflow.maxToolCalls === 0 ? "unlimited" : config.workflow.maxToolCalls}`,
+    );
+    lines.push(
       `Doom-loop detector: enabled ${doom.enabled ? "yes" : "no"}; window ${doom.windowSize} calls; identical threshold ${doom.maxIdenticalCalls}; repeated-pattern threshold ${doom.maxRepeatedPattern}; interventions ${doom.maxInterventions}`,
     );
     const runtime = await ModelRuntime.create({

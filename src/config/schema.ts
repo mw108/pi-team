@@ -45,7 +45,7 @@ const agent = z
     timeoutMs: z
       .union([z.literal(0), z.number().int().min(1000).max(3600000)])
       .optional(),
-    maxToolCalls: z.number().int().min(1).optional(),
+    maxToolCalls: z.number().int().min(0).optional(),
     doomLoop: z
       .object({
         enabled: z.boolean().optional(),
@@ -144,7 +144,7 @@ export const configSchema = z
           })
           .strict()
           .default({}),
-        maxToolCalls: z.number().int().min(1).default(80),
+        maxToolCalls: z.number().int().min(0).default(80),
         doomLoop: z
           .object({
             enabled: z.boolean().default(true),

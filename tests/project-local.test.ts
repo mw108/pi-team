@@ -334,7 +334,7 @@ test("global /team-init command works from a Git subdirectory", async () => {
   for (const command of ["team", "team-init", "team-status", "team-stop"])
     assert.ok(commands.has(command));
 });
-test("config and prompt hashes persist; prompt drift pauses resume, explicit refresh restarts reasoning", async () => {
+test("config and prompt hashes persist; future prompt drift is accepted", async () => {
   const cwd = await repository(),
     cfg = config(),
     runner = new FixtureRunner();
@@ -355,24 +355,15 @@ test("config and prompt hashes persist; prompt drift pauses resume, explicit ref
   );
   const loaded = await engine.store.load(s.id);
   await engine.run(loaded);
-  assert.equal(loaded.phase, "WAITING_USER");
-  assert.equal(loaded.pendingApproval?.kind, "configDrift");
-  assert.match(
-    loaded.driftCandidate?.changed.join(",") ?? "",
-    /solver-pragmatic/,
-  );
-  assert.equal(runner.calls.length, 0);
-  const resumed = new WorkflowEngine(cwd, runner, {
-    ...ui,
-    approve: async () => ["resume"],
-  });
-  await resumed.run(loaded);
   assert.equal(loaded.phase, "DONE", loaded.blocker);
+  assert.ok(
+    loaded.history.some((event) => event.event === "config_drift_accepted"),
+  );
   assert.equal(
     loaded.agentPromptHashes?.solver2,
     (await loadConfig(cwd)).agentPromptHashes.solver2,
   );
-  assert.equal((await resumed.store.load(s.id)).phase, "DONE");
+  assert.equal((await engine.store.load(s.id)).phase, "DONE");
 });
 test("drift after implementation blocks automation even if new instructions are approved", async () => {
   const cwd = await repository(),

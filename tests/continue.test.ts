@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import YAML from "yaml";
 import { join } from "node:path";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import teamExtension from "../src/index.ts";
@@ -15,6 +16,7 @@ import {
 } from "../src/workflow/recovery.ts";
 import { renderBlocked } from "../src/workflow/report.ts";
 import { FixtureRunner, config, repository } from "./helpers.ts";
+import { semanticConfigHash } from "../src/config/drift.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
 async function completed(commit = false) {
@@ -52,6 +54,175 @@ async function blockedAt(phase: Phase, remove: string[], commit = false) {
   await engine.store.save(state);
   return fixture;
 }
+
+async function editConfig(cwd: string, edit: (config: any) => void) {
+  const path = join(cwd, ".pi/team/team.yaml");
+  const value = YAML.parse(await readFile(path, "utf8"));
+  edit(value);
+  await writeFile(path, YAML.stringify(value));
+}
+
+test("semantic fingerprint ignores runtime and presentation fields", () => {
+  const previous = config();
+  const current = structuredClone(previous);
+  current.workflow.maxAgentFailures = 3;
+  current.workflow.maxToolCalls = 0;
+  current.agents.solver1.name = "Architecture Expert";
+  current.ui.progress.refreshMs = 3000;
+  assert.equal(semanticConfigHash(previous), semanticConfigHash(current));
+  current.agents.reviewer.model = "different-model";
+  assert.notEqual(semanticConfigHash(previous), semanticConfigHash(current));
+});
+
+test("runtime guardrail drift 2→3 and 80→9999 allows Code Reviewer continuation", async () => {
+  const { cwd, state, engine, runner } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxAgentFailures = 3;
+    value.workflow.maxToolCalls = 9999;
+  });
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "continue");
+  assert.match(renderBlocked(state, plan), /Next action\n\/team-continue/);
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.codeReviewer, 2);
+  assert.equal(state.config.workflow.maxAgentFailures, 3);
+  assert.equal(state.config.workflow.maxToolCalls, 9999);
+  assert.match(
+    state.history.find((event) => event.event === "config_drift_accepted")
+      ?.detail ?? "",
+    /workflow.maxToolCalls/,
+  );
+});
+
+test("runtime drift 80→0 gives the next agent unlimited tool calls", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxToolCalls = 0;
+  });
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).kind, "continue");
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.config.workflow.maxToolCalls, 0);
+});
+
+test("resume accepts runtime drift using the shared analysis", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxToolCalls = 0;
+  });
+  await engine.resumeReadonly(state);
+  assert.equal(state.config.workflow.maxToolCalls, 0);
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).kind, "continue");
+});
+
+test("legacy state blocks changed team YAML without a semantic snapshot", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  delete state.semanticConfigHash;
+  delete state.driftConfigSnapshot;
+  await engine.store.save(state);
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).kind, "continue");
+  await editConfig(cwd, (value) => {
+    value.workflow.maxToolCalls = 0;
+  });
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "unsafe");
+  assert.match(plan.reason, /legacy state/);
+});
+
+test("presentation drift in name, UI, and logging allows continuation", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.agents.solver1.name = "Architecture Expert";
+    value.ui.progress.refreshMs = 3000;
+    value.logging.agentLogs.level = "off";
+  });
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).kind, "continue");
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.config.agents.solver1.name, "Architecture Expert");
+});
+
+test("future Code Reviewer prompt and model changes are accepted", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Interrupted mutating phase; inspect effects before recovery";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.agents.codeReviewer.model = "future-model";
+  });
+  await writeFile(
+    join(cwd, ".pi/team/agents/code-reviewer.md"),
+    "Updated Code Reviewer instructions",
+  );
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).kind, "continue");
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.config.agents.codeReviewer.model, "future-model");
+  assert.match(
+    state.history.find((event) => event.event === "config_drift_accepted")
+      ?.detail ?? "",
+    /agents.codeReviewer.prompt/,
+  );
+});
+
+test("consumed Reviewer prompt and model changes block continuation", async () => {
+  for (const kind of ["prompt", "model"] as const) {
+    const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+      "codeReviewer",
+      "tester",
+      "reporter",
+    ]);
+    state.blocker =
+      "Interrupted mutating phase; inspect effects before recovery";
+    await engine.store.save(state);
+    if (kind === "prompt")
+      await writeFile(
+        join(cwd, ".pi/team/agents/reviewer.md"),
+        "Changed Reviewer instructions",
+      );
+    else
+      await editConfig(cwd, (value) => {
+        value.agents.reviewer.model = "changed-model";
+      });
+    const plan = await getWorkflowRecoveryPlan(state, cwd);
+    assert.equal(plan.kind, "unsafe");
+    assert.match(plan.reason, /agents.reviewer/);
+    await assert.rejects(engine.continueBlocked(state), /Configuration drift/);
+  }
+});
 
 test("completed Implementor continues with Code Reviewer attempt 1 and consistent advice", async () => {
   const { cwd, state, engine, runner } = await blockedAt("IMPLEMENT", [
@@ -282,10 +453,11 @@ test("configuration drift and repository drift refuse continuation", async () =>
     "tester",
     "reporter",
   ]);
-  await appendFile(
-    join(configFixture.cwd, ".pi/team/team.yaml"),
-    "\n# changed\n",
-  );
+  const changedConfigPath = join(configFixture.cwd, ".pi/team/team.yaml");
+  const changedConfig = YAML.parse(await readFile(changedConfigPath, "utf8"));
+  changedConfig.qualityGates.testing.enabled =
+    !changedConfig.qualityGates.testing.enabled;
+  await writeFile(changedConfigPath, YAML.stringify(changedConfig));
   assert.equal(
     (await getWorkflowRecoveryPlan(configFixture.state, configFixture.cwd))
       .kind,
@@ -293,7 +465,7 @@ test("configuration drift and repository drift refuse continuation", async () =>
   );
   await assert.rejects(
     configFixture.engine.continueBlocked(configFixture.state),
-    /configuration|prompts/i,
+    /Configuration drift/i,
   );
   const repoFixture = await blockedAt("CODE_REVIEW", ["tester", "reporter"]);
   await writeFile(join(repoFixture.cwd, "unrelated.txt"), "unrelated\n");

@@ -25,6 +25,31 @@ import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { renderProgress } from "../src/ui/progress.ts";
 import type { AgentRunner } from "../src/agents/runner.ts";
 
+test("unlimited tool budget is explicit in provider failure diagnostics", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.maxToolCalls = 0;
+  const runner: AgentRunner = {
+    async run() {
+      throw new Error("fixture provider failure");
+    },
+  };
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("diagnostic fixture", cfg);
+  await assert.rejects(
+    () => engine.invoke("researcher", state),
+    /fixture provider failure/,
+  );
+  const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  const failure = events.find((event) => event.type === "provider_error");
+  assert.equal(failure?.maxToolCalls, 0);
+  assert.equal(failure?.toolBudgetUnlimited, true);
+  assert.equal(failure?.toolBudgetExhausted, false);
+});
+
 const model = {
   api: "openai-completions",
   provider: "local",

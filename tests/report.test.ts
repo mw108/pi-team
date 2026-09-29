@@ -315,7 +315,7 @@ test("aborting Reporter preserves completed implementation and shows fallback", 
   assert.ok(s.results.reporter);
 });
 
-test("Reporter config drift produces fallback without replaying work", async () => {
+test("future Reporter prompt drift uses new prompt without replaying work", async () => {
   const cwd = await repository();
   const runner = new FixtureRunner();
   const engine = new WorkflowEngine(cwd, runner, ui);
@@ -329,8 +329,8 @@ test("Reporter config drift produces fallback without replaying work", async () 
   );
   await engine.run(s);
   assert.equal(s.phase, "DONE");
-  assert.ok(s.reportFailure?.includes("Configuration changed"));
-  assert.deepEqual(runner.calls, []);
+  assert.equal(s.reportFailure, undefined);
+  assert.deepEqual(runner.calls, ["reporter"]);
 });
 
 test("Reporter provider failure after commit preserves the created commit", async () => {

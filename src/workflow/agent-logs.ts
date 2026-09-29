@@ -285,7 +285,7 @@ export class AgentLogStore {
           `  abort requested: ${event.abortSignalAborted ? "yes" : "no"}${event.abortReason ? ` (${event.abortReason})` : ""}`,
         );
         lines.push(
-          `  tool calls: ${event.toolCalls ?? 0}/${event.maxToolCalls ?? "?"}`,
+          `  tool calls: ${event.toolCalls ?? 0}${event.maxToolCalls === 0 ? "" : `/${event.maxToolCalls ?? "?"}`}`,
         );
         const doom = event.doomLoop as
           | { interventions?: number; toolsDisabledForFinalization?: boolean }

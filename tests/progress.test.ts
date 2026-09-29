@@ -124,6 +124,18 @@ test("zero doom-loop interventions stay hidden while tool calls and finalization
   runtime.dispose();
 });
 
+test("unlimited tool budget renders a count without /0", () => {
+  const s = state();
+  s.config.workflow.maxToolCalls = 0;
+  const runtime = new ProgressRuntime(() => {});
+  runtime.bind(s);
+  runtime.event({ type: "start", role: "solver1" });
+  runtime.agents.solver1!.toolCalls = 53;
+  assert.match(lines(s, runtime), /tool calls: 53(?:\n|$)/);
+  assert.doesNotMatch(lines(s, runtime), /tool calls: 53\/0/);
+  runtime.dispose();
+});
+
 test("each disabled quality gate is rendered exactly once", () => {
   const s = state();
   s.config.qualityGates.pentest.enabled = true;

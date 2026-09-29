@@ -31,7 +31,21 @@ test("version 1 state without additive approval/config fields migrates conservat
   assert.equal(loaded.commandApprovalComplete, false);
   assert.equal(loaded.config.commit.runHooks, false);
   assert.deepEqual(loaded.config.pentest.localHttp.allowedMethods, ["GET"]);
-  assert.equal(loaded.version, 2);
+  assert.equal(loaded.version, 3);
+});
+test("version 2 state loads without inventing semantic drift metadata", () => {
+  const raw: any = newState("/tmp", "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  raw.version = 2;
+  const loaded = validateState(raw);
+  assert.equal(loaded.version, 3);
+  assert.equal(loaded.semanticConfigHash, undefined);
+  assert.equal(loaded.driftConfigSnapshot, undefined);
 });
 test("version 1 string test requirements migrate without inventing paths", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
@@ -60,7 +74,7 @@ test("version 1 string test requirements migrate without inventing paths", async
   await mkdir(store.dir, { recursive: true });
   await writeFile(store.path(raw.id), JSON.stringify(raw));
   const loaded = await store.load(raw.id);
-  assert.equal(loaded.version, 2);
+  assert.equal(loaded.version, 3);
   const migrated = ["reviewer", "previous_reviewer"].map(
     (key) => (loaded.results[key] as any).requiredTests,
   );
@@ -70,7 +84,7 @@ test("version 1 string test requirements migrate without inventing paths", async
       { description: "failed login", action: "existing" },
     ]);
   await store.save(loaded);
-  assert.equal((await store.load(raw.id)).version, 2);
+  assert.equal((await store.load(raw.id)).version, 3);
   assert.throws(() => validateState({ ...raw, version: 2 }), /requiredTests/);
 });
 test("approval state and pending selection survive serialization without global config changes", async () => {

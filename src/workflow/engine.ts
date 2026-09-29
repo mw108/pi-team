@@ -45,6 +45,11 @@ import {
 } from "./state.ts";
 import { phaseRoles, transition } from "./router.ts";
 import { getWorkflowRecoveryPlan } from "./recovery.ts";
+import {
+  analyzeConfigDrift,
+  acceptConfigDrift,
+  driftSummary,
+} from "../config/drift.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -458,6 +463,8 @@ export class WorkflowEngine {
     const state = newState(this.cwd, task, config, await baseline(this.cwd));
     state.teamConfigPath = snapshot.path;
     state.teamConfigHash = snapshot.configHash;
+    state.semanticConfigHash = snapshot.semanticConfigHash;
+    state.driftConfigSnapshot = snapshot.config;
     state.agentPromptHashes = snapshot.agentPromptHashes;
     record(state, "started");
     await this.store.save(state);
@@ -903,6 +910,9 @@ export class WorkflowEngine {
           maxToolCalls:
             s.config.agents[role].maxToolCalls ??
             s.config.workflow.maxToolCalls,
+          toolBudgetUnlimited:
+            (s.config.agents[role].maxToolCalls ??
+              s.config.workflow.maxToolCalls) === 0,
           toolBudgetExhausted: failedRequest?.toolBudgetExhausted ?? false,
           networkRetry: failedRequest?.networkRetryState ?? {
             currentRetry: networkRetries,
@@ -1010,6 +1020,14 @@ export class WorkflowEngine {
     }
   }
   async resumeReadonly(s: WorkflowState) {
+    if (s.teamConfigHash && s.agentPromptHashes && s.teamConfigPath) {
+      const current = await loadConfig(this.cwd);
+      const drift = analyzeConfigDrift(s, current);
+      if (drift.changed && !drift.blocking) {
+        acceptConfigDrift(s, current, drift);
+        await this.store.save(s);
+      }
+    }
     if (
       s.phase !== "BLOCKED" ||
       !s.blocker?.startsWith("Agent execution failed:")
@@ -1102,18 +1120,16 @@ export class WorkflowEngine {
             await this.store.save(s);
             break;
           }
-          const changed: string[] = [];
-          if (
-            current.path !== s.teamConfigPath ||
-            current.configHash !== s.teamConfigHash
-          )
-            changed.push("team.yaml");
-          for (const [slot, hash] of Object.entries(current.agentPromptHashes))
-            if (s.agentPromptHashes[slot] !== hash)
-              changed.push(current.config.agents[slot as Role].prompt);
-          if (changed.length && s.phase === "REPORT") {
+          const drift = analyzeConfigDrift(s, current);
+          const changed = [
+            ...drift.semanticChanges,
+            ...drift.runtimeChanges,
+            ...drift.presentationChanges,
+            ...drift.futureAgentChanges,
+          ];
+          if (drift.blocking && s.phase === "REPORT") {
             record(s, "configuration_drift", changed.join(", "));
-            s.reportFailure = `Configuration changed during REPORT: ${changed.join(", ")}`;
+            s.reportFailure = `Configuration changed during REPORT: ${drift.semanticChanges.join(", ")}`;
             s.reportInput ??= await buildCompletionReportInput(s);
             s.results.reporter ??= fallbackReport(
               s.reportInput as CompletionReportInput,
@@ -1122,7 +1138,7 @@ export class WorkflowEngine {
             await this.store.save(s);
             break;
           }
-          if (changed.length) {
+          if (drift.blocking) {
             s.driftCandidate = {
               configPath: current.path,
               configHash: current.configHash,
@@ -1132,7 +1148,7 @@ export class WorkflowEngine {
             s.pendingApproval = {
               kind: "configDrift",
               title: "Project team definition changed",
-              prompt: `Review changed project team files before continuing: ${changed.join(", ")}. Abort is the safe default. Resuming restarts reasoning with the new team definition and original cycle limits; after implementation it is unavailable.`,
+              prompt: `Configuration drift detected.\n${driftSummary(drift)}\nAbort is the safe default. Resuming restarts reasoning with the new team definition and original cycle limits; after implementation it is unavailable.`,
               options: [
                 {
                   value: "resume",
@@ -1151,6 +1167,10 @@ export class WorkflowEngine {
             record(s, "configuration_drift", changed.join(", "));
             await this.store.save(s);
             continue;
+          }
+          if (drift.changed) {
+            acceptConfigDrift(s, current, drift);
+            await this.store.save(s);
           }
         }
         if (s.phase === "WAITING_USER") {
@@ -1262,6 +1282,8 @@ export class WorkflowEngine {
                   s.config = current.config;
                   s.teamConfigPath = current.path;
                   s.teamConfigHash = current.configHash;
+                  s.semanticConfigHash = current.semanticConfigHash;
+                  s.driftConfigSnapshot = current.config;
                   s.agentPromptHashes = current.agentPromptHashes;
                   s.phase = "ORCHESTRATE";
                   delete s.pendingQuestion;

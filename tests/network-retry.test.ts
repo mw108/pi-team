@@ -148,7 +148,7 @@ test("network configuration defaults, per-field inheritance and validation", () 
     );
 });
 
-test("network retry edits trigger existing config drift detection", async () => {
+test("network retry edits are accepted as runtime drift", async () => {
   const cwd = await repository();
   const path = join(teamRoot(cwd), "team.yaml");
   const cfg = config();
@@ -166,9 +166,11 @@ test("network retry edits trigger existing config drift detection", async () => 
   changed.agents.researcher.networkRetry = { maxRetries: 0, delayMs: 2000 };
   await writeFile(path, YAML.stringify(changed));
   await engine.run(state);
-  assert.equal(state.phase, "WAITING_USER");
-  assert.equal(state.pendingApproval?.kind, "configDrift");
-  assert.equal(runner.calls.length, 0);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.config.agents.researcher.networkRetry?.maxRetries, 0);
+  assert.ok(
+    state.history.some((event) => event.event === "config_drift_accepted"),
+  );
 });
 
 test("request classifier limits retries to transport, 502-504, and 429", () => {

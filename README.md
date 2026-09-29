@@ -39,7 +39,7 @@ Then enter:
 /team resume <workflow-id>
 ```
 
-Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-init --repair` adds a missing Reporter prompt and config entry to an existing project team. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection; a change during REPORT uses the deterministic report fallback.
+Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-init --repair` adds a missing Reporter prompt and config entry to an existing project team. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. Runtime guardrail and presentation changes are accepted and logged; semantic changes to completed agents or workflow behavior pause resume for explicit pi-ask review. A never-run agent may use a new prompt or model on its first attempt. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, semantic drift blocks for manual inspection. Old states without a semantic snapshot conservatively block when team YAML changes. Semantic drift during REPORT uses the deterministic report fallback.
 
 ### Completion reports
 
@@ -118,7 +118,12 @@ Pi Team detects repeated tool calls from normalized tool names and arguments. `r
 
 The first two detections steer the current agent to change approach. A further loop disables tools and asks for a final structured result. If finalization still produces invalid output, the attempt fails with `AgentDoomLoopError`. Pi's `AgentSession.steer()` injects the control message as a user-role message. Pi Team intentionally uses this path for Qwen compatibility; the message role cannot be configured. `/team-steer` clears the current pattern history without using an automatic intervention, `/team-abort` clears queued steering through session cancellation, and `/team-retry` starts a fresh detector with the new session. Network reconnects leave the detector intact.
 
-`workflow.maxToolCalls` retains its call-count limit. On the first call beyond the budget, Pi Team blocks that call, disables tools, and steers the agent to finalize with existing information. It queues this steering only once. `agents.<id>.maxToolCalls` can override the workflow budget. `/team-status`, the live widget, and `/team-log` show detector interventions and finalization state.
+`workflow.maxToolCalls: 0` means unlimited tool calls; a positive integer is a hard budget. On the first call beyond a positive budget, Pi Team blocks that call, disables tools, and steers the agent to finalize with existing information. It queues this steering only once. `agents.<id>.maxToolCalls` can override the workflow budget, including with `0`. Doom-Loop detection remains independent and active with unlimited tool calls. `/team-status`, the live widget, and `/team-log` show detector interventions and finalization state.
+
+```yaml
+workflow:
+  maxToolCalls: 0 # unlimited
+```
 
 ```yaml
 workflow:

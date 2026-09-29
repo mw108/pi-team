@@ -79,7 +79,7 @@ test("project config retains independent agent temperatures and state snapshot",
   assert.notEqual((await loadConfig(cwd)).configHash, oldHash);
 });
 
-test("temperature edit pauses an interrupted workflow as config drift", async () => {
+test("future agent temperature edit is accepted as runtime drift", async () => {
   const cwd = await repository();
   const path = join(teamRoot(cwd), "team.yaml");
   const cfg = config();
@@ -97,10 +97,11 @@ test("temperature edit pauses an interrupted workflow as config drift", async ()
   changed.agents.solver2.temperature = 0.8;
   await writeFile(path, YAML.stringify(changed));
   await engine.run(state);
-  assert.equal(state.phase, "WAITING_USER");
-  assert.equal(state.pendingApproval?.kind, "configDrift");
-  assert.ok(state.driftCandidate?.changed.includes("team.yaml"));
-  assert.equal(runner.calls.length, 0);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.config.agents.solver2.temperature, 0.8);
+  assert.ok(
+    state.history.some((event) => event.event === "config_drift_accepted"),
+  );
 });
 
 test("doctor identifies an invalid agent temperature", async () => {
@@ -113,6 +114,16 @@ test("doctor identifies an invalid agent temperature", async () => {
   assert.equal(result.ok, false);
   assert.match(result.lines.join("\n"), /Configuration: FAIL/);
   assert.match(result.lines.join("\n"), /solver3[\s\S]*temperature/);
+});
+
+test("doctor labels zero tool-call budget unlimited", async () => {
+  const cwd = await repository();
+  const path = join(teamRoot(cwd), "team.yaml");
+  const raw = YAML.parse(await readFile(path, "utf8"));
+  raw.workflow.maxToolCalls = 0;
+  await writeFile(path, YAML.stringify(raw));
+  const result = await doctor(cwd);
+  assert.match(result.lines.join("\n"), /maxToolCalls: unlimited/);
 });
 
 test("session runtime forwards temperature on every request without changing omitted defaults", () => {
