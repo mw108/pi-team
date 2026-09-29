@@ -36,6 +36,7 @@ export const expectedRoles: Record<
 };
 const agent = z
   .object({
+    name: z.string().trim().min(1).max(100).optional(),
     role: z.enum(logicalRoles),
     prompt: z.string().min(1),
     provider: z.string().min(1),

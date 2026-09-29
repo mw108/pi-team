@@ -186,6 +186,9 @@ test("/team-init creates project YAML, distinct prompts and ignored state withou
 test("/team-init default and repair never overwrite existing project content", async () => {
   const cwd = await repository(),
     prompt = join(teamRoot(cwd), "agents", "reviewer.md");
+  const before = await yaml(cwd);
+  before.agents.solver1.name = "Architecture Expert";
+  await writeYaml(cwd, before);
   await writeFile(prompt, "custom owner prompt");
   const first = await initTeam(cwd);
   assert.equal(first.created.length, 0);
@@ -194,6 +197,30 @@ test("/team-init default and repair never overwrite existing project content", a
   const repaired = await initTeam(cwd, "repair");
   assert.deepEqual(repaired.created, [".pi/team/agents/critic.md"]);
   assert.equal(await readFile(prompt, "utf8"), "custom owner prompt");
+  assert.equal((await yaml(cwd)).agents.solver1.name, "Architecture Expert");
+});
+test("display names validate, allow duplicates, and preserve older configs", async () => {
+  const cwd = await repository();
+  const current = await yaml(cwd);
+  current.agents.solver1.name = "Architecture Expert";
+  current.agents.solver2.name = "Architecture Expert";
+  await writeYaml(cwd, current);
+  const loaded = await loadConfig(cwd);
+  assert.equal(loaded.config.agents.solver1.name, "Architecture Expert");
+  assert.equal(loaded.config.agents.solver2.name, "Architecture Expert");
+  const changedHash = loaded.configHash;
+  delete current.agents.solver1.name;
+  await writeYaml(cwd, current);
+  const older = await loadConfig(cwd);
+  assert.equal(older.config.agents.solver1.name, undefined);
+  assert.notEqual(older.configHash, changedHash);
+  assert.equal(
+    older.agentPromptHashes.solver1,
+    loaded.agentPromptHashes.solver1,
+  );
+  current.agents.solver1.name = "   ";
+  await writeYaml(cwd, current);
+  await assert.rejects(loadConfig(cwd), /Invalid Pi Team configuration/);
 });
 test("/team-init --from-global copies legacy settings without altering its file", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "team-migrate-"));
@@ -241,10 +268,15 @@ test("new state path and legacy state diagnostic never merge old states", async 
 });
 test("doctor diagnoses missing config, prompt, escaping path and legacy state", async () => {
   const cwd = await repository();
+  const cfg = await yaml(cwd);
+  cfg.agents.solver2.name = "Practical Solver";
+  await writeYaml(cwd, cfg);
   let report = await doctor(cwd);
   assert.ok(
     report.lines.some((line) =>
-      line.includes("Agent solver2: solver → agents/solver-pragmatic.md"),
+      line.includes(
+        "Agent solver2: name Practical Solver; role solver → agents/solver-pragmatic.md",
+      ),
     ),
   );
   await mkdir(join(cwd, ".pi", "team-state"));

@@ -461,6 +461,7 @@ test("timed out read-only attempts persist history, logs, output and retry UI", 
 test("tool events, visible output and /team-log command remain concise", async () => {
   const cwd = await repository();
   const cfg = config();
+  cfg.agents.researcher.name = "Research Analyst";
   cfg.toolActivity.mappings = {
     "exa_*": { category: "web-search", provider: "Exa" },
   };
@@ -519,9 +520,13 @@ test("tool events, visible output and /team-log command remain concise", async (
   await commands.get("team-log").handler("", ctx);
   assert.match(
     notices.at(-1) ?? "",
-    /researcher\nattempt 1|researcher\n  attempt 1/,
+    /Research Analyst \(researcher\)\n  attempt 1/,
   );
   await commands.get("team-log").handler("researcher", ctx);
+  assert.match(
+    notices.at(-1) ?? "",
+    /Research Analyst \(researcher\) · attempt 1/,
+  );
   assert.match(notices.at(-1) ?? "", /Serena: symbols/);
   await commands.get("team-log").handler("researcher --attempt 1", ctx);
   assert.match(notices.at(-1) ?? "", /Web search/);

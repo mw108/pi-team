@@ -5,6 +5,8 @@ import { roles, type Role } from "../agents/schemas.ts";
 import { elapsed } from "../ui/progress.ts";
 import { StateStore } from "./persistence.ts";
 import type { ErrorDiagnostics } from "../agents/error-diagnostics.ts";
+import type { TeamConfig } from "../config/schema.ts";
+import { getAgentDisplayName } from "../ui/agent-name.ts";
 
 export type LogEvent = {
   type: string;
@@ -128,15 +130,16 @@ export class AgentLogStore {
       }
     });
   }
-  async overview(id: string) {
+  async overview(id: string, config?: TeamConfig) {
     const lines = [`Workflow ${id.slice(0, 8)}`];
     for (const role of roles) {
+      const heading = config ? getAgentDisplayName(config, role) : role;
       const attempts = await this.attempts(id, role);
       if (!attempts.length) {
-        lines.push(`${role}  pending`);
+        lines.push(`${heading} (${role})  pending`);
         continue;
       }
-      lines.push(role);
+      lines.push(`${heading} (${role})`);
       for (const attempt of attempts) {
         const events = await this.read(id, role, attempt);
         const last = events.at(-1);
@@ -181,19 +184,25 @@ export class AgentLogStore {
     }
     return lines.join("\n");
   }
-  async timeline(id: string, role: Role, attempt?: number): Promise<string> {
+  async timeline(
+    id: string,
+    role: Role,
+    attempt?: number,
+    config?: TeamConfig,
+  ): Promise<string> {
     const attempts = await this.attempts(id, role);
     if (attempt === undefined && attempts.length)
       return (
         await Promise.all(
-          attempts.map((number) => this.timeline(id, role, number)),
+          attempts.map((number) => this.timeline(id, role, number, config)),
         )
       ).join("\n\n");
     const selected = attempt ?? attempts.at(-1);
+    const heading = config ? getAgentDisplayName(config, role) : role;
     if (!selected || !attempts.includes(selected))
-      return `No log for ${role}${attempt ? ` attempt ${attempt}` : ""}.`;
+      return `No log for ${heading} (${role})${attempt ? ` attempt ${attempt}` : ""}.`;
     const events = await this.read(id, role, selected);
-    const lines = [`${role} · attempt ${selected}`];
+    const lines = [`${heading} (${role}) · attempt ${selected}`];
     const seconds = (value: unknown) =>
       typeof value === "number"
         ? `${(value / 1000).toFixed(1)}s`

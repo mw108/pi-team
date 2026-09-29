@@ -195,11 +195,12 @@ Normal `/team` execution never reads `~/.pi/agent/team.yaml` or bundled template
 
 The generated tree contains `.pi/team/team.yaml`, `.pi/team/agents/*.md`, `.pi/team/.gitignore` with `state/`, and `.pi/team/state/`. Initialization never commits files or edits the repository root `.gitignore`. Commit the YAML, prompts and nested `.gitignore` when they represent your team's reviewed policy; keep state private. If the directory already exists, default init does not change it. `--repair` creates only missing files. `--from-global` reads the legacy global config only when requested, transfers compatible settings into a new project YAML, preserves the old file and never overwrites an existing project YAML or prompt.
 
-Every one of the 13 fixed workflow slots has a configured logical `role`, `prompt`, `provider`, `model` and `thinking`. The prompt path is relative to `.pi/team/`. The three independent Solver instances can share a model or use different providers and prompts:
+Every fixed workflow slot has a configured logical `role`, `prompt`, `provider`, `model` and `thinking`. The agent key is its stable internal ID; optional `name` is only its user-facing label, and `role` defines logical behavior. Older configs without `name` keep the established display label. Commands such as `/team-retry solver1` still use the ID, regardless of the display name. Changing a name does not rename its prompt file. The prompt path is relative to `.pi/team/`. The three independent Solver instances can share a model or use different providers and prompts:
 
 ```yaml
 agents:
   solver1:
+    name: Architecture Expert
     role: solver
     prompt: agents/solver-architecture.md
     provider: local
@@ -207,6 +208,7 @@ agents:
     temperature: 0.2
     thinking: off
   solver2:
+    name: Solver Pragmatic
     role: solver
     prompt: agents/solver-pragmatic.md
     provider: local
@@ -214,6 +216,7 @@ agents:
     temperature: 0.5
     thinking: off
   solver3:
+    name: Solver Alternative
     role: solver
     prompt: agents/solver-alternative.md
     provider: local

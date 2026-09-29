@@ -56,6 +56,7 @@ test("disabled gates are explicit; only enabled gates show counters and agents",
   assert.match(text, /Pentest cycle 1\/2/);
   assert.match(text, /Pen Tester/);
   assert.match(text, /Security Reviewer/);
+  delete s.config.agents.solver2.name;
   s.config.agents.solver2.prompt = "agents/solver-security-heavy.md";
   assert.match(lines(s), /Solver Security Heavy/);
   for (const gate of ["codeReview", "testing", "commit"] as const)
@@ -66,6 +67,61 @@ test("disabled gates are explicit; only enabled gates show counters and agents",
     /Code review disabled · Testing disabled · Commit disabled/,
   );
   assert.doesNotMatch(text, /○ Code Reviewer|○ Tester|○ Commit Agent/);
+});
+
+test("configured names and legacy fallback render without changing agent IDs", () => {
+  const s = state();
+  s.config.agents.solver1.name = "Architecture Expert";
+  assert.match(lines(s), /○ Architecture Expert/);
+  assert.doesNotMatch(lines(s), /Solver Architecture/);
+  assert.equal(s.results["Architecture Expert"], undefined);
+  delete s.config.agents.solver1.name;
+  assert.match(lines(s), /○ Solver Architecture/);
+  assert.equal(s.results.solver1, undefined);
+});
+
+test("runtime command syntax continues to require the stable agent ID", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.agents.solver1.name = "Architecture Expert";
+  await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
+  const commands = new Map<string, any>();
+  const notices: string[] = [];
+  teamExtension({
+    on: () => {},
+    registerCommand: (name: string, command: any) =>
+      commands.set(name, command),
+  } as any);
+  const ctx = {
+    cwd,
+    ui: { notify: (message: string) => notices.push(message) },
+  };
+  await commands.get("team-retry").handler("Architecture Expert", ctx);
+  assert.match(notices.at(-1) ?? "", /Usage: \/team-retry <agent-id>/);
+  await commands.get("team-retry").handler("solver1", ctx);
+  assert.match(notices.at(-1) ?? "", /No team workflow in this repository/);
+});
+
+test("zero doom-loop interventions stay hidden while tool calls and finalization remain visible", () => {
+  const s = state();
+  const runtime = new ProgressRuntime(() => {});
+  runtime.bind(s);
+  runtime.event({ type: "start", role: "solver1" });
+  runtime.agents.solver1!.toolCalls = 12;
+  let text = lines(s, runtime);
+  assert.match(text, /tool calls: 12\/80/);
+  assert.doesNotMatch(text, /doom-loop interventions/);
+  runtime.agents.solver1!.doomLoopInterventions = 1;
+  runtime.agents.solver1!.toolCalls = 53;
+  text = lines(s, runtime);
+  assert.match(text, /doom-loop interventions: 1\/2 · tool calls: 53\/80/);
+  runtime.agents.solver1!.toolsDisabledForFinalization = true;
+  assert.match(lines(s, runtime), /tools: disabled for finalization/);
+  runtime.agents.solver1!.doomLoopInterventions = 0;
+  text = lines(s, runtime);
+  assert.doesNotMatch(text, /doom-loop interventions/);
+  assert.match(text, /tool calls: 53\/80 · tools: disabled for finalization/);
+  runtime.dispose();
 });
 
 test("each disabled quality gate is rendered exactly once", () => {
@@ -300,6 +356,7 @@ test("/team-status reports live agent and /team-stop removes working display", a
   const cwd = await repository();
   const cfg = config();
   cfg.agents.researcher.timeoutMs = 0;
+  cfg.agents.researcher.name = "Research Analyst";
   await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));
   const commands = new Map<string, any>(),
     notices: string[] = [],
@@ -328,16 +385,16 @@ test("/team-status reports live agent and /team-stop removes working display", a
     const task = commands.get("team").handler("Fix addition", ctx);
     await eventually(() =>
       widgets.some((widget) =>
-        widget?.some((line) => line.includes("● Researcher")),
+        widget?.some((line) => line.includes("● Research Analyst")),
       ),
     );
     await commands.get("team-status").handler("", ctx);
-    assert.match(notices.at(-1) ?? "", /● Researcher/);
+    assert.match(notices.at(-1) ?? "", /● Research Analyst/);
     assert.match(notices.at(-1) ?? "", /Pentest disabled/);
     await commands.get("team-stop").handler("", ctx);
     assert.match(widgets.at(-1)?.join("\n") ?? "", /stopped/);
     assert.match(statuses.at(-1) ?? "", /STOPPED/);
-    assert.doesNotMatch(widgets.at(-1)?.join("\n") ?? "", /● Researcher/);
+    assert.doesNotMatch(widgets.at(-1)?.join("\n") ?? "", /● Research Analyst/);
     researcher.resolve(output("researcher"));
     await task;
     const restarted = new Map<string, any>();

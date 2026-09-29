@@ -433,7 +433,9 @@ test("retrying a completed Solver retains its result until success and recompute
   const cwd = await repository();
   const runner = new FixtureRunner();
   const engine = new WorkflowEngine(cwd, runner, ui);
-  const state = await engine.start("Fix", config());
+  const cfg = config();
+  cfg.agents.solver1.name = "Architecture Expert";
+  const state = await engine.start("Fix", cfg);
   state.phase = "REVIEW";
   state.requirements = ["Fix addition"];
   state.commandApprovalComplete = true;
@@ -446,12 +448,20 @@ test("retrying a completed Solver retains its result until success and recompute
     reviewer: contract,
   };
   const original = state.results.solver1;
+  assert.match(
+    engine.retryConfirmation(state, "solver1") ?? "",
+    /Architecture Expert \(solver1\)/,
+  );
   await assert.rejects(engine.retryAgent(state, "solver1"), /confirmation/);
   await engine.retryAgent(state, "solver1", true);
   assert.equal(state.results.solver1, original);
+  assert.equal(state.results["Architecture Expert"], undefined);
   assert.ok(state.results.critic);
   await engine.run(state);
   assert.equal(state.phase, "DONE", state.blocker);
+  const persisted = await engine.store.load(state.id);
+  assert.ok(persisted.results.solver1);
+  assert.equal(persisted.results["Architecture Expert"], undefined);
   assert.equal(runner.counts.solver1, 1);
   assert.equal(runner.counts.solver2, undefined);
   assert.equal(runner.counts.solver3, undefined);

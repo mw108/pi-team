@@ -403,6 +403,7 @@ test("Reporter has zero tools; repair adds its config and prompt to an older pro
   const result = await initTeam(cwd, "repair");
   assert.ok(result.created.includes(".pi/team/agents/reporter.md"));
   assert.ok(result.created.includes(".pi/team/team.yaml reporter entry"));
+  assert.equal((await loadConfig(cwd)).config.agents.reporter.name, "Reporter");
 });
 
 test("explicit Reporter configuration validates its prompt, role, temperature, and timeout", async () => {
@@ -431,6 +432,7 @@ test("explicit Reporter configuration validates its prompt, role, temperature, a
 test("blocked summary uses persisted cause and a safe next action", async () => {
   const cwd = await repository();
   const s = newState(cwd, "task", noCommit(), await baseline(cwd));
+  s.config.agents.researcher.name = "Research Analyst";
   s.phase = "BLOCKED";
   s.blocker = "Agent execution failed: researcher: provider terminated";
   s.history.push({
@@ -447,6 +449,6 @@ test("blocked summary uses persisted cause and a safe next action", async () => 
   });
   assert.match(
     renderBlocked(s),
-    /Stopped at\nRESEARCH · researcher[\s\S]*\/team-retry researcher/,
+    /Stopped at\nRESEARCH · Research Analyst \(researcher\)[\s\S]*Agent execution failed: Research Analyst \(researcher\):[\s\S]*\/team-retry researcher/,
   );
 });

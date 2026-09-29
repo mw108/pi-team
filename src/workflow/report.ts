@@ -1,4 +1,5 @@
-import { completionReportSchema } from "../agents/schemas.ts";
+import { completionReportSchema, roles, type Role } from "../agents/schemas.ts";
+import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { dirtyPaths } from "./git.ts";
 import type { WorkflowState } from "./state.ts";
 
@@ -312,11 +313,18 @@ export function renderBlocked(s: WorkflowState) {
       (entry.event === "agent_failure" ||
         entry.event === "agent_attempt_failed"),
   );
-  const role =
+  const candidate =
     failed?.meta?.agent ?? /^([a-zA-Z0-9]+):/.exec(failed?.detail ?? "")?.[1];
+  const role = roles.includes(candidate as Role)
+    ? (candidate as Role)
+    : undefined;
   const completed = s.history
     .filter((entry) => entry.event === "agent_completed")
-    .map((entry) => entry.detail);
+    .map((entry) =>
+      roles.includes(entry.detail as Role)
+        ? getAgentDisplayName(s.config, entry.detail as Role)
+        : entry.detail,
+    );
   const diagnostics = s.history.findLast(
     (entry) =>
       entry.phase === stopped &&
@@ -332,14 +340,26 @@ export function renderBlocked(s: WorkflowState) {
       : role && s.blocker?.startsWith("Agent execution failed:")
         ? `/team-retry ${role}`
         : "Use /team-status and /team-log for details.";
+  const reason =
+    role && s.blocker
+      ? s.blocker
+          .replaceAll(
+            `Agent ${role}`,
+            `Agent ${getAgentDisplayName(s.config, role)} (${role})`,
+          )
+          .replace(
+            `Agent execution failed: ${role}:`,
+            `Agent execution failed: ${getAgentDisplayName(s.config, role)} (${role}):`,
+          )
+      : (s.blocker ?? "Unknown blocker");
   return [
     "Team BLOCKED",
     "",
     "Stopped at",
-    `${stopped}${role ? ` · ${role}` : ""}`,
+    `${stopped}${role ? ` · ${getAgentDisplayName(s.config, role)} (${role})` : ""}`,
     "",
     "Reason",
-    s.blocker ?? "Unknown blocker",
+    reason,
     "",
     "Completed",
     ...(completed.length

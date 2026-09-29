@@ -60,6 +60,7 @@ toolActivity:
 commands: []
 agents:
   orchestrator:
+    name: Orchestrator
     role: orchestrator
     prompt: agents/orchestrator.md
     provider: local
@@ -68,6 +69,7 @@ agents:
     thinking: off
     timeoutMs: 300000
   researcher:
+    name: Researcher
     role: researcher
     prompt: agents/researcher.md
     provider: local
@@ -77,6 +79,7 @@ agents:
     timeoutMs: 900000
     # timeoutMs: 0 # no wall-clock timeout; maxToolCalls and /team-stop still apply
   solver1:
+    name: Solver Architecture
     role: solver
     prompt: agents/solver-architecture.md
     provider: local
@@ -85,6 +88,7 @@ agents:
     thinking: off
     timeoutMs: 600000
   solver2:
+    name: Solver Pragmatic
     role: solver
     prompt: agents/solver-pragmatic.md
     provider: local
@@ -93,6 +97,7 @@ agents:
     thinking: off
     timeoutMs: 600000
   solver3:
+    name: Solver Alternative
     role: solver
     prompt: agents/solver-alternative.md
     provider: local
@@ -101,6 +106,7 @@ agents:
     thinking: off
     timeoutMs: 600000
   critic:
+    name: Critic
     role: critic
     prompt: agents/critic.md
     provider: local
@@ -108,6 +114,7 @@ agents:
     temperature: 0.2
     thinking: off
   reviewer:
+    name: Reviewer
     role: reviewer
     prompt: agents/reviewer.md
     provider: local
@@ -115,6 +122,7 @@ agents:
     temperature: 0.1
     thinking: off
   implementor:
+    name: Implementor
     role: implementor
     prompt: agents/implementor.md
     provider: local
@@ -123,6 +131,7 @@ agents:
     thinking: off
     timeoutMs: 1200000
   codeReviewer:
+    name: Code Reviewer
     role: code-reviewer
     prompt: agents/code-reviewer.md
     provider: local
@@ -131,6 +140,7 @@ agents:
     thinking: off
     timeoutMs: 900000
   pentester:
+    name: Pen Tester
     role: pentester
     prompt: agents/pentester.md
     provider: local
@@ -139,6 +149,7 @@ agents:
     thinking: off
     timeoutMs: 1200000
   securityReviewer:
+    name: Security Reviewer
     role: security-reviewer
     prompt: agents/security-reviewer.md
     provider: local
@@ -146,6 +157,7 @@ agents:
     temperature: 0.1
     thinking: off
   tester:
+    name: Tester
     role: tester
     prompt: agents/tester.md
     provider: local
@@ -153,6 +165,7 @@ agents:
     temperature: 0.1
     thinking: off
   commitAgent:
+    name: Commit Agent
     role: commit-agent
     prompt: agents/commit-agent.md
     provider: local
@@ -160,3 +173,12 @@ agents:
     temperature: 0.1
     thinking: off
     timeoutMs: 300000
+  reporter:
+    name: Reporter
+    role: reporter
+    prompt: agents/reporter.md
+    provider: local
+    model: configure-model-id
+    temperature: 0.1
+    thinking: off
+    timeoutMs: 600000

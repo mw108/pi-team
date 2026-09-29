@@ -2,24 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { roles, type Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import type { AgentProgress, ProgressRuntime } from "./runtime.ts";
-import { basename } from "node:path";
-
-const names: Record<Role, string> = {
-  orchestrator: "Orchestrator",
-  researcher: "Researcher",
-  solver1: "Solver Architecture",
-  solver2: "Solver Pragmatic",
-  solver3: "Solver Alternative",
-  critic: "Critic",
-  reviewer: "Reviewer",
-  implementor: "Implementor",
-  codeReviewer: "Code Reviewer",
-  pentester: "Pen Tester",
-  securityReviewer: "Security Reviewer",
-  tester: "Tester",
-  commitAgent: "Commit Agent",
-  reporter: "Reporter",
-};
+import { getAgentDisplayName } from "./agent-name.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -28,14 +11,6 @@ const symbols = {
   stopped: "–",
   aborted: "⊘",
 };
-function agentName(role: Role, state: WorkflowState) {
-  if (!role.startsWith("solver")) return names[role];
-  const stem = basename(state.config.agents[role].prompt, ".md"),
-    variant = stem.startsWith("solver-") ? stem.slice(7) : "";
-  return /^[a-z][a-z-]{0,23}$/.test(variant)
-    ? `Solver ${variant.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase())}`
-    : `Solver ${role.slice(-1)}`;
-}
 export function elapsed(ms: number) {
   const seconds = Math.floor(ms / 1000);
   const minutes = Math.floor(seconds / 60);
@@ -64,6 +39,7 @@ function displayAgent(
   role: Role,
   state: WorkflowState,
   runtime?: ProgressRuntime,
+  showId = false,
 ) {
   const live: AgentProgress | undefined = runtime?.agents[role];
   const last = state.history.findLast(
@@ -104,7 +80,7 @@ function displayAgent(
     live?.attempt && (live.manualRetry || live.attempt > 1)
       ? ` · attempt ${live.attempt}`
       : "";
-  const label = `${symbols[status]} ${agentName(role, state)}${model}${duration}${retry}${attempt}`;
+  const label = `${symbols[status]} ${getAgentDisplayName(state.config, role)}${showId ? ` (${role})` : ""}${model}${duration}${retry}${attempt}`;
   const activity =
     status === "running" &&
     live?.activity &&
@@ -130,7 +106,7 @@ function displayAgent(
       : undefined;
   const guardStatus =
     status === "running" && live
-      ? `  ↳ doom-loop interventions: ${live.doomLoopInterventions ?? 0}/${state.config.agents[role].doomLoop?.maxInterventions ?? state.config.workflow.doomLoop.maxInterventions} · tool calls: ${live.toolCalls ?? 0}/${state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls}${live.toolsDisabledForFinalization ? " · tools: disabled for finalization" : ""}`
+      ? `  ↳ ${live.doomLoopInterventions ? `doom-loop interventions: ${live.doomLoopInterventions}/${state.config.agents[role].doomLoop?.maxInterventions ?? state.config.workflow.doomLoop.maxInterventions} · ` : ""}tool calls: ${live.toolCalls ?? 0}/${state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls}${live.toolsDisabledForFinalization ? " · tools: disabled for finalization" : ""}`
       : undefined;
   const persistedRetry = state.history.findLast(
     (entry) => entry.meta?.agent === role && entry.event === "agent_retry",
@@ -174,6 +150,7 @@ function displayAgent(
 export function renderProgress(
   state: WorkflowState,
   runtime?: ProgressRuntime,
+  showIds = false,
 ) {
   const phase = runtime?.stopped
     ? "stopped"
@@ -189,7 +166,7 @@ export function renderProgress(
       "Live runtime details unavailable; inspect or resume this workflow",
     );
   for (const role of visibleRoles(state))
-    lines.push(...displayAgent(role, state, runtime));
+    lines.push(...displayAgent(role, state, runtime, showIds));
   const gates = [
     `Local fixes ${state.localFixCycle}/${state.config.workflow.maxLocalFixCycles}`,
     state.config.qualityGates.pentest.enabled
@@ -225,7 +202,7 @@ export function progress(
 ) {
   const active = Object.values(runtime?.agents ?? {})
     .filter((agent) => agent.status === "running")
-    .map((agent) => agentName(agent.instanceId, state));
+    .map((agent) => getAgentDisplayName(state.config, agent.instanceId));
   ctx.ui.setStatus(
     "pi-team",
     `Team: ${runtime?.stopped ? "STOPPED" : state.phase}${active.length ? ` · ${active.join(", ")}` : ""} · design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`,

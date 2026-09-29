@@ -24,6 +24,7 @@ import {
   effectiveConfig,
 } from "../agents/discovery.ts";
 import type { TeamConfig } from "../config/schema.ts";
+import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { StateStore } from "./persistence.ts";
 import {
   baseline,
@@ -155,7 +156,9 @@ export class WorkflowEngine {
       attempt.intention ||
       attempt.settled
     )
-      throw new Error(`Agent "${role}" is not currently running.`);
+      throw new Error(
+        `Agent "${getAgentDisplayName(state.config, role)}" (${role}) is not currently running.`,
+      );
     const entry = await this.sessions.steer(state.id, role, message);
     entry.resetDoomLoop?.();
     const logger = new AttemptLogger(
@@ -195,7 +198,9 @@ export class WorkflowEngine {
       control.intention ||
       control.settled
     )
-      throw new Error(`Agent "${role}" is not currently running.`);
+      throw new Error(
+        `Agent "${getAgentDisplayName(state.config, role)}" (${role}) is not currently running.`,
+      );
     control.intention = "abort";
     const session = this.sessions.get(state.id, role);
     if (session) session.state = "aborting";
@@ -213,9 +218,10 @@ export class WorkflowEngine {
     const downstream = this.dependentRoles(role).filter(
       (key) => state.results[key],
     );
-    return `${role} already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.join(", ")}` : ""}. Continue?`;
+    return `${getAgentDisplayName(state.config, role)} (${role}) already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.map((id) => getAgentDisplayName(state.config, id)).join(", ")}` : ""}. Continue?`;
   }
   async retryAgent(state: WorkflowState, role: Role, confirmed = false) {
+    const label = getAgentDisplayName(state.config, role);
     if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
     const control = this.activeAttempts.get(role);
@@ -224,7 +230,7 @@ export class WorkflowEngine {
     if (control && control.workflowId === state.id && !control.settled) {
       if (control.intention)
         throw new Error(
-          `Agent ${role} is already ${control.intention === "retry" ? "restarting" : "aborting"}.`,
+          `Agent ${label} (${role}) is already ${control.intention === "retry" ? "restarting" : "aborting"}.`,
         );
       control.intention = "retry";
       this.retryRequests.add(role);
@@ -239,19 +245,21 @@ export class WorkflowEngine {
       return "restarting";
     }
     if (this.retryRequests.has(role))
-      throw new Error(`Agent ${role} is already restarting.`);
+      throw new Error(`Agent ${label} (${role}) is already restarting.`);
     if (state.manualRetry && state.manualRetry.agent !== role)
       throw new Error(
-        `Agent ${state.manualRetry.agent} already has a pending manual retry.`,
+        `Agent ${getAgentDisplayName(state.config, state.manualRetry.agent)} (${state.manualRetry.agent}) already has a pending manual retry.`,
       );
     if (this.retryConfirmation(state, role) && !confirmed)
-      throw new Error(`Retrying completed ${role} requires confirmation.`);
+      throw new Error(
+        `Retrying completed ${label} (${role}) requires confirmation.`,
+      );
     const targetPhase = (Object.entries(phaseRoles) as [Phase, Role[]][]).find(
       ([, roles]) => roles.includes(role),
     )?.[0];
     if (!targetPhase) throw new Error(`Unknown agent ${role}`);
     if (this.nextAttempt(state, role) === 1 && !state.results[role])
-      throw new Error(`Agent ${role} has no attempt to retry yet.`);
+      throw new Error(`Agent ${label} (${role}) has no attempt to retry yet.`);
     if (this.running && state.phase !== targetPhase) {
       if (
         targetPhase === "SOLVE" &&
@@ -283,12 +291,12 @@ export class WorkflowEngine {
         ].includes(state.phase)
       )
         throw new Error(
-          `Cannot retry ${role} while ${state.phase} is running. Stop the workflow before rewinding this agent.`,
+          `Cannot retry ${label} (${role}) while ${state.phase} is running. Stop the workflow before rewinding this agent.`,
         );
       const order = Object.keys(phaseRoles) as Phase[];
       if (order.indexOf(state.phase) <= order.indexOf(targetPhase))
         throw new Error(
-          `Agent ${role} is not available in the current workflow phase.`,
+          `Agent ${label} (${role}) is not available in the current workflow phase.`,
         );
       if (
         state.results.implementor ||
@@ -298,7 +306,7 @@ export class WorkflowEngine {
         )
       )
         throw new Error(
-          `Cannot rewind ${role} after implementation; inspect repository changes and start a new workflow.`,
+          `Cannot rewind ${label} (${role}) after implementation; inspect repository changes and start a new workflow.`,
         );
       this.pendingRewind = { workflowId: state.id, role, phase: targetPhase };
       for (const [activeRole, active] of this.activeAttempts)
@@ -329,6 +337,7 @@ export class WorkflowEngine {
     return "prepared";
   }
   private prepareManualRetry(state: WorkflowState, role: Role, phase: Phase) {
+    const label = getAgentDisplayName(state.config, role);
     if (role !== "reporter" && (state.commit || state.phase === "DONE"))
       throw new Error(
         "Completed workflow cannot be retried after commit or completion.",
@@ -343,7 +352,7 @@ export class WorkflowEngine {
       !(role === "reporter" && state.phase === "DONE")
     )
       throw new Error(
-        `Agent ${role} is not available in the current workflow phase.`,
+        `Agent ${label} (${role}) is not available in the current workflow phase.`,
       );
     if (state.phase === "BLOCKED") {
       const failure = state.history.findLast(
@@ -373,7 +382,7 @@ export class WorkflowEngine {
         ))
     )
       throw new Error(
-        `Cannot rewind ${role} after implementation; inspect repository changes and start a new workflow.`,
+        `Cannot rewind ${label} (${role}) after implementation; inspect repository changes and start a new workflow.`,
       );
     state.phase = phase;
     delete state.blocker;

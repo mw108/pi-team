@@ -16,6 +16,7 @@ import { initTeam } from "./config/init.ts";
 import { projectRoot } from "./config/project.ts";
 import { AgentLogStore } from "./workflow/agent-logs.ts";
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
+import { getAgentDisplayName } from "./ui/agent-name.ts";
 import {
   buildCompletionReportInput,
   fallbackReport,
@@ -111,9 +112,14 @@ export default function teamExtension(pi: ExtensionAPI) {
           throw new Error("Usage: /team-steer <agent-id> <message>");
         const root = await projectRoot(ctx.cwd);
         if (!active?.state || active.state.cwd !== root || !active.engine)
-          throw new Error(`Agent "${match[1]}" is not currently running.`);
+          throw new Error(
+            `Agent "${active?.state ? getAgentDisplayName(active.state.config, match[1] as Role) : match[1]}" (${match[1]}) is not currently running.`,
+          );
         await active.engine.steer(active.state, match[1] as Role, message);
-        ctx.ui.notify(`Steering message queued for ${match[1]}.`, "info");
+        ctx.ui.notify(
+          `Steering message queued for ${getAgentDisplayName(active.state.config, match[1] as Role)} (${match[1]}).`,
+          "info",
+        );
       } catch (e) {
         ctx.ui.notify(String(e), "error");
       }
@@ -127,9 +133,14 @@ export default function teamExtension(pi: ExtensionAPI) {
         const role = target(args, "team-abort");
         const root = await projectRoot(ctx.cwd);
         if (!active?.state || active.state.cwd !== root || !active.engine)
-          throw new Error(`Agent "${role}" is not currently running.`);
+          throw new Error(
+            `Agent "${active?.state ? getAgentDisplayName(active.state.config, role) : role}" (${role}) is not currently running.`,
+          );
         await active.engine.abortAgent(active.state, role);
-        ctx.ui.notify(`${role} abort requested.`, "info");
+        ctx.ui.notify(
+          `${getAgentDisplayName(active.state.config, role)} (${role}) abort requested.`,
+          "info",
+        );
       } catch (e) {
         ctx.ui.notify(String(e), "error");
       }
@@ -165,7 +176,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         if (message) {
           const selected = await askApproval(pi, ctx, {
             kind: "manualRetry",
-            title: `Retry ${role}?`,
+            title: `Retry ${getAgentDisplayName(state.config, role)}?`,
             prompt: message,
             options: [
               {
@@ -188,7 +199,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         }
         const result = await engine.retryAgent(state, role, confirmed);
         ctx.ui.notify(
-          `${role} ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
+          `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
           "info",
         );
         if (result !== "prepared") return;
@@ -231,7 +242,7 @@ export default function teamExtension(pi: ExtensionAPI) {
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `${renderProgress(state, runtime).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id>`,
+            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id>`,
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
@@ -303,8 +314,9 @@ export default function teamExtension(pi: ExtensionAPI) {
                 state.id,
                 parts[0] as Role,
                 parts[2] ? Number(parts[2]) : undefined,
+                state.config,
               )
-            : await logs.overview(state.id),
+            : await logs.overview(state.id, state.config),
           "info",
         );
       } catch (e) {

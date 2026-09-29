@@ -22,6 +22,7 @@ import { assertTemperatureSupported } from "../agents/sampling.ts";
 import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
 import { resolveNetworkRetry } from "../agents/network-retry.ts";
 import { resolveDoomLoop } from "../agents/doom-loop.ts";
+import { getAgentDisplayName } from "../ui/agent-name.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -107,7 +108,7 @@ export async function doctor(cwd: string) {
     lines.push(`Configuration: ${path}`);
     for (const role of roles)
       lines.push(
-        `Agent ${role}: ${config.agents[role].role} → ${config.agents[role].prompt}`,
+        `Agent ${role}: name ${getAgentDisplayName(config, role)}; role ${config.agents[role].role} → ${config.agents[role].prompt}`,
       );
     configSchema.parse(config);
     const doom = config.workflow.doomLoop;
