@@ -13,6 +13,7 @@ export const logicalRoles = [
   "security-reviewer",
   "tester",
   "commit-agent",
+  "reporter",
 ] as const;
 export const expectedRoles: Record<
   (typeof roles)[number],
@@ -31,6 +32,7 @@ export const expectedRoles: Record<
   securityReviewer: "security-reviewer",
   tester: "tester",
   commitAgent: "commit-agent",
+  reporter: "reporter",
 };
 const agent = z
   .object({

@@ -169,9 +169,9 @@ test("/team-init creates project YAML, distinct prompts and ignored state withou
   await git(cwd, ["init"]);
   const original = await head(cwd),
     result = await initTeam(cwd);
-  assert.equal(result.created.length, 15);
+  assert.equal(result.created.length, 16);
   const entries = await readdir(join(teamRoot(cwd), "agents"));
-  assert.equal(entries.length, 13);
+  assert.equal(entries.length, 14);
   assert.equal(
     await readFile(join(teamRoot(cwd), ".gitignore"), "utf8"),
     "state/\n",
@@ -297,7 +297,7 @@ test("global /team-init command works from a Git subdirectory", async () => {
       },
     },
   });
-  assert.match(notice, /Created 15 project team files/);
+  assert.match(notice, /Created 16 project team files/);
   assert.ok((await loadConfig(join(cwd, "src"))).config.agents.orchestrator);
   for (const command of ["team", "team-init", "team-status", "team-stop"])
     assert.ok(commands.has(command));
@@ -313,7 +313,7 @@ test("config and prompt hashes persist; prompt drift pauses resume, explicit ref
     s.teamConfigPath,
     join(teamRoot(await realpath(cwd)), "team.yaml"),
   );
-  assert.equal(Object.keys(s.agentPromptHashes ?? {}).length, 13);
+  assert.equal(Object.keys(s.agentPromptHashes ?? {}).length, 14);
   s.phase = "RESEARCH";
   s.inFlight = { phase: "RESEARCH", roles: ["researcher"] };
   await engine.store.save(s);

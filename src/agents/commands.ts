@@ -10,6 +10,7 @@ export interface CommandEvidence {
   stdout?: string;
   stderr?: string;
   timedOut?: boolean;
+  durationMs?: number;
 }
 export async function execute(
   command: Command,
@@ -17,6 +18,7 @@ export async function execute(
   signal?: AbortSignal,
 ): Promise<CommandEvidence> {
   if (signal?.aborted) throw new Error("Command aborted");
+  const startedAt = Date.now();
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([key]) =>
       ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SHELL"].includes(key),
@@ -73,6 +75,7 @@ export async function execute(
         stdout,
         stderr,
         timedOut,
+        durationMs: Math.max(0, Date.now() - startedAt),
       });
     });
   });

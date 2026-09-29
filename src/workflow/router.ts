@@ -6,7 +6,7 @@ export function afterSecurity(s: WorkflowState): Phase {
   return s.config.qualityGates.testing.enabled ? "TEST" : afterTests(s);
 }
 export function afterTests(s: WorkflowState): Phase {
-  return s.config.qualityGates.commit.enabled ? "COMMIT" : "DONE";
+  return s.config.qualityGates.commit.enabled ? "COMMIT" : "REPORT";
 }
 export function fix(
   s: WorkflowState,
@@ -166,6 +166,9 @@ export function transition(s: WorkflowState) {
       break;
     }
     case "COMMIT":
+      s.phase = "REPORT";
+      break;
+    case "REPORT":
       s.phase = "DONE";
       break;
   }

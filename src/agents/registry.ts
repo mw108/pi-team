@@ -9,6 +9,11 @@ export function digest(content: string) {
 export async function rolePrompt(root: string, config: TeamConfig, slot: Role) {
   const definition = config.agents[slot];
   if (!definition) throw new Error(`Missing required agent: ${slot}`);
+  if (slot === "reporter" && definition.prompt === "agents/reporter-compat.md")
+    return readFile(
+      new URL("../../templates/agents/reporter.md", import.meta.url),
+      "utf8",
+    );
   const path = promptPath(root, definition.prompt),
     base = teamRoot(root);
   let actual: string;

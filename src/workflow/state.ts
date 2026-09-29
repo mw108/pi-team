@@ -59,6 +59,7 @@ export const phases = [
   "SECURITY_REVIEW",
   "TEST",
   "COMMIT",
+  "REPORT",
   "WAITING_USER",
   "BLOCKED",
   "DONE",
@@ -153,9 +154,37 @@ export const stateSchema = z.object({
     })
     .optional(),
   commit: z.object({ hash: z.string(), files: z.array(z.string()) }).optional(),
+  reportFailure: z.string().optional(),
+  reportInput: z.unknown().optional(),
 });
 export type WorkflowState = z.infer<typeof stateSchema>;
 function migrateState(value: unknown): unknown {
+  if (value && typeof value === "object") {
+    const old = value as Record<string, any>;
+    if (
+      (old.version === 1 || old.version === 2) &&
+      old.config?.agents &&
+      !old.config.agents.reporter
+    )
+      value = {
+        ...old,
+        config: {
+          ...old.config,
+          agents: {
+            ...old.config.agents,
+            reporter: {
+              role: "reporter",
+              prompt: "agents/reporter.md",
+              provider: old.config.agents.orchestrator.provider,
+              model: old.config.agents.orchestrator.model,
+              temperature: 0.1,
+              thinking: "off",
+              timeoutMs: 600000,
+            },
+          },
+        },
+      };
+  }
   if (!value || typeof value !== "object" || (value as any).version !== 1)
     return value;
   const old = value as Record<string, unknown>;

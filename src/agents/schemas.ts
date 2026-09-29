@@ -16,6 +16,7 @@ export const roles = [
   "securityReviewer",
   "tester",
   "commitAgent",
+  "reporter",
 ] as const;
 export type Role = (typeof roles)[number];
 const strings = z.array(z.string());
@@ -239,12 +240,33 @@ export const testSchema = z.object({
       stdout: z.string().optional(),
       stderr: z.string().optional(),
       timedOut: z.boolean().optional(),
+      durationMs: z.number().int().nonnegative().optional(),
     }),
   ),
   failedAreas: strings,
   classification: z.enum(["FIX_LOCAL", "FIX_DESIGN"]).optional(),
 });
 export const commitSchema = z.object({ message: text, files: strings });
+export const completionReportSchema = z.object({
+  summary: text,
+  implemented: strings,
+  changedFiles: strings,
+  validation: z.array(
+    z.object({
+      label: text,
+      status: z.enum(["passed", "failed", "disabled", "not-run", "warning"]),
+      detail: z.string().optional(),
+    }),
+  ),
+  notes: strings,
+  unresolvedIssues: strings,
+  commit: z.object({
+    created: z.boolean(),
+    hash: z.string().optional(),
+    message: z.string().optional(),
+    detail: z.string().optional(),
+  }),
+});
 export const normalizeSchema = z.object({
   requirements: strings.min(1),
   summary: text,
@@ -263,6 +285,7 @@ export const resultSchemas: Record<Role, z.ZodTypeAny> = {
   securityReviewer: securitySchema,
   tester: testSchema,
   commitAgent: commitSchema,
+  reporter: completionReportSchema,
 };
 export type Contract = z.infer<typeof contractSchema>;
 export type Question = z.infer<typeof questionSchema>;

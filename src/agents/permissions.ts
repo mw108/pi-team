@@ -33,7 +33,10 @@ const docsRoles: Role[] = [
   "securityReviewer",
 ];
 export function allowedTools(role: Role, config: TeamConfig) {
-  const tools = role === "orchestrator" ? [] : ["read", "grep", "find", "ls"];
+  const tools =
+    role === "orchestrator" || role === "reporter"
+      ? []
+      : ["read", "grep", "find", "ls"];
   if (
     role === "implementor" ||
     (role === "tester" && config.tester.mayModifyTests)

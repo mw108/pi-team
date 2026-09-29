@@ -26,6 +26,8 @@ Then enter:
 /team Implement feature X according to requirement Y.
 /team doctor
 /team-status
+/team-report
+/team-report <workflow-id>
 /team-log
 /team-log researcher
 /team-log researcher --attempt 1
@@ -37,7 +39,58 @@ Then enter:
 /team resume <workflow-id>
 ```
 
-Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection.
+Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-init --repair` adds a missing Reporter prompt and config entry to an existing project team. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. A changed team YAML or agent prompt pauses resume for explicit pi-ask review. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, the workflow blocks for manual inspection; a change during REPORT uses the deterministic report fallback.
+
+### Completion reports
+
+The successful route ends with Commit Agent → Reporter → DONE. The host builds a compact `CompletionReportInput` from the final workflow state. Changed paths come from the created commit or final Git working tree compared with the starting dirty paths; validation commands come from the Tester's recorded execution results; reviews, gate settings, commit details, warnings and open issues come from their final structured state. Solver proposals are not treated as implemented work. The Reporter has no tools or web access, uses a low temperature, and returns structured JSON. The host keeps factual fields authoritative, persists the final report in workflow state, and renders it in the terminal. `/team-log` remains available for detailed diagnostics.
+
+```text
+Team DONE
+
+Summary
+Authentication error handling was corrected.
+
+Implemented
+- Login errors are displayed to the user.
+
+Changed files
+- src/login.ts
+
+Validation
+- ✓ Code review: passed
+- ✓ npm test: passed
+- ⚠ Pentest: disabled
+
+Commit
+abc1234 Fix login error handling
+```
+
+`/team-report` displays the latest completed workflow; `/team-report <workflow-id>` selects a saved workflow. Both reuse persisted results without a model call. Older DONE states without a Reporter result get a deterministic fallback from available state. When an older state has no recorded commit, its changed paths are marked unavailable rather than inferred from today's working tree. While a workflow runs, `/team-report` shows its current phase. `/team-status` marks completed reports as available. If Reporter output is malformed, times out, fails at the provider, or is aborted, completed implementation and validation stay DONE and the host renders a factual fallback. `/team resume` replays an interrupted REPORT without rerunning implementation, tests or commit. `/team-retry reporter` starts a fresh report attempt and preserves the previous report unless replacement succeeds.
+
+BLOCKED output identifies the stopped phase and agent, the recorded reason, completed agents, repository mutation state, available diagnostics, and a deterministic next action when one is safe. For example:
+
+```text
+Team BLOCKED
+
+Stopped at
+RESEARCH · researcher
+
+Reason
+Agent execution failed: provider terminated
+
+Completed
+✓ orchestrator
+
+Repository changes
+No implementation recorded.
+
+Diagnostics
+- Agent failures: 1/2
+
+Next action
+/team-retry researcher
+```
 
 The in-place progress widget shows each agent as `○` pending, `●` running, `✓` completed, or `✗` failed; `◉` marks a pause for user input. Parallel Solvers update independently. Running agents show elapsed time, refreshed every two seconds by default, and a short activity label such as “Serena: references,” “Context7,” “Running tests,” or “Creating commit.” Tool arguments, source text, credentials and private reasoning are never included. Completed phases remain visible without adding permanent log lines. `/team-status` shows the same live information while this Pi session is running; after a restart it reports persisted state and says live timing is unavailable. `/team-stop` immediately marks running agents stopped and clears the heartbeat.
 

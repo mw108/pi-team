@@ -164,3 +164,11 @@ agents:
     temperature: 0.1
     thinking: off
     timeoutMs: 300000
+  reporter:
+    role: reporter
+    prompt: agents/reporter.md
+    provider: local
+    model: configure-model-id
+    temperature: 0.1
+    thinking: off
+    timeoutMs: 600000

@@ -67,6 +67,12 @@ import {
   serializeErrorDiagnostics,
 } from "../agents/error-diagnostics.ts";
 import type { ProviderRequestEvent } from "../agents/network-retry.ts";
+import {
+  buildCompletionReportInput,
+  finalizeReport,
+  fallbackReport,
+  type CompletionReportInput,
+} from "./report.ts";
 const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
@@ -79,6 +85,7 @@ const phaseRoles: Partial<Record<Phase, Role[]>> = {
   SECURITY_REVIEW: ["securityReviewer"],
   TEST: ["tester"],
   COMMIT: ["commitAgent"],
+  REPORT: ["reporter"],
 };
 const mutatingRoles: Role[] = [
   "implementor",
@@ -196,6 +203,7 @@ export class WorkflowEngine {
     control.controller.abort();
   }
   retryConfirmation(state: WorkflowState, role: Role) {
+    if (role === "reporter" && state.reportFailure) return undefined;
     const settled = this.activeAttempts.get(role);
     if (
       !state.results[role] &&
@@ -321,7 +329,7 @@ export class WorkflowEngine {
     return "prepared";
   }
   private prepareManualRetry(state: WorkflowState, role: Role, phase: Phase) {
-    if (state.commit || state.phase === "DONE")
+    if (role !== "reporter" && (state.commit || state.phase === "DONE"))
       throw new Error(
         "Completed workflow cannot be retried after commit or completion.",
       );
@@ -330,7 +338,10 @@ export class WorkflowEngine {
       state.phase === "BLOCKED"
         ? state.history.findLast((e) => e.event === "blocked")?.phase
         : state.phase;
-    if (!current || order.indexOf(current) < order.indexOf(phase))
+    if (
+      (!current || order.indexOf(current) < order.indexOf(phase)) &&
+      !(role === "reporter" && state.phase === "DONE")
+    )
       throw new Error(
         `Agent ${role} is not available in the current workflow phase.`,
       );
@@ -343,6 +354,8 @@ export class WorkflowEngine {
           state.agentFailures = Math.max(0, state.agentFailures - 1);
         else if (!state.blocker.includes(`Agent ${role} aborted by user`))
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
+      } else if (role === "reporter" && state.reportFailure) {
+        // Presentation can be retried after work has completed.
       } else if (!(
         state.blocker?.startsWith("Insufficient Solver proposals") &&
         role.startsWith("solver")
@@ -386,6 +399,7 @@ export class WorkflowEngine {
       "securityReviewer",
       "tester",
       "commitAgent",
+      "reporter",
     ];
     if (role.startsWith("solver")) return all.slice(all.indexOf("critic"));
     return all.slice(all.indexOf(role) + 1);
@@ -1042,7 +1056,21 @@ export class WorkflowEngine {
             );
             break;
           }
-          const current = await loadConfig(this.cwd);
+          let current: TeamDefinition;
+          try {
+            current = await loadConfig(this.cwd);
+          } catch (configError) {
+            if (s.phase !== "REPORT") throw configError;
+            s.reportFailure = `Reporter configuration unavailable: ${String(configError)}`;
+            s.reportInput ??= await buildCompletionReportInput(s);
+            s.results.reporter ??= fallbackReport(
+              s.reportInput as CompletionReportInput,
+            );
+            record(s, "report_fallback", s.reportFailure);
+            s.phase = "DONE";
+            await this.store.save(s);
+            break;
+          }
           const changed: string[] = [];
           if (
             current.path !== s.teamConfigPath ||
@@ -1052,6 +1080,17 @@ export class WorkflowEngine {
           for (const [slot, hash] of Object.entries(current.agentPromptHashes))
             if (s.agentPromptHashes[slot] !== hash)
               changed.push(current.config.agents[slot as Role].prompt);
+          if (changed.length && s.phase === "REPORT") {
+            record(s, "configuration_drift", changed.join(", "));
+            s.reportFailure = `Configuration changed during REPORT: ${changed.join(", ")}`;
+            s.reportInput ??= await buildCompletionReportInput(s);
+            s.results.reporter ??= fallbackReport(
+              s.reportInput as CompletionReportInput,
+            );
+            s.phase = "DONE";
+            await this.store.save(s);
+            break;
+          }
           if (changed.length) {
             s.driftCandidate = {
               configPath: current.path,
@@ -1255,11 +1294,17 @@ export class WorkflowEngine {
           await this.store.save(s);
           continue;
         }
-        if (s.agentFailures >= s.config.workflow.maxAgentFailures) {
+        if (
+          s.phase !== "REPORT" &&
+          s.agentFailures >= s.config.workflow.maxAgentFailures
+        ) {
           block(s, "Agent failure limit reached");
           break;
         }
-        if ((await head(this.cwd)) !== s.baseline.head) {
+        if (
+          s.phase !== "REPORT" &&
+          (await head(this.cwd)) !== s.baseline.head
+        ) {
           block(s, "Git HEAD changed during workflow");
           break;
         }
@@ -1377,6 +1422,10 @@ export class WorkflowEngine {
             continue;
           }
         }
+        if (s.phase === "REPORT" && !s.reportInput) {
+          s.reportInput = await buildCompletionReportInput(s);
+          await this.store.save(s);
+        }
         const allRoles = phaseRoles[s.phase];
         if (!allRoles) {
           block(s, "Unknown workflow phase");
@@ -1451,7 +1500,19 @@ export class WorkflowEngine {
               this.invalidateDependents(s, role);
               delete s.manualRetry;
             }
-            s.results[role] = result;
+            try {
+              s.results[role] =
+                role === "reporter"
+                  ? finalizeReport(
+                      s.reportInput as CompletionReportInput,
+                      result,
+                    )
+                  : result;
+              if (role === "reporter") delete s.reportFailure;
+            } catch (invalid) {
+              error = `Invalid reporter result: ${String(invalid)}`;
+              continue;
+            }
             if (role !== "commitAgent") record(s, "agent_completed", role);
           }
         }
@@ -1466,7 +1527,14 @@ export class WorkflowEngine {
             s.agentFailures += replay.failures;
             if (replay.result.type !== "QUESTION_REQUEST") {
               this.invalidateDependents(s, role);
-              s.results[role] = replay.result;
+              s.results[role] =
+                role === "reporter"
+                  ? finalizeReport(
+                      s.reportInput as CompletionReportInput,
+                      replay.result,
+                    )
+                  : replay.result;
+              if (role === "reporter") delete s.reportFailure;
               delete s.manualRetry;
               record(s, "agent_completed", role);
             } else pending = replay.result;
@@ -1512,6 +1580,17 @@ export class WorkflowEngine {
           }
         }
         if (aborted && !error) error = `Agent ${aborted} aborted by user`;
+        if ((error || pending) && s.phase === "REPORT") {
+          s.reportFailure =
+            error ?? "Reporter requested additional information";
+          s.results.reporter ??= fallbackReport(
+            s.reportInput as CompletionReportInput,
+          );
+          record(s, "report_fallback", s.reportFailure);
+          s.phase = "DONE";
+          await this.store.save(s);
+          break;
+        }
         if (error) {
           block(s, `Agent execution failed: ${error}`);
           await this.store.save(s);

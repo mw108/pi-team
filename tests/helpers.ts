@@ -130,6 +130,16 @@ export function output(role: Role): any {
       };
     case "commitAgent":
       return { message: "fix(math): correct addition", files: ["math.js"] };
+    case "reporter":
+      return {
+        summary: "Fixed addition",
+        implemented: ["Fixed addition"],
+        changedFiles: [],
+        validation: [],
+        notes: [],
+        unresolvedIssues: [],
+        commit: { created: false },
+      };
   }
 }
 export async function repository() {

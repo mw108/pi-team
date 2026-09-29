@@ -101,6 +101,15 @@ export async function initTeam(cwd: string, mode: InitMode = "default") {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     existing.push(".pi/team/team.yaml");
+    if (mode === "repair") {
+      const document = YAML.parseDocument(await readFile(configTarget, "utf8"));
+      if (!document.hasIn(["agents", "reporter"])) {
+        const defaults = YAML.parse(configText);
+        document.setIn(["agents", "reporter"], defaults.agents.reporter);
+        await writeFile(configTarget, String(document));
+        created.push(".pi/team/team.yaml reporter entry");
+      }
+    }
   }
   for (const name of templateFiles)
     await add(`agents/${name}`, join(templates, "agents", name));

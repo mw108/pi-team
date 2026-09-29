@@ -18,6 +18,7 @@ const names: Record<Role, string> = {
   securityReviewer: "Security Reviewer",
   tester: "Tester",
   commitAgent: "Commit Agent",
+  reporter: "Reporter",
 };
 const symbols = {
   pending: "○",
@@ -206,6 +207,10 @@ export function renderProgress(
   ];
   lines.push(gates.join(" · "));
   if (state.blocker) lines.push("Blocked; inspect workflow state for details");
+  if (state.phase === "DONE")
+    lines.push(
+      `Report: ${state.results.reporter ? "available" : "deterministic fallback available"} · /team-report`,
+    );
   if (
     state.history.some((entry) => entry.event === "agent_attempt_started") &&
     state.config.logging.agentLogs.level !== "off"

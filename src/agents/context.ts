@@ -2,7 +2,16 @@ import type { Role } from "./schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { actualDiff } from "../workflow/git.ts";
 import { effectiveConfig } from "./discovery.ts";
-export async function contextFor(role: Role, s: WorkflowState) {
+import { buildCompletionReportInput } from "../workflow/report.ts";
+export async function contextFor(
+  role: Role,
+  s: WorkflowState,
+): Promise<Record<string, any>> {
+  if (role === "reporter")
+    return (
+      (s.reportInput as Record<string, any> | undefined) ??
+      (await buildCompletionReportInput(s))
+    );
   const context: Record<string, unknown> = {
     task: s.task,
     requirements: s.requirements,

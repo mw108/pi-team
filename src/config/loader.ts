@@ -5,6 +5,21 @@ import YAML from "yaml";
 import { configSchema, type TeamConfig } from "./schema.ts";
 import { contained, projectRoot, teamRoot } from "./project.ts";
 import { digest, promptHashes } from "../agents/registry.ts";
+function compatibleConfig(source: string): TeamConfig {
+  const value = YAML.parse(source, { uniqueKeys: true });
+  if (value?.agents && !value.agents.reporter && value.agents.orchestrator) {
+    value.agents.reporter = {
+      role: "reporter",
+      prompt: "agents/reporter-compat.md",
+      provider: value.agents.orchestrator.provider,
+      model: value.agents.orchestrator.model,
+      temperature: 0.1,
+      thinking: "off",
+      timeoutMs: 600000,
+    };
+  }
+  return configSchema.parse(value);
+}
 export function agentDir() {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
@@ -43,7 +58,7 @@ export async function loadConfig(cwd: string): Promise<TeamDefinition> {
       !contained(realBase, await realpath(path))
     )
       throw new Error("Project team.yaml symlink escapes .pi/team");
-    const config = configSchema.parse(YAML.parse(source, { uniqueKeys: true }));
+    const config = compatibleConfig(source);
     return {
       path,
       config,

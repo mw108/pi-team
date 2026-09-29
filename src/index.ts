@@ -15,7 +15,28 @@ import type { WorkflowState } from "./workflow/state.ts";
 import { initTeam } from "./config/init.ts";
 import { projectRoot } from "./config/project.ts";
 import { AgentLogStore } from "./workflow/agent-logs.ts";
-import { roles, type Role } from "./agents/schemas.ts";
+import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
+import {
+  buildCompletionReportInput,
+  fallbackReport,
+  renderReport,
+  renderBlocked,
+  type CompletionReportInput,
+} from "./workflow/report.ts";
+async function completionText(state: WorkflowState) {
+  const report = state.results.reporter
+    ? completionReportSchema.parse(state.results.reporter)
+    : fallbackReport(
+        (state.reportInput as CompletionReportInput | undefined) ??
+          (await buildCompletionReportInput(state, true)),
+      );
+  return renderReport(report, state.reportFailure);
+}
+async function finalText(state: WorkflowState) {
+  if (state.phase === "DONE") return completionText(state);
+  if (state.phase === "BLOCKED") return renderBlocked(state);
+  return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
+}
 export default function teamExtension(pi: ExtensionAPI) {
   let active:
     | {
@@ -181,7 +202,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         try {
           const finished = await engine.run(state, controller.signal);
           ctx.ui.notify(
-            `Team ${finished.phase}${finished.blocker ? ` · ${finished.blocker}` : ""}`,
+            await finalText(finished),
             finished.phase === "BLOCKED" ? "error" : "info",
           );
         } finally {
@@ -216,6 +237,38 @@ export default function teamExtension(pi: ExtensionAPI) {
         } else ctx.ui.notify("No team workflow in this repository.", "info");
       } catch (e) {
         ctx.ui.notify(String(e), "error");
+      }
+    },
+  });
+  pi.registerCommand("team-report", {
+    description:
+      "Show the latest completion report: /team-report [workflow-id]",
+    handler: async (args, ctx) => {
+      try {
+        const id = args.trim();
+        if (id && !/^[a-f0-9-]{36}$/.test(id))
+          throw new Error("Usage: /team-report [workflow-id]");
+        const root = await projectRoot(ctx.cwd);
+        const store = new StateStore(root);
+        const state = id
+          ? await store.load(id)
+          : active?.state?.cwd === root
+            ? active.state
+            : await store.latest();
+        if (!state) {
+          ctx.ui.notify("No team workflow in this repository.", "info");
+          return;
+        }
+        ctx.ui.notify(
+          state.phase === "DONE"
+            ? await completionText(state)
+            : state.phase === "BLOCKED"
+              ? renderBlocked(state)
+              : `Report is not final yet.\nCurrent phase: ${state.phase}`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(String(error), "error");
       }
     },
   });
@@ -324,7 +377,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           phase: result.phase,
         });
         ctx.ui.notify(
-          `Team ${result.phase}${result.commit ? ` · commit ${result.commit.hash.slice(0, 12)}` : ""}${result.blocker ? ` · ${result.blocker}` : ""}\nState: ${engine.store.path(result.id)}`,
+          await finalText(result),
           result.phase === "DONE"
             ? "info"
             : result.phase === "BLOCKED"
