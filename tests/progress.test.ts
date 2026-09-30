@@ -21,6 +21,11 @@ import { WorkflowEngine } from "../src/workflow/engine.ts";
 import type { Role } from "../src/agents/schemas.ts";
 import teamExtension from "../src/index.ts";
 import { PiRunner } from "../src/agents/runner.ts";
+import { ActiveSessionRegistry } from "../src/agents/active-sessions.ts";
+import type {
+  AgentSession,
+  ContextUsage,
+} from "@earendil-works/pi-coding-agent";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -36,6 +41,27 @@ function state() {
 }
 function lines(s: WorkflowState, runtime?: ProgressRuntime) {
   return renderProgress(s, runtime).join("\n");
+}
+function sessionWithUsage(getContextUsage: () => ContextUsage | undefined) {
+  return { getContextUsage } as AgentSession;
+}
+function registerUsage(
+  registry: ActiveSessionRegistry,
+  workflowId: string,
+  agentId: Role,
+  attempt: number,
+  session: AgentSession,
+) {
+  const entry = {
+    workflowId,
+    agentId,
+    attempt,
+    session,
+    startedAt: Date.now(),
+    state: "running" as const,
+  };
+  registry.register(entry);
+  return entry;
 }
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -494,6 +520,127 @@ test("parallel solver events update each result before siblings settle", async (
   runtime.dispose();
 });
 
+test("Pi context usage renders rounded percentage and hides unavailable compaction interval", () => {
+  const s = state();
+  const registry = new ActiveSessionRegistry();
+  const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  let usage: ContextUsage | undefined = {
+    tokens: 34_000,
+    contextWindow: 200_000,
+    percent: 17.4,
+  };
+  runtime.bindSessions(registry);
+  runtime.bind(s);
+  runtime.event({ type: "start", role: "implementor", attempt: 1 });
+  registerUsage(
+    registry,
+    s.id,
+    "implementor",
+    1,
+    sessionWithUsage(() => usage),
+  );
+  runtime.refreshContextUsage();
+  assert.match(lines(s, runtime), /● Implementor.*context used 17%/);
+  assert.equal(runtime.agents.implementor?.contextUsage?.tokens, 34_000);
+  usage = { tokens: 164_000, contextWindow: 200_000, percent: 82 };
+  runtime.refreshContextUsage();
+  assert.match(lines(s, runtime), /context used 82%/);
+  usage = { tokens: null, contextWindow: 200_000, percent: null };
+  runtime.refreshContextUsage();
+  assert.doesNotMatch(lines(s, runtime), /context used/);
+  usage = { tokens: 42_000, contextWindow: 200_000, percent: 21 };
+  runtime.refreshContextUsage();
+  assert.match(lines(s, runtime), /context used 21%/);
+  usage = undefined;
+  runtime.refreshContextUsage();
+  assert.doesNotMatch(lines(s, runtime), /context used/);
+  runtime.dispose();
+});
+
+test("parallel Solvers read their own active Pi sessions", () => {
+  const s = state();
+  const registry = new ActiveSessionRegistry();
+  const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  runtime.bindSessions(registry);
+  runtime.bind(s);
+  for (const [role, percent] of [
+    ["solver1", 12],
+    ["solver2", 19],
+    ["solver3", 8],
+  ] as const) {
+    runtime.event({ type: "start", role, attempt: 1 });
+    registerUsage(
+      registry,
+      s.id,
+      role,
+      1,
+      sessionWithUsage(() => ({
+        tokens: percent * 100,
+        contextWindow: 10_000,
+        percent,
+      })),
+    );
+  }
+  runtime.refreshContextUsage();
+  const text = lines(s, runtime);
+  assert.match(text, /● Solver Architecture.*context used 12%/);
+  assert.match(text, /● Solver Pragmatic.*context used 19%/);
+  assert.match(text, /● Solver Alternative.*context used 8%/);
+  runtime.dispose();
+});
+
+test("new run replaces old context source and telemetry failures hide usage", () => {
+  const s = state();
+  const registry = new ActiveSessionRegistry();
+  const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  runtime.bindSessions(registry);
+  runtime.bind(s);
+  runtime.event({ type: "start", role: "implementor", attempt: 1 });
+  const old = registerUsage(
+    registry,
+    s.id,
+    "implementor",
+    1,
+    sessionWithUsage(() => ({
+      tokens: 83_000,
+      contextWindow: 100_000,
+      percent: 83,
+    })),
+  );
+  runtime.refreshContextUsage();
+  assert.match(lines(s, runtime), /context used 83%/);
+  runtime.event({ type: "start", role: "implementor", attempt: 2 });
+  runtime.refreshContextUsage();
+  assert.doesNotMatch(lines(s, runtime), /context used/);
+  registry.remove(old);
+  const fresh = registerUsage(
+    registry,
+    s.id,
+    "implementor",
+    2,
+    sessionWithUsage(() => ({
+      tokens: 6_000,
+      contextWindow: 100_000,
+      percent: 6,
+    })),
+  );
+  runtime.refreshContextUsage();
+  assert.match(lines(s, runtime), /run 2 · context used 6%/);
+  registry.remove(fresh);
+  registerUsage(
+    registry,
+    s.id,
+    "implementor",
+    2,
+    sessionWithUsage(() => {
+      throw new Error("telemetry unavailable");
+    }),
+  );
+  assert.doesNotThrow(() => runtime.refreshContextUsage());
+  assert.doesNotMatch(lines(s, runtime), /context used/);
+  runtime.dispose();
+});
+
 test("/team-status reports live agent and /team-stop removes working display", async () => {
   const cwd = await repository();
   const cfg = config();
@@ -521,8 +668,30 @@ test("/team-status reports live agent and /team-stop removes working display", a
   };
   const researcher = deferred<any>(),
     original = PiRunner.prototype.run;
-  PiRunner.prototype.run = async (role: Role) =>
-    role === "researcher" ? researcher.promise : output(role);
+  let registered = false;
+  PiRunner.prototype.run = async (role: Role, ...args: any[]) => {
+    if (role !== "researcher") return output(role);
+    const state = args[0] as WorkflowState;
+    const attempt = args[3] as number;
+    const registry = args[6] as ActiveSessionRegistry;
+    const entry = registerUsage(
+      registry,
+      state.id,
+      role,
+      attempt,
+      sessionWithUsage(() => ({
+        tokens: 34_000,
+        contextWindow: 200_000,
+        percent: 17,
+      })),
+    );
+    registered = true;
+    try {
+      return await researcher.promise;
+    } finally {
+      registry.remove(entry);
+    }
+  };
   try {
     const task = commands.get("team").handler("Fix addition", ctx);
     await eventually(() =>
@@ -530,8 +699,12 @@ test("/team-status reports live agent and /team-stop removes working display", a
         widget?.some((line) => line.includes("● Research Analyst")),
       ),
     );
+    await eventually(() => registered);
     await commands.get("team-status").handler("", ctx);
-    assert.match(notices.at(-1) ?? "", /● Research Analyst/);
+    assert.match(
+      notices.at(-1) ?? "",
+      /● Research Analyst \(researcher\).*context used 17%/,
+    );
     assert.match(notices.at(-1) ?? "", /Pentest disabled/);
     await commands.get("team-stop").handler("", ctx);
     assert.match(widgets.at(-1)?.join("\n") ?? "", /stopped/);
@@ -547,6 +720,7 @@ test("/team-status reports live agent and /team-stop removes working display", a
     } as any);
     await restarted.get("team-status").handler("", ctx);
     assert.match(notices.at(-1) ?? "", /Live runtime details unavailable/);
+    assert.doesNotMatch(notices.at(-1) ?? "", /context used/);
   } finally {
     PiRunner.prototype.run = original;
   }

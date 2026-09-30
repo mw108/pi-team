@@ -2,6 +2,8 @@ import type { Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { formatToolActivity } from "./activity.ts";
 import type { GuardEvent } from "../agents/runner.ts";
+import type { ContextUsage } from "@earendil-works/pi-coding-agent";
+import type { ActiveSessionRegistry } from "../agents/active-sessions.ts";
 
 export type AgentRuntimeStatus =
   "pending" | "running" | "completed" | "failed" | "stopped" | "aborted";
@@ -30,6 +32,7 @@ export interface AgentProgress {
     retryAt?: number;
     category: string;
   };
+  contextUsage?: ContextUsage;
 }
 export type AgentEvent =
   | {
@@ -90,6 +93,7 @@ export class ProgressRuntime {
   stopped = false;
   private cancelTimer?: () => void;
   private disposed = false;
+  private sessions?: ActiveSessionRegistry;
   constructor(
     private readonly changed: () => void,
     private refreshMs = 2000,
@@ -100,6 +104,28 @@ export class ProgressRuntime {
       ms: number,
     ) => () => void = interval,
   ) {}
+  bindSessions(sessions: ActiveSessionRegistry) {
+    this.sessions = sessions;
+  }
+  refreshContextUsage() {
+    if (this.disposed || !this.state) return;
+    for (const [role, agent] of Object.entries(this.agents) as [
+      Role,
+      AgentProgress,
+    ][]) {
+      agent.contextUsage = undefined;
+      if (agent.status !== "running") continue;
+      const entry = this.sessions?.get(this.state.id, role);
+      if (!entry || entry.attempt !== agent.attempt) continue;
+      try {
+        const usage = entry.session.getContextUsage();
+        if (usage?.percent != null && Number.isFinite(usage.percent))
+          agent.contextUsage = usage;
+      } catch {
+        // Context telemetry must never affect an active agent.
+      }
+    }
+  }
   configure(refreshMs: number, heartbeat: boolean) {
     if (this.disposed) return;
     if (this.refreshMs === refreshMs && this.heartbeat === heartbeat) return;

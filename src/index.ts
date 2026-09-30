@@ -229,6 +229,7 @@ export default function teamExtension(pi: ExtensionAPI) {
             approve: (request) => askApproval(pi, ctx, request),
             agentEvent: (event) => runtime.event(event),
           });
+        runtime.bindSessions(engine.sessions);
         if (!active) ownedRuntime = runtime;
         const message = engine.retryConfirmation(state, role);
         let confirmed = false;
@@ -318,6 +319,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           approve: (request) => askApproval(pi, ctx, request),
           agentEvent: (event) => runtime!.event(event),
         });
+        runtime.bindSessions(engine.sessions);
         active = { controller, runtime, state, engine };
         runtime.configure(
           state.config.ui.progress.refreshMs,
@@ -493,6 +495,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           approve: (request) => askApproval(pi, ctx, request),
           agentEvent: (event) => runtime.event(event),
         });
+        runtime.bindSessions(engine.sessions);
         active.engine = engine;
         const [verb, id] = args.trim().split(/\s+/);
         let state;

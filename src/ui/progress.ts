@@ -222,7 +222,11 @@ function displayAgent(
     derived.attempt && (live?.manualRetry || derived.attempt > 1)
       ? ` · run ${derived.attempt}`
       : "";
-  const label = `${symbols[status]} ${getAgentDisplayName(state.config, role)}${showId ? ` (${role})` : ""}${model}${duration}${attempt}${retry}${derived.detail ? ` · ${derived.detail}` : ""}`;
+  const context =
+    status === "running" && live?.contextUsage?.percent != null
+      ? ` · context used ${Math.round(live.contextUsage.percent)}%`
+      : "";
+  const label = `${symbols[status]} ${getAgentDisplayName(state.config, role)}${showId ? ` (${role})` : ""}${model}${duration}${attempt}${retry}${context}${derived.detail ? ` · ${derived.detail}` : ""}`;
   const returnedBy =
     trigger === "fix_local" ||
     trigger === "fix_design" ||
@@ -365,6 +369,7 @@ export function progress(
   state: WorkflowState,
   runtime?: ProgressRuntime,
 ) {
+  runtime?.refreshContextUsage();
   const active = Object.values(runtime?.agents ?? {})
     .filter((agent) => agent.status === "running")
     .map((agent) => getAgentDisplayName(state.config, agent.instanceId));
