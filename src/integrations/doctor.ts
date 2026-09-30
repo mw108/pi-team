@@ -116,6 +116,9 @@ export async function doctor(cwd: string) {
       `maxToolCalls: ${config.workflow.maxToolCalls === 0 ? "unlimited" : config.workflow.maxToolCalls}`,
     );
     lines.push(
+      `maxResearchClarifications: ${config.workflow.maxResearchClarifications === 0 ? "unlimited" : config.workflow.maxResearchClarifications}`,
+    );
+    lines.push(
       `Doom-loop detector: enabled ${doom.enabled ? "yes" : "no"}; window ${doom.windowSize} calls; identical threshold ${doom.maxIdenticalCalls}; repeated-pattern threshold ${doom.maxRepeatedPattern}; interventions ${doom.maxInterventions}`,
     );
     const runtime = await ModelRuntime.create({

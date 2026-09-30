@@ -582,6 +582,15 @@ test("temporary failure recovers within one engine attempt without agent failure
   assert.equal(sessions, 1);
   assert.equal(fixture.requests, 3);
   assert.equal(state.agentFailures, 0);
+  assert.deepEqual(
+    state.history
+      .filter(
+        (e) =>
+          e.event === "agent_attempt_started" && e.meta?.agent === "researcher",
+      )
+      .map((e) => [e.meta?.attempt, e.meta?.retryNumber]),
+    [[1, 0]],
+  );
   assert.equal(
     state.history.filter((e) => e.event === "agent_retry").length,
     0,

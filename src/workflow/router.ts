@@ -28,7 +28,7 @@ export function fix(
   route: "FIX_LOCAL" | "FIX_DESIGN" | "FIX_REQUIREMENTS",
   question?: string,
 ) {
-  record(s, route);
+  record(s, route, s.phase);
   if (route === "FIX_REQUIREMENTS") {
     s.pendingQuestion = {
       type: "QUESTION_REQUEST",
@@ -47,6 +47,9 @@ export function fix(
     }
     s.fullCycle++;
     s.phase = "RESEARCH";
+    if (s.results.researcher)
+      s.results.previous_researcher = s.results.researcher;
+    delete s.results.researcher;
   } else {
     if (s.localFixCycle >= s.config.workflow.maxLocalFixCycles) {
       block(s, "Local fix cycle limit reached");
@@ -87,6 +90,13 @@ export function transition(s: WorkflowState) {
       s.phase = "RESEARCH";
       break;
     case "RESEARCH":
+      if (
+        !(s.results.researcher as any) ||
+        (s.results.researcher as any).unresolvedQuestions?.length !== 0
+      )
+        throw new Error(
+          "Researcher has unresolved questions; Solvers cannot start",
+        );
       for (const key of [
         "solver1",
         "solver2",

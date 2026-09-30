@@ -20,7 +20,7 @@ export class AgentTimeoutError extends Error {
     readonly timeoutMs: number,
     readonly attempt: number,
   ) {
-    super(`${agentId} timed out after ${timeoutMs} ms (attempt ${attempt})`);
+    super(`${agentId} timed out after ${timeoutMs} ms (run ${attempt})`);
     this.name = "AgentTimeoutError";
   }
 }
@@ -33,7 +33,7 @@ export class AgentDoomLoopError extends Error {
     readonly interventions: number,
   ) {
     super(
-      `${agentId} attempt ${attempt} could not finalize after ${interventions} doom-loop interventions`,
+      `${agentId} run ${attempt} could not finalize after ${interventions} doom-loop interventions`,
     );
     this.name = "AgentDoomLoopError";
   }
@@ -45,7 +45,7 @@ export class AgentAbortedByUserError extends Error {
     readonly agentId: Role,
     readonly attempt: number,
   ) {
-    super(`${agentId} attempt ${attempt} aborted by user`);
+    super(`${agentId} run ${attempt} aborted by user`);
     this.name = "AgentAbortedByUserError";
   }
 }
@@ -56,7 +56,7 @@ export class AgentSupersededForRetryError extends Error {
     readonly agentId: Role,
     readonly attempt: number,
   ) {
-    super(`${agentId} attempt ${attempt} stopped for an upstream manual retry`);
+    super(`${agentId} run ${attempt} stopped for an upstream manual retry`);
     this.name = "AgentSupersededForRetryError";
   }
 }

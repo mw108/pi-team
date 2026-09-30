@@ -134,6 +134,7 @@ export const configSchema = z
         maxPentestCycles: z.number().int().min(1).default(2),
         maxAgentFailures: z.number().int().min(1).default(2),
         maxQuestions: z.number().int().min(1).default(5),
+        maxResearchClarifications: z.number().int().min(0).default(5),
         agentTimeoutMs: z
           .union([z.literal(0), z.number().int().min(1000).max(3600000)])
           .default(300000),

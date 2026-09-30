@@ -153,3 +153,54 @@ export async function askUser(
     answer?.customText || answer?.note || answer?.optionNotes?.clarify;
   return typeof text === "string" && text.trim() ? text.trim() : undefined;
 }
+
+export function researchQuestionParams(questions: string[]) {
+  return {
+    title: "Researcher needs clarification before Solvers continue",
+    questions: questions.map((question, index) => ({
+      id: `research_${index + 1}`,
+      label: `Question ${index + 1}`,
+      prompt: `${index + 1}. ${question}`,
+      type: "single" as const,
+      required: true,
+      options: [
+        {
+          value: "answer",
+          label: "Provide an answer",
+          description:
+            "Enter your answer in the custom response field or option note",
+        },
+      ],
+    })),
+  };
+}
+
+export function researchQuestionAnswers(
+  questions: string[],
+  details: any,
+): { question: string; answer: string }[] | undefined {
+  if (!details || details.cancelled || details.mode !== "submit")
+    return undefined;
+  const mapped = questions.map((question, index) => {
+    const answer = details.answers?.[`research_${index + 1}`];
+    const value =
+      answer?.customText || answer?.note || answer?.optionNotes?.answer;
+    return { question, answer: typeof value === "string" ? value.trim() : "" };
+  });
+  return mapped.every(({ answer }) => answer.length > 0) ? mapped : undefined;
+}
+
+export async function askResearchQuestions(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  questions: string[],
+) {
+  const details = await invoke(pi, ctx, researchQuestionParams(questions));
+  const answers = researchQuestionAnswers(questions, details);
+  if (details && !answers)
+    ctx.ui.notify(
+      "Please answer every Researcher question before the Solvers can continue. Resume the workflow to reopen the questions.",
+      "warning",
+    );
+  return answers;
+}

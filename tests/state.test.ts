@@ -47,6 +47,19 @@ test("version 2 state loads without inventing semantic drift metadata", () => {
   assert.equal(loaded.semanticConfigHash, undefined);
   assert.equal(loaded.driftConfigSnapshot, undefined);
 });
+test("older version 3 states default the dedicated Researcher count to zero", () => {
+  const raw: any = newState("/tmp", "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  delete raw.researchClarificationCount;
+  delete raw.config.workflow.maxResearchClarifications;
+  assert.equal(validateState(raw).researchClarificationCount, 0);
+  assert.equal(validateState(raw).config.workflow.maxResearchClarifications, 5);
+});
 test("version 1 string test requirements migrate without inventing paths", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
   const raw: any = newState(cwd, "task", config(), {

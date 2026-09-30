@@ -16,6 +16,7 @@ export interface ConfigDriftAnalysis {
 
 const runtimeWorkflow = new Set([
   "maxAgentFailures",
+  "maxResearchClarifications",
   "maxToolCalls",
   "agentTimeoutMs",
   "networkRetry",

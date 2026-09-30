@@ -14,6 +14,8 @@ export interface AgentProgress {
   toolCallId?: string;
   error?: string;
   retry?: number;
+  retryNumber?: number;
+  trigger?: Extract<AgentEvent, { type: "start" | "complete" }>["trigger"];
   previousFailure?: string;
   attempt?: number;
   controlActivity?: string;
@@ -34,8 +36,19 @@ export type AgentEvent =
       type: "start" | "complete";
       role: Role;
       attempt?: number;
+      retryNumber?: number;
       trigger?:
-        "initial" | "automatic_retry" | "manual_retry" | "manual_continue";
+        | "initial"
+        | "automatic_retry"
+        | "manual_retry"
+        | "manual_continue"
+        | "user_clarification"
+        | "fix_local"
+        | "fix_design"
+        | "fix_requirements"
+        | "pentest_remediation"
+        | "security_remediation"
+        | "test_remediation";
     }
   | { type: "fail"; role: Role; error: string }
   | { type: "retry"; role: Role; attempt: number; reason: string }
@@ -138,6 +151,8 @@ export class ProgressRuntime {
         status: "running",
         startedAt: this.now(),
         attempt: event.attempt,
+        retryNumber: event.retryNumber,
+        trigger: event.trigger,
         toolCalls: 0,
         doomLoopInterventions: 0,
         manualRetry: event.trigger === "manual_retry",
@@ -170,7 +185,7 @@ export class ProgressRuntime {
     else if (event.type === "aborting" && existing)
       existing.controlActivity = "Aborting...";
     else if (event.type === "restarting" && existing) {
-      existing.controlActivity = `Restarting as attempt ${event.attempt}`;
+      existing.controlActivity = `Restarting as run ${event.attempt}`;
       existing.networkRetry = undefined;
     } else if (event.type === "aborted" && existing) {
       existing.status = "aborted";

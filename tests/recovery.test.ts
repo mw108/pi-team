@@ -11,8 +11,9 @@ import {
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, head } from "../src/workflow/git.ts";
-import type { WorkflowState } from "../src/workflow/state.ts";
+import { record, type WorkflowState } from "../src/workflow/state.ts";
 import { AgentTimeoutError } from "../src/agents/errors.ts";
+import { renderProgress } from "../src/ui/progress.ts";
 const ui = { progress: () => {}, ask: async () => undefined };
 test("complete team pipeline executes real tests and creates intended commit", async () => {
   const cwd = await repository();
@@ -60,6 +61,28 @@ for (const status of ["FIX_LOCAL", "FIX_DESIGN", "FIX_REQUIREMENTS"] as const)
     assert.equal(s.phase, "DONE", s.blocker);
     assert.equal(runner.counts.researcher, status === "FIX_LOCAL" ? 1 : 2);
     assert.equal(runner.counts.implementor, 2);
+    assert.equal(s.agentFailures, 0);
+    const implementationRuns = s.history.filter(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "implementor",
+    );
+    assert.deepEqual(
+      implementationRuns.map((event) => event.meta?.retryNumber),
+      [0, 0],
+    );
+    assert.equal(
+      implementationRuns[1]?.meta?.trigger,
+      status === "FIX_LOCAL"
+        ? "fix_local"
+        : status === "FIX_DESIGN"
+          ? "fix_design"
+          : "fix_requirements",
+    );
+    assert.equal(
+      s.history.filter((event) => event.event === "agent_retry").length,
+      0,
+    );
     assert.equal(questions, status === "FIX_REQUIREMENTS" ? 1 : 0);
   });
 test("three solvers execute concurrently with isolated initial context", async () => {
@@ -116,6 +139,23 @@ test("read-only agent timeout retries once and is accounted globally", async () 
   assert.equal(s.phase, "DONE", s.blocker);
   assert.equal(runner.counts.researcher, 2);
   assert.equal(s.agentFailures, 1);
+  assert.deepEqual(
+    s.history
+      .filter(
+        (event) =>
+          event.event === "agent_attempt_started" &&
+          event.meta?.agent === "researcher",
+      )
+      .map((event) => [
+        event.meta?.attempt,
+        event.meta?.retryNumber,
+        event.meta?.trigger,
+      ]),
+    [
+      [1, 0, "initial"],
+      [2, 1, "automatic_retry"],
+    ],
+  );
 });
 test("provider failure stops without consuming a hard retry", async () => {
   const cwd = await repository();
@@ -218,8 +258,91 @@ test("pentest global limit prevents infinite security repair loops", async () =>
   assert.equal(s.phase, "BLOCKED");
   assert.match(s.blocker ?? "", /Pentest cycle limit/);
   assert.equal(runner.counts.pentester, 2);
+  assert.equal(s.agentFailures, 0);
+  const implementationRuns = s.history.filter(
+    (event) =>
+      event.event === "agent_attempt_started" &&
+      event.meta?.agent === "implementor",
+  );
+  assert.deepEqual(
+    implementationRuns.map((event) => [
+      event.meta?.attempt,
+      event.meta?.retryNumber,
+      event.meta?.trigger,
+    ]),
+    [
+      [1, 0, "initial"],
+      [2, 0, "security_remediation"],
+      [3, 0, "security_remediation"],
+    ],
+  );
+  assert.equal(
+    s.history.filter((event) => event.event === "agent_retry").length,
+    0,
+  );
+  assert.ok(
+    s.history.some(
+      (event) =>
+        event.event === "FIX_LOCAL" && event.detail === "SECURITY_REVIEW",
+    ),
+  );
   assert.equal(runner.counts.commitAgent, undefined);
 });
+for (const [source, trigger, returnedBy] of [
+  ["PENTEST", "pentest_remediation", "Pentester"],
+  ["SECURITY_REVIEW", "security_remediation", "Security Reviewer"],
+] as const)
+  test(`${source} return starts a normal Implementor run with the correct TUI reason`, async () => {
+    const cwd = await repository();
+    const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+    const state = await engine.start("Fix", config());
+    state.phase = "IMPLEMENT";
+    record(state, "agent_attempt_started", "implementor run 1 started", {
+      agent: "implementor",
+      attempt: 1,
+      retryNumber: 0,
+      trigger: "initial",
+    });
+    record(state, "agent_attempt_completed", "implementor run 1 completed", {
+      agent: "implementor",
+      attempt: 1,
+      retryNumber: 0,
+    });
+    record(state, "FIX_LOCAL", source);
+    const result = await engine.invoke("implementor", state);
+    state.results.implementor = result.result;
+    const starts = state.history.filter(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "implementor",
+    );
+    assert.deepEqual(
+      starts.map((event) => [
+        event.meta?.attempt,
+        event.meta?.retryNumber,
+        event.meta?.trigger,
+      ]),
+      [
+        [1, 0, "initial"],
+        [2, 0, trigger],
+      ],
+    );
+    assert.equal(result.failures, 0);
+    assert.equal(state.agentFailures, 0);
+    assert.equal(
+      state.history.filter((event) => event.event === "agent_retry").length,
+      0,
+    );
+    assert.equal(
+      state.history.filter((event) => event.event === "network_retry_started")
+        .length,
+      0,
+    );
+    const display = renderProgress(state).join("\n");
+    assert.match(display, /Implementor.*run 2/);
+    assert.match(display, new RegExp(`returned by ${returnedBy}`));
+    assert.doesNotMatch(display, /Implementor.*retry 1/);
+  });
 test("failing real checks prevent commit even after claimed approval", async () => {
   const cwd = await repository();
   const cfg = config();

@@ -96,6 +96,9 @@ type AttemptControl = {
 export interface EngineUI {
   progress(state: WorkflowState): void;
   ask(question: Question): Promise<string | undefined>;
+  askResearchQuestions?(
+    questions: string[],
+  ): Promise<{ question: string; answer: string }[] | undefined>;
   approve?(request: ApprovalRequest): Promise<string[] | undefined>;
   agentEvent?(event: AgentEvent): void;
 }
@@ -480,12 +483,49 @@ export class WorkflowEngine {
     let failures = 0;
     let automaticRetries = 0;
     let trigger:
-      "initial" | "automatic_retry" | "manual_retry" | "manual_continue" =
+      | "initial"
+      | "automatic_retry"
+      | "manual_retry"
+      | "manual_continue"
+      | "user_clarification"
+      | "fix_local"
+      | "fix_design"
+      | "fix_requirements"
+      | "pentest_remediation"
+      | "security_remediation"
+      | "test_remediation" =
       manualStart || authoritative.manualRetry?.agent === role
         ? "manual_retry"
-        : authoritative.phase === this.continuingPhase
-          ? "manual_continue"
-          : "initial";
+        : role === "researcher" && authoritative.researchClarificationPending
+          ? "user_clarification"
+          : authoritative.phase === this.continuingPhase
+            ? "manual_continue"
+            : (() => {
+                const lastStart = authoritative.history.findLastIndex(
+                  (h) =>
+                    h.event === "agent_attempt_started" &&
+                    h.meta?.agent === role,
+                );
+                const returned = authoritative.history
+                  .slice(lastStart + 1)
+                  .findLast((h) =>
+                    ["FIX_LOCAL", "FIX_DESIGN", "FIX_REQUIREMENTS"].includes(
+                      h.event,
+                    ),
+                  );
+                if (!returned) return "initial";
+                if (returned.detail === "CODE_REVIEW")
+                  return returned.event === "FIX_LOCAL"
+                    ? "fix_local"
+                    : returned.event === "FIX_DESIGN"
+                      ? "fix_design"
+                      : "fix_requirements";
+                if (returned.detail === "SECURITY_REVIEW")
+                  return "security_remediation";
+                if (returned.detail === "PENTEST") return "pentest_remediation";
+                if (returned.detail === "TEST") return "test_remediation";
+                return "initial";
+              })();
     for (;;) {
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
@@ -501,6 +541,15 @@ export class WorkflowEngine {
               .create(s.id, role, Math.max(0, ...prior) + 1)
               .catch(() => undefined);
       const attemptNumber = logged?.attempt ?? Math.max(0, ...prior) + 1;
+      const retryNumber =
+        authoritative.history.filter(
+          (h) =>
+            h.event === "agent_attempt_started" &&
+            h.meta?.agent === role &&
+            (h.meta.trigger === "manual_retry" ||
+              h.meta.trigger === "automatic_retry"),
+        ).length +
+        (trigger === "manual_retry" || trigger === "automatic_retry" ? 1 : 0);
       const control: AttemptControl = {
         workflowId: s.id,
         controller: new AbortController(),
@@ -518,6 +567,7 @@ export class WorkflowEngine {
         role,
         attempt: attemptNumber,
         trigger,
+        retryNumber,
       });
       const started = Date.now();
       const calls = new Map<string, { name: string; started: number }>();
@@ -546,10 +596,11 @@ export class WorkflowEngine {
         await this.persistAttempt(
           authoritative,
           "agent_attempt_started",
-          `${role} attempt ${attemptNumber} started`,
+          `${role} run ${attemptNumber} started`,
           {
             agent: role,
             attempt: attemptNumber,
+            retryNumber,
             timeoutMs: timeoutMs ?? null,
             timeoutMode,
             trigger,
@@ -761,10 +812,11 @@ export class WorkflowEngine {
         await this.persistAttempt(
           authoritative,
           "agent_attempt_completed",
-          `${role} attempt ${attemptNumber} completed`,
+          `${role} run ${attemptNumber} completed`,
           {
             agent: role,
             attempt: attemptNumber,
+            retryNumber,
             durationMs: Date.now() - started,
           },
         );
@@ -942,10 +994,11 @@ export class WorkflowEngine {
         await this.persistAttempt(
           authoritative,
           "agent_attempt_failed",
-          `${role} attempt ${attemptNumber}: ${label}`,
+          `${role} run ${attemptNumber}: ${label}`,
           {
             agent: role,
             attempt: attemptNumber,
+            retryNumber,
             reason: category,
             durationMs,
             finalError: {
@@ -1192,6 +1245,45 @@ export class WorkflowEngine {
           }
         }
         if (s.phase === "WAITING_USER") {
+          if (s.pendingResearchQuestions?.length && !s.pendingApproval) {
+            const questions = s.pendingResearchQuestions;
+            const answers = await this.ui.askResearchQuestions?.(questions);
+            if (!answers) {
+              await this.store.save(s);
+              break;
+            }
+            if (
+              answers.length !== questions.length ||
+              answers.some(
+                (answer, index) =>
+                  answer.question !== questions[index] || !answer.answer.trim(),
+              )
+            )
+              throw new Error(
+                "Research clarification must answer every pending question in order",
+              );
+            s.answers.push(
+              ...answers.map((answer) => ({
+                ...answer,
+                sourceAgent: "researcher" as const,
+                cycle: s.fullCycle,
+              })),
+            );
+            record(s, "research_questions_answered", "", {
+              agent: "researcher",
+              attempt: Math.max(1, this.nextAttempt(s, "researcher") - 1),
+              count: answers.length,
+            });
+            if (s.results.researcher)
+              s.results.previous_researcher = s.results.researcher;
+            delete s.results.researcher;
+            delete s.pendingResearchQuestions;
+            delete s.resumePhase;
+            s.researchClarificationPending = true;
+            s.phase = "RESEARCH";
+            await this.store.save(s);
+            continue;
+          }
           if (s.pendingApproval) {
             if (s.questionCount >= s.config.workflow.maxQuestions) {
               block(s, "User-question limit reached");
@@ -1305,6 +1397,8 @@ export class WorkflowEngine {
                   s.agentPromptHashes = current.agentPromptHashes;
                   s.phase = "ORCHESTRATE";
                   delete s.pendingQuestion;
+                  delete s.pendingResearchQuestions;
+                  delete s.researchClarificationPending;
                   delete s.resumePhase;
                   delete s.gateHashes;
                   record(
@@ -1497,6 +1591,18 @@ export class WorkflowEngine {
           s.reportInput = await buildCompletionReportInput(s);
           await this.store.save(s);
         }
+        if (
+          s.phase === "SOLVE" &&
+          (!s.results.researcher ||
+            (s.results.researcher as any).unresolvedQuestions?.length !== 0)
+        ) {
+          block(
+            s,
+            "Solvers require a current Researcher result with no unresolved questions",
+          );
+          await this.store.save(s);
+          break;
+        }
         const allRoles = phaseRoles[s.phase];
         if (!allRoles) {
           block(s, "Unknown workflow phase");
@@ -1675,6 +1781,46 @@ export class WorkflowEngine {
           s.phase = "WAITING_USER";
           await this.store.save(s);
           continue;
+        }
+        if (s.phase === "RESEARCH") {
+          s.researchClarificationPending = false;
+          const questions: string[] = [
+            ...new Set<string>(
+              (
+                s.results.researcher as { unresolvedQuestions: string[] }
+              ).unresolvedQuestions
+                .map((question) => question.trim())
+                .filter(Boolean),
+            ),
+          ];
+          (
+            s.results.researcher as { unresolvedQuestions: string[] }
+          ).unresolvedQuestions = questions;
+          if (questions.length) {
+            if (
+              s.config.workflow.maxResearchClarifications > 0 &&
+              s.researchClarificationCount >=
+                s.config.workflow.maxResearchClarifications
+            )
+              block(
+                s,
+                `Research clarification limit reached. The Researcher still has unresolved questions after ${s.researchClarificationCount} clarification rounds.`,
+              );
+            else {
+              s.pendingResearchQuestions = questions;
+              s.resumePhase = "RESEARCH";
+              s.researchClarificationCount++;
+              record(s, "research_questions_requested", "", {
+                agent: "researcher",
+                attempt: Math.max(1, this.nextAttempt(s, "researcher") - 1),
+                count: questions.length,
+              });
+              s.phase = "WAITING_USER";
+            }
+            await this.store.save(s);
+            if ((s.phase as Phase) === "BLOCKED") break;
+            continue;
+          }
         }
         if (s.phase === "REVIEW") {
           const contract = contractSchema.parse(s.results.reviewer);

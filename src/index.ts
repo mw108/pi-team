@@ -6,6 +6,7 @@ import { StateStore } from "./workflow/persistence.ts";
 import {
   askUser,
   askApproval,
+  askResearchQuestions,
   checkAskCompatibility,
 } from "./integrations/pi-ask.ts";
 import { doctor } from "./integrations/doctor.ts";
@@ -44,6 +45,8 @@ async function finalText(state: WorkflowState) {
       state,
       await getWorkflowRecoveryPlan(state, state.cwd),
     );
+  if (state.phase === "WAITING_USER" && state.pendingResearchQuestions?.length)
+    return `Researcher waiting for user clarification (${state.pendingResearchQuestions.length} questions). Run /team resume ${state.id} to answer them.`;
   return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
 }
 export default function teamExtension(pi: ExtensionAPI) {
@@ -176,6 +179,8 @@ export default function teamExtension(pi: ExtensionAPI) {
           new WorkflowEngine(root, new PiRunner(), {
             progress: (s) => runtime.bind(s),
             ask: (q) => askUser(pi, ctx, q),
+            askResearchQuestions: (questions) =>
+              askResearchQuestions(pi, ctx, questions),
             approve: (request) => askApproval(pi, ctx, request),
             agentEvent: (event) => runtime.event(event),
           });
@@ -264,6 +269,8 @@ export default function teamExtension(pi: ExtensionAPI) {
         const engine = new WorkflowEngine(root, new PiRunner(), {
           progress: (s) => runtime!.bind(s),
           ask: (q) => askUser(pi, ctx, q),
+          askResearchQuestions: (questions) =>
+            askResearchQuestions(pi, ctx, questions),
           approve: (request) => askApproval(pi, ctx, request),
           agentEvent: (event) => runtime!.event(event),
         });
@@ -425,6 +432,8 @@ export default function teamExtension(pi: ExtensionAPI) {
         const engine = new WorkflowEngine(ctx.cwd, new PiRunner(), {
           progress: (s) => runtime.bind(s),
           ask: (q) => askUser(pi, ctx, q),
+          askResearchQuestions: (questions) =>
+            askResearchQuestions(pi, ctx, questions),
           approve: (request) => askApproval(pi, ctx, request),
           agentEvent: (event) => runtime.event(event),
         });

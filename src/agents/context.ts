@@ -35,13 +35,19 @@ export async function contextFor(
       nextPhase:
         "Researcher inspects repository files, source, tests and instructions",
     };
-  if (role === "researcher")
+  if (role === "researcher") {
     copy(
-      "researcher",
+      "previous_researcher",
       "previous_codeReviewer",
       "previous_securityReviewer",
       "previous_tester",
     );
+    if (s.answers.some((answer) => answer.sourceAgent === "researcher"))
+      context.researchClarification = {
+        instruction:
+          "The researcher entries in answers are user answers to your previous unresolved questions. Incorporate them into your new research result. Remove answered questions from unresolvedQuestions unless an answer creates a genuinely new blocking ambiguity.",
+      };
+  }
   if (role.startsWith("solver")) {
     copy("researcher");
     context.solverId = role;

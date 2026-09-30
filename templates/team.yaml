@@ -6,6 +6,7 @@ workflow:
   maxPentestCycles: 2
   maxAgentFailures: 2
   maxQuestions: 5
+  maxResearchClarifications: 5
   agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout
   networkRetry:
     maxRetries: 10 # 0 means unlimited reconnects

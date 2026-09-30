@@ -67,6 +67,7 @@ test("semantic fingerprint ignores runtime and presentation fields", () => {
   const current = structuredClone(previous);
   current.workflow.maxAgentFailures = 3;
   current.workflow.maxToolCalls = 0;
+  current.workflow.maxResearchClarifications = 10;
   current.agents.solver1.name = "Architecture Expert";
   current.ui.progress.refreshMs = 3000;
   assert.equal(semanticConfigHash(previous), semanticConfigHash(current));
@@ -85,6 +86,7 @@ test("runtime guardrail drift 2→3 and 80→9999 allows Code Reviewer continuat
   await editConfig(cwd, (value) => {
     value.workflow.maxAgentFailures = 3;
     value.workflow.maxToolCalls = 9999;
+    value.workflow.maxResearchClarifications = 10;
   });
   const plan = await getWorkflowRecoveryPlan(state, cwd);
   assert.equal(plan.kind, "continue");
@@ -94,10 +96,16 @@ test("runtime guardrail drift 2→3 and 80→9999 allows Code Reviewer continuat
   assert.equal(runner.counts.codeReviewer, 2);
   assert.equal(state.config.workflow.maxAgentFailures, 3);
   assert.equal(state.config.workflow.maxToolCalls, 9999);
+  assert.equal(state.config.workflow.maxResearchClarifications, 10);
   assert.match(
     state.history.find((event) => event.event === "config_drift_accepted")
       ?.detail ?? "",
     /workflow.maxToolCalls/,
+  );
+  assert.match(
+    state.history.find((event) => event.event === "config_drift_accepted")
+      ?.detail ?? "",
+    /workflow.maxResearchClarifications/,
   );
 });
 

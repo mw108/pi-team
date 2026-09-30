@@ -8,9 +8,134 @@ const symbols = {
   running: "●",
   completed: "✓",
   failed: "✗",
+  waiting: "◉",
+  invalidated: "↺",
   stopped: "–",
   aborted: "⊘",
 };
+export type AgentProgressStatus = keyof typeof symbols;
+export interface DerivedAgentProgress {
+  status: AgentProgressStatus;
+  attempt?: number;
+  detail?: string;
+}
+const roleOrder = [...roles];
+function invalidates(event: WorkflowState["history"][number], role: Role) {
+  if (event.event === "configuration_refresh") return true;
+  if (event.event === "research_questions_answered")
+    return role === "researcher";
+  if (event.event === "FIX_REQUIREMENTS") return true;
+  if (event.event === "FIX_DESIGN")
+    return roleOrder.indexOf(role) >= roleOrder.indexOf("researcher");
+  if (event.event === "FIX_LOCAL")
+    return roleOrder.indexOf(role) >= roleOrder.indexOf("implementor");
+  if (event.event === "downstream_invalidated") {
+    const source = event.detail.match(/^After manual retry of (\w+)$/)?.[1] as
+      Role | undefined;
+    return !!source && roleOrder.indexOf(role) > roleOrder.indexOf(source);
+  }
+  return false;
+}
+export function deriveAgentProgressState(
+  state: WorkflowState,
+  role: Role,
+  runtime?: ProgressRuntime,
+): DerivedAgentProgress {
+  const live = runtime?.agents[role];
+  const history = state.history;
+  const invalidation = history.findLastIndex((entry) =>
+    invalidates(entry, role),
+  );
+  const lifecycle = history.findLastIndex(
+    (entry) =>
+      entry.meta?.agent === role &&
+      [
+        "agent_attempt_started",
+        "agent_attempt_completed",
+        "agent_attempt_failed",
+        "agent_aborted_by_user",
+        "agent_superseded_by_upstream_retry",
+      ].includes(entry.event),
+  );
+  const latest = history[lifecycle];
+  const completion = history.findLastIndex(
+    (entry) =>
+      entry.meta?.agent === role && entry.event === "agent_attempt_completed",
+  );
+  const latestStart = history.findLastIndex(
+    (entry) =>
+      entry.meta?.agent === role && entry.event === "agent_attempt_started",
+  );
+  const historicalResult =
+    !!state.results[`previous_${role}`] ||
+    completion >= 0 ||
+    (invalidation >= 0 && !!state.results[role]);
+  const currentResult =
+    !!state.results[role] &&
+    (invalidation < 0 || completion > invalidation) &&
+    (latestStart < 0 || completion >= latestStart);
+  if (
+    role === "researcher" &&
+    state.pendingResearchQuestions?.length &&
+    state.phase === "WAITING_USER"
+  )
+    return {
+      status: "waiting",
+      attempt: latest?.meta?.attempt,
+      detail: `waiting for user answers · ${state.pendingResearchQuestions.length} questions`,
+    };
+  if (
+    live?.status === "running" &&
+    (invalidation < 0 ||
+      lifecycle > invalidation ||
+      (state.phase === "RESEARCH" && role === "researcher"))
+  )
+    return { status: "running", attempt: live.attempt };
+  if (lifecycle > invalidation && latest?.event === "agent_attempt_failed")
+    return { status: "failed", attempt: latest.meta?.attempt };
+  if (lifecycle > invalidation && latest?.event === "agent_aborted_by_user")
+    return { status: "aborted", attempt: latest.meta?.attempt };
+  if (
+    lifecycle > invalidation &&
+    latest?.event === "agent_superseded_by_upstream_retry"
+  )
+    return { status: "stopped", attempt: latest.meta?.attempt };
+  if (
+    live?.status === "completed" &&
+    lifecycle > invalidation &&
+    latest?.event === "agent_attempt_completed" &&
+    state.inFlight?.roles.includes(role)
+  )
+    return { status: "completed", attempt: latest.meta?.attempt };
+  if (currentResult)
+    return { status: "completed", attempt: latest?.meta?.attempt };
+  if (latest?.event === "agent_attempt_started" && lifecycle > invalidation)
+    return {
+      status: "pending",
+      attempt: latest.meta?.attempt,
+      detail: "run incomplete",
+    };
+  if (invalidation >= 0 && historicalResult)
+    return {
+      status: "invalidated",
+      detail: role === "codeReviewer" ? "re-review pending" : "rerun required",
+    };
+  if (
+    live?.status === "failed" ||
+    (state.phase === "BLOCKED" &&
+      history.some(
+        (entry) =>
+          entry.event === "agent_attempt_failed" && entry.meta?.agent === role,
+      ))
+  )
+    return {
+      status: "failed",
+      attempt: live?.attempt ?? latest?.meta?.attempt,
+    };
+  if (live?.status === "aborted" || live?.status === "stopped")
+    return { status: live.status, attempt: live.attempt };
+  return { status: "pending" };
+}
 export function elapsed(ms: number) {
   const seconds = Math.floor(ms / 1000);
   const minutes = Math.floor(seconds / 60);
@@ -57,30 +182,47 @@ function displayAgent(
         "agent_superseded_by_upstream_retry",
       ].includes(entry.event),
   );
-  const status =
-    live?.status ??
-    (state.results[role]
-      ? "completed"
-      : latestLifecycle?.event === "agent_aborted_by_user"
-        ? "aborted"
-        : latestLifecycle?.event === "agent_superseded_by_upstream_retry"
-          ? "stopped"
-          : state.phase === "BLOCKED" && last
-            ? "failed"
-            : "pending");
+  const derived = deriveAgentProgressState(state, role, runtime);
+  const latestStart = state.history.findLast(
+    (entry) =>
+      entry.event === "agent_attempt_started" &&
+      entry.meta?.agent === role &&
+      entry.meta.attempt === derived.attempt,
+  );
+  const trigger = live?.trigger ?? latestStart?.meta?.trigger;
+  const retryNumber = live?.retryNumber ?? latestStart?.meta?.retryNumber ?? 0;
+  const status = derived.status;
   const modelId = state.config.agents[role].model;
   const model = state.config.ui.progress.showModels
     ? ` [${/^[A-Za-z0-9._:/-]{1,80}$/.test(modelId) && !modelId.includes("://") ? modelId.slice(0, 24) : "model configured"}]`
     : "";
   const duration =
-    live?.startedAt !== undefined ? `  ${elapsed(runtime!.elapsed(live))}` : "";
-  const retry =
-    live?.retry && status === "running" ? ` · retry ${live.retry}/1` : "";
-  const attempt =
-    live?.attempt && (live.manualRetry || live.attempt > 1)
-      ? ` · attempt ${live.attempt}`
+    live?.startedAt !== undefined &&
+    ["running", "completed", "failed"].includes(status)
+      ? `  ${elapsed(runtime!.elapsed(live))}`
       : "";
-  const label = `${symbols[status]} ${getAgentDisplayName(state.config, role)}${showId ? ` (${role})` : ""}${model}${duration}${retry}${attempt}`;
+  const retry =
+    retryNumber > 0 &&
+    (trigger === "manual_retry" || trigger === "automatic_retry")
+      ? ` · retry ${retryNumber}`
+      : "";
+  const attempt =
+    derived.attempt && (live?.manualRetry || derived.attempt > 1)
+      ? ` · run ${derived.attempt}`
+      : "";
+  const label = `${symbols[status]} ${getAgentDisplayName(state.config, role)}${showId ? ` (${role})` : ""}${model}${duration}${attempt}${retry}${derived.detail ? ` · ${derived.detail}` : ""}`;
+  const returnedBy =
+    trigger === "fix_local" ||
+    trigger === "fix_design" ||
+    trigger === "fix_requirements"
+      ? "Code Reviewer"
+      : trigger === "pentest_remediation"
+        ? "Pentester"
+        : trigger === "security_remediation"
+          ? "Security Reviewer"
+          : trigger === "test_remediation"
+            ? "Tester"
+            : undefined;
   const activity =
     status === "running" &&
     live?.activity &&
@@ -118,9 +260,9 @@ function displayAgent(
       : undefined);
   const reason =
     status === "running" && previous
-      ? `  ↳ Previous attempt failed: ${previous}`
+      ? `  ↳ Previous run failed: ${previous}`
       : status === "failed" && last
-        ? `  ↳ Final error: ${last.detail.split(": ").at(-1)} · attempt ${last.meta?.attempt}`
+        ? `  ↳ Final error: ${last.detail.split(": ").at(-1)} · run ${last.meta?.attempt}`
         : undefined;
   const finalError =
     status === "failed" &&
@@ -139,6 +281,9 @@ function displayAgent(
     : [];
   return [
     label,
+    returnedBy && derived.attempt && derived.attempt > 1
+      ? `  ↳ returned by ${returnedBy}`
+      : undefined,
     control ?? reconnect ?? activity,
     guardStatus,
     finalError?.message
@@ -161,6 +306,14 @@ export function renderProgress(
     `Team ${state.id.slice(0, 8)} · ${phase} · Design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`,
   ];
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
+  if (state.pendingResearchQuestions?.length)
+    lines.push(
+      `Pending research questions: ${state.pendingResearchQuestions.length}`,
+    );
+  if (state.pendingResearchQuestions?.length)
+    lines.push(
+      `Research clarification: ${state.researchClarificationCount}${state.config.workflow.maxResearchClarifications === 0 ? "" : `/${state.config.workflow.maxResearchClarifications}`}`,
+    );
   if (state.inFlight && !runtime)
     lines.push(
       "Live runtime details unavailable; inspect or resume this workflow",

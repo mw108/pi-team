@@ -1,10 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { config, repository, FixtureRunner, output } from "./helpers.ts";
+import {
+  config,
+  repository,
+  FixtureRunner,
+  output,
+  research,
+} from "./helpers.ts";
 import { configSchema } from "../src/config/schema.ts";
-import { newState, type WorkflowState } from "../src/workflow/state.ts";
+import { newState, record, type WorkflowState } from "../src/workflow/state.ts";
 import { ProgressRuntime } from "../src/ui/runtime.ts";
-import { elapsed, renderProgress } from "../src/ui/progress.ts";
+import {
+  deriveAgentProgressState,
+  elapsed,
+  renderProgress,
+} from "../src/ui/progress.ts";
+import { fix } from "../src/workflow/router.ts";
 import { formatToolActivity } from "../src/ui/activity.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import type { Role } from "../src/agents/schemas.ts";
@@ -78,6 +89,124 @@ test("configured names and legacy fallback render without changing agent IDs", (
   delete s.config.agents.solver1.name;
   assert.match(lines(s), /○ Solver Architecture/);
   assert.equal(s.results.solver1, undefined);
+});
+
+test("FIX_LOCAL invalidates historical success while Implementor attempt 2 runs or fails", () => {
+  const s = state();
+  s.results.implementor = { status: "IMPLEMENTED" };
+  s.results.codeReviewer = { status: "FIX_LOCAL", findings: [] };
+  record(s, "agent_attempt_completed", "implementor attempt 1 completed", {
+    agent: "implementor",
+    attempt: 1,
+  });
+  record(s, "agent_attempt_completed", "codeReviewer attempt 1 completed", {
+    agent: "codeReviewer",
+    attempt: 1,
+  });
+  fix(s, "FIX_LOCAL");
+  const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  runtime.bind(s);
+  record(s, "agent_attempt_started", "implementor attempt 2 started", {
+    agent: "implementor",
+    attempt: 2,
+    retryNumber: 0,
+    trigger: "fix_local",
+  });
+  assert.doesNotMatch(lines(s), /✓ Implementor/);
+  runtime.event({ type: "start", role: "implementor", attempt: 2 });
+  assert.equal(
+    deriveAgentProgressState(s, "implementor", runtime).status,
+    "running",
+  );
+  assert.equal(
+    deriveAgentProgressState(s, "codeReviewer", runtime).status,
+    "invalidated",
+  );
+  assert.match(lines(s, runtime), /● Implementor.*run 2/);
+  assert.match(lines(s, runtime), /returned by Code Reviewer/);
+  assert.match(lines(s, runtime), /↺ Code Reviewer.*re-review pending/);
+  assert.doesNotMatch(lines(s, runtime), /✓ Implementor|✓ Code Reviewer/);
+  record(s, "agent_attempt_failed", "implementor attempt 2 failed", {
+    agent: "implementor",
+    attempt: 2,
+  });
+  runtime.event({ type: "fail", role: "implementor", error: "failure" });
+  assert.match(lines(s, runtime), /✗ Implementor.*run 2/);
+  assert.match(lines(s, runtime), /↺ Code Reviewer/);
+  assert.doesNotMatch(lines(s, runtime), /✓ Implementor|✓ Code Reviewer/);
+  record(s, "agent_attempt_completed", "implementor attempt 3 completed", {
+    agent: "implementor",
+    attempt: 3,
+  });
+  runtime.event({ type: "complete", role: "implementor" });
+  s.results.codeReviewer = { status: "APPROVED", findings: [] };
+  record(s, "agent_attempt_completed", "codeReviewer attempt 2 completed", {
+    agent: "codeReviewer",
+    attempt: 2,
+  });
+  assert.match(lines(s, runtime), /✓ Implementor/);
+  assert.match(lines(s, runtime), /✓ Code Reviewer/);
+  runtime.dispose();
+});
+test("run and retry labels distinguish remediation from technical recovery", () => {
+  for (const [trigger, returnedBy] of [
+    ["pentest_remediation", "Pentester"],
+    ["security_remediation", "Security Reviewer"],
+  ] as const) {
+    const s = state();
+    record(s, "agent_attempt_started", "implementor run 2 started", {
+      agent: "implementor",
+      attempt: 2,
+      retryNumber: 0,
+      trigger,
+    });
+    assert.match(lines(s), /Implementor.*run 2/);
+    assert.match(lines(s), new RegExp(`returned by ${returnedBy}`));
+    assert.doesNotMatch(lines(s), /retry 1/);
+  }
+  const s = state();
+  record(s, "agent_attempt_started", "implementor run 3 started", {
+    agent: "implementor",
+    attempt: 3,
+    retryNumber: 1,
+    trigger: "automatic_retry",
+  });
+  assert.match(lines(s), /Implementor.*run 3 · retry 1/);
+  assert.doesNotMatch(lines(s), /returned by/);
+});
+
+test("FIX_DESIGN and FIX_REQUIREMENTS remove current success across rewinds", () => {
+  for (const route of ["FIX_DESIGN", "FIX_REQUIREMENTS"] as const) {
+    const s = state();
+    s.results.orchestrator = { requirements: ["x"] };
+    s.results.researcher = { unresolvedQuestions: [] };
+    s.results.solver1 = { solverId: "solver1" };
+    s.results.implementor = { status: "IMPLEMENTED" };
+    for (const role of [
+      "orchestrator",
+      "researcher",
+      "solver1",
+      "implementor",
+    ] as const)
+      record(s, "agent_attempt_completed", `${role} completed`, {
+        agent: role,
+        attempt: 1,
+      });
+    fix(s, route);
+    assert.equal(
+      deriveAgentProgressState(s, "researcher").status,
+      "invalidated",
+    );
+    assert.equal(deriveAgentProgressState(s, "solver1").status, "invalidated");
+    assert.equal(
+      deriveAgentProgressState(s, "implementor").status,
+      "invalidated",
+    );
+    assert.equal(
+      deriveAgentProgressState(s, "orchestrator").status,
+      route === "FIX_REQUIREMENTS" ? "invalidated" : "completed",
+    );
+  }
 });
 
 test("runtime command syntax continues to require the stable agent ID", async () => {
@@ -342,6 +471,7 @@ test("parallel solver events update each result before siblings settle", async (
   });
   const s = await engine.start("Fix addition", config());
   s.phase = "SOLVE";
+  s.results.researcher = research;
   s.commandApprovalComplete = true;
   const run = engine.run(s);
   await eventually(() =>

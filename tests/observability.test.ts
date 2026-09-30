@@ -425,11 +425,11 @@ test("timed out read-only attempts persist history, logs, output and retry UI", 
   );
   assert.match(
     snapshots.join("\n"),
-    /Previous attempt failed: timeout after 00:01/,
+    /Previous run failed: timeout after 00:01/,
   );
   assert.match(
     renderProgress(state).join("\n"),
-    /Final error: timeout after 00:01 · attempt 2/,
+    /Final error: timeout after 00:01 · run 2/,
   );
   const logs = new AgentLogStore(cwd);
   assert.deepEqual(await logs.attempts(state.id, "researcher"), [1, 2]);

@@ -280,6 +280,19 @@ test("manual retry aborts the old attempt, starts a new number, and leaves sibli
       .map((event) => event.meta?.attempt),
     [1, 2],
   );
+  assert.deepEqual(
+    state.history
+      .filter(
+        (event) =>
+          event.event === "agent_attempt_started" &&
+          event.meta?.agent === "solver1",
+      )
+      .map((event) => [event.meta?.retryNumber, event.meta?.trigger]),
+    [
+      [0, "initial"],
+      [1, "manual_retry"],
+    ],
+  );
   assert.equal(
     state.history.filter((event) => event.event === "agent_retry").length,
     0,
