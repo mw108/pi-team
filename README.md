@@ -4,7 +4,7 @@ A Pi-native development team with isolated role sessions, configurable parallel 
 
 ## Installed environment
 
-This setup uses Pi **0.87.1**, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **3.0.0**, `pi-web-access` **0.32.0**, and the existing Serena **1.7.0**. Node 24+ is required. Exact dependency versions are in `package-lock.json`.
+This setup uses Pi **0.99.2**, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **3.0.0**, `pi-web-access` **0.32.0**, and the existing Serena **1.7.0**. Node 24+ is required. Exact dependency versions are in `package-lock.json`.
 
 The user-facing `pi` executable is installed under `~/.local/bin`. This project and its four integration packages are registered as local Pi packages. Keep this checkout and its `node_modules` directory available.
 
