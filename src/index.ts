@@ -22,6 +22,7 @@ import {
 } from "./workflow/recovery.ts";
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
 import { getAgentDisplayName } from "./ui/agent-name.ts";
+import { inactiveSolverError } from "./config/solvers.ts";
 import {
   buildCompletionReportInput,
   fallbackReport,
@@ -382,6 +383,15 @@ export default function teamExtension(pi: ExtensionAPI) {
                 !/^[1-9]\d*$/.test(parts[2]))))
         )
           throw new Error("Usage: /team-log [agent [--attempt N]]");
+        if (parts.length) {
+          const inactive = inactiveSolverError(state.config, parts[0]);
+          if (inactive) throw new Error(inactive);
+          if (
+            parts[0].startsWith("solver") &&
+            !state.config.agents[parts[0] as Role]
+          )
+            throw new Error(`Unknown agent ${parts[0]}`);
+        }
         const logs = new AgentLogStore(root);
         ctx.ui.notify(
           parts.length

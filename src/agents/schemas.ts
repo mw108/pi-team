@@ -8,6 +8,13 @@ export const roles = [
   "solver1",
   "solver2",
   "solver3",
+  "solver4",
+  "solver5",
+  "solver6",
+  "solver7",
+  "solver8",
+  "solver9",
+  "solver10",
   "critic",
   "reviewer",
   "implementor",
@@ -19,6 +26,10 @@ export const roles = [
   "reporter",
 ] as const;
 export type Role = (typeof roles)[number];
+export type SolverAgentId = Extract<Role, `solver${number}`>;
+export const solverIds = roles.filter((role): role is SolverAgentId =>
+  /^solver(?:10|[1-9])$/.test(role),
+);
 const strings = z.array(z.string());
 const text = z.string().min(1);
 export const route = z.enum([
@@ -277,6 +288,13 @@ export const resultSchemas: Record<Role, z.ZodTypeAny> = {
   solver1: proposalSchema,
   solver2: proposalSchema,
   solver3: proposalSchema,
+  solver4: proposalSchema,
+  solver5: proposalSchema,
+  solver6: proposalSchema,
+  solver7: proposalSchema,
+  solver8: proposalSchema,
+  solver9: proposalSchema,
+  solver10: proposalSchema,
   critic: critiqueSchema,
   reviewer: contractSchema,
   implementor: implementationSchema,

@@ -3,7 +3,11 @@ import { analyzeConfigDrift, driftSummary } from "../config/drift.ts";
 import { contractSchema, type Role } from "../agents/schemas.ts";
 import { contractPaths } from "../agents/permissions.ts";
 import { dirtyPaths, hashes, head } from "./git.ts";
-import { phaseRoles, transition } from "./router.ts";
+import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import {
+  getRequiredSuccessfulSolverCount,
+  getFailureBudgetUsed,
+} from "../config/solvers.ts";
 import type { Phase, WorkflowState } from "./state.ts";
 
 const mutating = new Set<Role>([
@@ -102,11 +106,12 @@ export async function getWorkflowRecoveryPlan(
     seen.add(phase);
     if (phase === "DONE")
       return { kind: "none", reason: "All workflow phases are complete." };
-    const roles = phaseRoles[phase];
+    const roles = getPhaseRoles(state, phase);
     if (!roles) return unsafe(`Unknown workflow phase: ${phase}`);
     const complete =
       phase === "SOLVE"
-        ? roles.filter(hasResult).length >= 2
+        ? roles.filter(hasResult).length >=
+          getRequiredSuccessfulSolverCount(state.config.workflow.solverCount)
         : roles.every(hasResult);
     if (!complete) break;
     if (
@@ -135,7 +140,7 @@ export async function getWorkflowRecoveryPlan(
       return unsafe(`Completed ${phase} requires review before proceeding.`);
     phase = copy.phase;
   }
-  const roles = phaseRoles[phase]!;
+  const roles = getPhaseRoles(state, phase)!;
   const pending = roles.filter((role) => !hasResult(role));
   const lastInvalidation = state.history.findLastIndex((event) =>
     [
@@ -160,7 +165,8 @@ export async function getWorkflowRecoveryPlan(
   if (
     state.blocker?.startsWith("Agent execution failed:") ||
     state.blocker?.includes("aborted by user") ||
-    state.blocker?.startsWith("Insufficient Solver proposals")
+    state.blocker?.startsWith("Insufficient Solver proposals") ||
+    state.blocker?.startsWith("Solver quorum not reached")
   ) {
     const role = pending.includes(failedRole as Role) ? failedRole : started;
     if (role && pending.includes(role))
@@ -197,7 +203,7 @@ export async function getWorkflowRecoveryPlan(
     state.blocker?.startsWith("Interrupted mutating phase;") &&
     stopped &&
     ["IMPLEMENT", "PENTEST", "TEST", "COMMIT"].includes(stopped) &&
-    (phaseRoles[stopped] ?? []).every(hasResult) &&
+    (getPhaseRoles(state, stopped) ?? []).every(hasResult) &&
     (stopped !== "COMMIT" || !!state.commit);
   if (
     !interruptedAfterCompletedMutation &&
@@ -210,7 +216,7 @@ export async function getWorkflowRecoveryPlan(
       `Blocker requires inspection: ${state.blocker ?? "unknown blocker"}`,
     );
   if (
-    state.agentFailures >=
+    getFailureBudgetUsed(state) >=
     (drift.changed
       ? current.config.workflow.maxAgentFailures
       : state.config.workflow.maxAgentFailures)

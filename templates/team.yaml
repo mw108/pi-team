@@ -1,6 +1,7 @@
 # Project-local Pi Team template. Set real provider/model IDs before /team.
 # Review discovered commands before approving them.
 workflow:
+  solverCount: 3 # active solver1..solverN, from 1 to 10
   maxFullCycles: 3
   maxLocalFixCycles: 5
   maxPentestCycles: 2

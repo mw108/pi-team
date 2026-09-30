@@ -17,10 +17,12 @@ export function config() {
   );
   return configSchema.parse({
     agents: Object.fromEntries(
-      roles.map((r) => [
-        r,
-        { ...defaults.agents[r], provider: "fixture", model: "fixture" },
-      ]),
+      roles
+        .filter((r) => defaults.agents[r])
+        .map((r) => [
+          r,
+          { ...defaults.agents[r], provider: "fixture", model: "fixture" },
+        ]),
     ),
     integrations: {
       serena: { enabled: false },
@@ -77,26 +79,24 @@ export const finding = {
   requiresRedesign: false,
 };
 export function output(role: Role): any {
+  if (role.startsWith("solver"))
+    return {
+      solverId: role,
+      title: "Addition",
+      approach: "Use +",
+      filesToChange: ["math.js"],
+      implementationPlan: ["Change operator"],
+      advantages: [],
+      disadvantages: [],
+      risks: [],
+      assumptions: [],
+      requiredTests: ["test"],
+    };
   switch (role) {
     case "orchestrator":
       return { requirements: ["Fix addition"], summary: "Fix arithmetic" };
     case "researcher":
       return research;
-    case "solver1":
-    case "solver2":
-    case "solver3":
-      return {
-        solverId: role,
-        title: "Addition",
-        approach: "Use +",
-        filesToChange: ["math.js"],
-        implementationPlan: ["Change operator"],
-        advantages: [],
-        disadvantages: [],
-        risks: [],
-        assumptions: [],
-        requiredTests: ["test"],
-      };
     case "critic":
       return {
         proposalCritiques: ["solver1", "solver2", "solver3"].map(

@@ -1,9 +1,10 @@
 import { block, record, type WorkflowState, type Phase } from "./state.ts";
 import type { Role } from "../agents/schemas.ts";
+import { getActiveSolverIds } from "../config/solvers.ts";
 export const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
-  SOLVE: ["solver1", "solver2", "solver3"],
+  SOLVE: [],
   CRITIQUE: ["critic"],
   REVIEW: ["reviewer"],
   IMPLEMENT: ["implementor"],
@@ -14,6 +15,12 @@ export const phaseRoles: Partial<Record<Phase, Role[]>> = {
   COMMIT: ["commitAgent"],
   REPORT: ["reporter"],
 };
+export function getPhaseRoles(
+  s: WorkflowState,
+  phase: Phase,
+): Role[] | undefined {
+  return phase === "SOLVE" ? getActiveSolverIds(s.config) : phaseRoles[phase];
+}
 export function afterCodeReview(s: WorkflowState): Phase {
   return s.config.qualityGates.pentest.enabled ? "PENTEST" : afterSecurity(s);
 }
@@ -72,9 +79,7 @@ export function fix(
   delete s.gateHashes;
   if (route === "FIX_DESIGN")
     for (const key of [
-      "solver1",
-      "solver2",
-      "solver3",
+      ...getActiveSolverIds(s.config),
       "critic",
       "reviewer",
       "implementor",
@@ -98,9 +103,7 @@ export function transition(s: WorkflowState) {
           "Researcher has unresolved questions; Solvers cannot start",
         );
       for (const key of [
-        "solver1",
-        "solver2",
-        "solver3",
+        ...getActiveSolverIds(s.config),
         "critic",
         "reviewer",
         "implementor",

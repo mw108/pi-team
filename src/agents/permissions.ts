@@ -2,6 +2,7 @@ import { realpath, lstat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { Role, Contract } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
+import { getActiveSolverIds } from "../config/solvers.ts";
 export const serenaRead = [
   "serena_status",
   "serena_list_tools",
@@ -24,9 +25,6 @@ export const serenaWrite = [
 ];
 const docsRoles: Role[] = [
   "researcher",
-  "solver1",
-  "solver2",
-  "solver3",
   "reviewer",
   "implementor",
   "codeReviewer",
@@ -58,7 +56,11 @@ export function allowedTools(role: Role, config: TeamConfig) {
     !["orchestrator", "tester", "commitAgent"].includes(role)
   )
     tools.push(...serenaRead, ...(role === "implementor" ? serenaWrite : []));
-  if (config.integrations.context7.enabled && docsRoles.includes(role))
+  if (
+    config.integrations.context7.enabled &&
+    (docsRoles.includes(role) ||
+      getActiveSolverIds(config).includes(role as any))
+  )
     tools.push("mcp");
   if (config.integrations.web.enabled && role === "researcher")
     tools.push("web_search", "fetch_content");

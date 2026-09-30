@@ -3,6 +3,7 @@ import type { WorkflowState } from "../workflow/state.ts";
 import { actualDiff } from "../workflow/git.ts";
 import { effectiveConfig } from "./discovery.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
+import { getActiveSolverIds } from "../config/solvers.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -53,7 +54,7 @@ export async function contextFor(
     context.solverId = role;
   }
   if (role === "critic" || role === "reviewer")
-    copy("researcher", "solver1", "solver2", "solver3");
+    copy("researcher", ...getActiveSolverIds(s.config));
   if (role === "reviewer") copy("critic");
   if (role === "implementor")
     copy(

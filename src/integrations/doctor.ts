@@ -23,6 +23,11 @@ import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
 import { resolveNetworkRetry } from "../agents/network-retry.ts";
 import { resolveDoomLoop } from "../agents/doom-loop.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
+import {
+  getActiveSolverIds,
+  getRequiredSuccessfulSolverCount,
+} from "../config/solvers.ts";
+import { solverIds } from "../agents/schemas.ts";
 export async function doctor(cwd: string) {
   cwd = await projectRoot(cwd);
   const lines: string[] = [
@@ -106,7 +111,14 @@ export async function doctor(cwd: string) {
   await check("Configuration", async () => {
     const { config, path } = await loadConfig(cwd);
     lines.push(`Configuration: ${path}`);
-    for (const role of roles)
+    lines.push(
+      `solverCount: ${config.workflow.solverCount}; requiredSuccessfulSolvers: ${getRequiredSuccessfulSolverCount(config.workflow.solverCount)}`,
+    );
+    for (const role of roles.filter(
+      (role) =>
+        !solverIds.includes(role as any) ||
+        getActiveSolverIds(config).includes(role as any),
+    ))
       lines.push(
         `Agent ${role}: name ${getAgentDisplayName(config, role)}; role ${config.agents[role].role} → ${config.agents[role].prompt}`,
       );
@@ -125,7 +137,11 @@ export async function doctor(cwd: string) {
       authPath: `${agentDir()}/auth.json`,
       modelsPath: `${agentDir()}/models.json`,
     });
-    for (const role of roles) {
+    for (const role of roles.filter(
+      (role) =>
+        !solverIds.includes(role as any) ||
+        getActiveSolverIds(config).includes(role as any),
+    )) {
       const selection = config.agents[role];
       const model = runtime.getModel(selection.provider, selection.model);
       const present = Boolean(model),

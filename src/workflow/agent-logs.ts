@@ -7,6 +7,8 @@ import { StateStore } from "./persistence.ts";
 import type { ErrorDiagnostics } from "../agents/error-diagnostics.ts";
 import type { TeamConfig } from "../config/schema.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
+import { getActiveSolverIds } from "../config/solvers.ts";
+import { solverIds } from "../agents/schemas.ts";
 
 export type LogEvent = {
   type: string;
@@ -133,6 +135,12 @@ export class AgentLogStore {
   async overview(id: string, config?: TeamConfig) {
     const lines = [`Workflow ${id.slice(0, 8)}`];
     for (const role of roles) {
+      if (
+        config &&
+        solverIds.includes(role as any) &&
+        !getActiveSolverIds(config).includes(role as any)
+      )
+        continue;
       const heading = config ? getAgentDisplayName(config, role) : role;
       const attempts = await this.attempts(id, role);
       if (!attempts.length) {

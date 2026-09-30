@@ -111,7 +111,7 @@ test("three solvers execute concurrently with isolated initial context", async (
   assert.equal(started, 3);
   assert.equal(s.phase, "DONE", s.blocker);
 });
-test("one solver failure preserves successful siblings and prevents implementation", async () => {
+test("one solver failure preserves successful siblings and continues with quorum", async () => {
   const cwd = await repository();
   const runner = new FixtureRunner(async (role) => {
     if (role === "solver2") throw new Error("Malformed output");
@@ -119,10 +119,10 @@ test("one solver failure preserves successful siblings and prevents implementati
   const engine = new WorkflowEngine(cwd, runner, ui),
     s = await engine.start("Fix", config());
   await engine.run(s);
-  assert.equal(s.phase, "BLOCKED");
+  assert.equal(s.phase, "DONE", s.blocker);
   assert.ok(s.results.solver1);
   assert.ok(s.results.solver3);
-  assert.equal(runner.counts.implementor, undefined);
+  assert.equal(runner.counts.implementor, 1);
 });
 test("read-only agent timeout retries once and is accounted globally", async () => {
   const cwd = await repository(),
@@ -382,7 +382,7 @@ test("contract touching a dirty baseline file waits for approval before editing"
   assert.equal(runner.counts.implementor, undefined);
   assert.equal(await readFile(join(cwd, "math.js"), "utf8"), "user changes");
 });
-test("explicit read-only resume reruns only the failed solver without resetting limits", async () => {
+test("failed solver with quorum is not retried during explicit resume", async () => {
   const cwd = await repository();
   const runner = new FixtureRunner(async (role, _s, count) => {
     if (role === "solver2" && count === 1) throw new Error("Malformed result");
@@ -390,13 +390,12 @@ test("explicit read-only resume reruns only the failed solver without resetting 
   const engine = new WorkflowEngine(cwd, runner, ui),
     s = await engine.start("Fix", config());
   await engine.run(s);
-  assert.equal(s.phase, "BLOCKED");
+  assert.equal(s.phase, "DONE", s.blocker);
   await engine.resumeReadonly(s);
-  await engine.run(s);
   assert.equal(s.phase, "DONE", s.blocker);
   assert.equal(s.agentFailures, 1);
   assert.equal(runner.counts.solver1, 1);
-  assert.equal(runner.counts.solver2, 2);
+  assert.equal(runner.counts.solver2, 1);
   assert.equal(runner.counts.solver3, 1);
 });
 test("source changes made after approvals cannot be committed", async () => {

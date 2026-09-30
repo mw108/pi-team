@@ -3,6 +3,8 @@ import { roles, type Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import type { AgentProgress, ProgressRuntime } from "./runtime.ts";
 import { getAgentDisplayName } from "./agent-name.ts";
+import { getActiveSolverIds } from "../config/solvers.ts";
+import { solverIds } from "../agents/schemas.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -32,7 +34,12 @@ function invalidates(event: WorkflowState["history"][number], role: Role) {
   if (event.event === "downstream_invalidated") {
     const source = event.detail.match(/^After manual retry of (\w+)$/)?.[1] as
       Role | undefined;
-    return !!source && roleOrder.indexOf(role) > roleOrder.indexOf(source);
+    return (
+      !!source &&
+      (solverIds.includes(source as any)
+        ? roleOrder.indexOf(role) >= roleOrder.indexOf("critic")
+        : roleOrder.indexOf(role) > roleOrder.indexOf(source))
+    );
   }
   return false;
 }
@@ -143,6 +150,11 @@ export function elapsed(ms: number) {
 }
 function visibleRoles(state: WorkflowState) {
   return roles.filter((role) => {
+    if (
+      solverIds.includes(role as any) &&
+      !getActiveSolverIds(state.config).includes(role as any)
+    )
+      return false;
     if (
       (role === "pentester" || role === "securityReviewer") &&
       !state.config.qualityGates.pentest.enabled

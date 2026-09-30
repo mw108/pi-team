@@ -490,7 +490,7 @@ test("parallel solver events update each result before siblings settle", async (
   assert.match(lines(s, runtime), /● Solver Alternative/);
   slots[2].resolve(output("solver3"));
   const result = await run;
-  assert.equal(result.phase, "BLOCKED");
+  assert.equal(result.phase, "DONE", result.blocker);
   runtime.dispose();
 });
 

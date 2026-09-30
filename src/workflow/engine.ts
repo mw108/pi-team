@@ -43,7 +43,14 @@ import {
   type Phase,
   type ApprovalRequest,
 } from "./state.ts";
-import { phaseRoles, transition } from "./router.ts";
+import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import {
+  getActiveSolverIds,
+  getRequiredSuccessfulSolverCount,
+  getFailureBudgetUsed,
+  inactiveSolverError,
+} from "../config/solvers.ts";
+import { solverIds } from "../agents/schemas.ts";
 import { getWorkflowRecoveryPlan } from "./recovery.ts";
 import {
   analyzeConfigDrift,
@@ -144,6 +151,7 @@ export class WorkflowEngine {
     return this.activeAttempts.get(role);
   }
   async steer(state: WorkflowState, role: Role, message: string) {
+    this.assertActiveAgent(state, role);
     if (!message.trim()) throw new Error("Steering message is required.");
     const attempt = this.activeAttempts.get(role);
     if (
@@ -187,6 +195,7 @@ export class WorkflowEngine {
     setTimeout(clearWhenConsumed, 250).unref?.();
   }
   async abortAgent(state: WorkflowState, role: Role) {
+    this.assertActiveAgent(state, role);
     const control = this.activeAttempts.get(role);
     if (
       !control ||
@@ -217,6 +226,7 @@ export class WorkflowEngine {
     return `${getAgentDisplayName(state.config, role)} (${role}) already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.map((id) => getAgentDisplayName(state.config, id)).join(", ")}` : ""}. Continue?`;
   }
   async retryAgent(state: WorkflowState, role: Role, confirmed = false) {
+    this.assertActiveAgent(state, role);
     const label = getAgentDisplayName(state.config, role);
     if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
@@ -250,9 +260,9 @@ export class WorkflowEngine {
       throw new Error(
         `Retrying completed ${label} (${role}) requires confirmation.`,
       );
-    const targetPhase = (Object.entries(phaseRoles) as [Phase, Role[]][]).find(
-      ([, roles]) => roles.includes(role),
-    )?.[0];
+    const targetPhase = (Object.keys(phaseRoles) as Phase[]).find((phase) =>
+      getPhaseRoles(state, phase)?.includes(role),
+    );
     if (!targetPhase) throw new Error(`Unknown agent ${role}`);
     if (this.nextAttempt(state, role) === 1 && !state.results[role])
       throw new Error(`Agent ${label} (${role}) has no attempt to retry yet.`);
@@ -268,7 +278,7 @@ export class WorkflowEngine {
         await this.store.save(state);
         return "queued";
       }
-      const currentRoles = phaseRoles[state.phase] ?? [];
+      const currentRoles = getPhaseRoles(state, state.phase) ?? [];
       if (
         this.pendingRewind ||
         !state.inFlight ||
@@ -362,7 +372,8 @@ export class WorkflowEngine {
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
       } else if (!(
-        state.blocker?.startsWith("Insufficient Solver proposals") &&
+        (state.blocker?.startsWith("Insufficient Solver proposals") ||
+          state.blocker?.startsWith("Solver quorum not reached")) &&
         role.startsWith("solver")
       ))
         throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
@@ -393,9 +404,7 @@ export class WorkflowEngine {
     const all: Role[] = [
       "orchestrator",
       "researcher",
-      "solver1",
-      "solver2",
-      "solver3",
+      ...solverIds,
       "critic",
       "reviewer",
       "implementor",
@@ -408,6 +417,15 @@ export class WorkflowEngine {
     ];
     if (role.startsWith("solver")) return all.slice(all.indexOf("critic"));
     return all.slice(all.indexOf(role) + 1);
+  }
+  private assertActiveAgent(state: WorkflowState, role: Role) {
+    if (
+      solverIds.includes(role as any) &&
+      !getActiveSolverIds(state.config).includes(role as any)
+    )
+      throw new Error(
+        inactiveSolverError(state.config, role) ?? `Unknown agent ${role}`,
+      );
   }
   private invalidateDependents(state: WorkflowState, role: Role) {
     for (const dependent of this.dependentRoles(role)) {
@@ -1105,7 +1123,7 @@ export class WorkflowEngine {
     )
       return;
     const phase = s.history.findLast((e) => e.event === "blocked")?.phase;
-    const roles = phase ? phaseRoles[phase] : undefined;
+    const roles = phase ? getPhaseRoles(s, phase) : undefined;
     // A failed Tester assertion with zero executed commands and no write tools
     // proves there are no command/source side effects to replay.
     const emptyReadOnlyTest =
@@ -1116,7 +1134,7 @@ export class WorkflowEngine {
       !phase ||
       !roles ||
       (roles.some((r) => mutatingRoles.includes(r)) && !emptyReadOnlyTest) ||
-      s.agentFailures >= s.config.workflow.maxAgentFailures
+      getFailureBudgetUsed(s) >= s.config.workflow.maxAgentFailures
     )
       return;
     record(s, "explicit_resume", phase);
@@ -1386,7 +1404,7 @@ export class WorkflowEngine {
                 else {
                   if (Object.keys(s.results).length) s.fullCycle++;
                   for (const role of Object.keys(phaseRoles).flatMap(
-                    (phase) => phaseRoles[phase as Phase] ?? [],
+                    (phase) => getPhaseRoles(s, phase as Phase) ?? [],
                   ))
                     delete s.results[role];
                   s.config = current.config;
@@ -1461,7 +1479,7 @@ export class WorkflowEngine {
         }
         if (
           s.phase !== "REPORT" &&
-          s.agentFailures >= s.config.workflow.maxAgentFailures
+          getFailureBudgetUsed(s) >= s.config.workflow.maxAgentFailures
         ) {
           block(s, "Agent failure limit reached");
           break;
@@ -1603,7 +1621,7 @@ export class WorkflowEngine {
           await this.store.save(s);
           break;
         }
-        const allRoles = phaseRoles[s.phase];
+        const allRoles = getPhaseRoles(s, s.phase);
         if (!allRoles) {
           block(s, "Unknown workflow phase");
           break;
@@ -1640,6 +1658,7 @@ export class WorkflowEngine {
         let error: string | undefined;
         let aborted: Role | undefined;
         let pending: Question | undefined;
+        let solverFailures = 0;
         for (let i = 0; i < results.length; i++) {
           const item = results[i];
           if (item.status === "rejected") {
@@ -1648,7 +1667,9 @@ export class WorkflowEngine {
               continue;
             }
             if (item.reason instanceof AgentSupersededForRetryError) continue;
-            s.agentFailures += item.reason?.failures ?? 1;
+            const failures = item.reason?.failures ?? 1;
+            s.agentFailures += failures;
+            if (s.phase === "SOLVE") solverFailures += failures;
             record(
               s,
               "agent_failure",
@@ -1743,15 +1764,28 @@ export class WorkflowEngine {
           continue;
         }
         if (s.phase === "SOLVE") {
-          const valid = ["solver1", "solver2", "solver3"].filter(
+          const solverCount = s.config.workflow.solverCount;
+          const required = getRequiredSuccessfulSolverCount(solverCount);
+          const valid = getActiveSolverIds(s.config).filter(
             (role) => !!s.results[role],
           ).length;
-          if (valid >= 2 && aborted && !error) {
+          if (valid >= required && !s.manualRetry) {
+            record(
+              s,
+              "solver_quorum_satisfied",
+              JSON.stringify({
+                successfulSolvers: valid,
+                requiredSuccessfulSolvers: required,
+                configuredSolvers: solverCount,
+                coveredFailures: solverFailures,
+              }),
+            );
             aborted = undefined;
-          } else if (valid < 2 && (aborted || error)) {
+            error = undefined;
+          } else if ((aborted || error) && !s.manualRetry) {
             block(
               s,
-              `Insufficient Solver proposals. Need at least 2, have ${valid}.`,
+              `Solver quorum not reached: ${valid}/${required} successful (${solverCount} configured).`,
             );
             await this.store.save(s);
             break;
@@ -1832,7 +1866,7 @@ export class WorkflowEngine {
             throw new Error("Contract file lists overlap");
         }
         if (s.phase === "SOLVE")
-          for (const role of ["solver1", "solver2", "solver3"])
+          for (const role of getActiveSolverIds(s.config))
             if (s.results[role] && (s.results[role] as any)?.solverId !== role)
               throw new Error(`Solver identity mismatch: ${role}`);
         if (

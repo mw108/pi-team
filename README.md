@@ -1,6 +1,6 @@
 # Pi Team
 
-A Pi-native development team with isolated role sessions, three parallel independent solvers, validated JSON results, deterministic TypeScript routing and resumable repository-local state. Models reason about the work; the engine controls its lifecycle.
+A Pi-native development team with isolated role sessions, configurable parallel independent solvers, validated JSON results, deterministic TypeScript routing and resumable repository-local state. Models reason about the work; the engine controls its lifecycle.
 
 ## Installed environment
 
@@ -39,7 +39,7 @@ Then enter:
 /team resume <workflow-id>
 ```
 
-Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-init --repair` adds a missing Reporter prompt and config entry to an existing project team. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. Runtime guardrail and presentation changes are accepted and logged; semantic changes to completed agents or workflow behavior pause resume for explicit pi-ask review. A never-run agent may use a new prompt or model on its first attempt. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, semantic drift blocks for manual inspection. Old states without a semantic snapshot conservatively block when team YAML changes. Semantic drift during REPORT uses the deterministic report fallback.
+Run `/team-init` once in each repository, then set real provider/model IDs in `.pi/team/team.yaml`. `/team-init --repair` adds a missing Reporter prompt and config entry to an existing project team. `/team-stop` interrupts agents and preserves state. `/team resume` opens the most recent state; specifying an ID selects an older workflow. Runtime guardrail and presentation changes are accepted and logged; semantic changes to completed agents or workflow behavior pause resume for explicit pi-ask review. A never-run agent may use a new prompt or model on its first attempt. Changing `solverCount` before SOLVE starts is accepted as a future-phase change; once SOLVE starts, it is blocking semantic drift. Edits to inactive Solver prompts do not affect the current workflow. Before implementation, approval restarts reasoning with the new definition and the original limits. After implementation, semantic drift blocks for manual inspection. Old states without a semantic snapshot conservatively block when team YAML changes. Semantic drift during REPORT uses the deterministic report fallback.
 
 ### Completion reports
 
@@ -114,7 +114,7 @@ workflow:
 | `/team-continue`                   | Continue a BLOCKED workflow at the next safe incomplete phase after checking prerequisites, configuration and repository state. It takes no agent or phase argument.                                                                 |
 | `/team-stop`                       | Stop the entire workflow.                                                                                                                                                                                                            |
 
-Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`. `/team-status` shows current runs and these commands. A manual retry starts a new wall-clock timeout and cancels any reconnect wait in the old run. One aborted Solver can be skipped when at least two valid proposals remain; otherwise the workflow blocks with the proposal count. A manually aborted non-Solver blocks until you retry that agent. `/team-retry` can recover a workflow blocked by the target agent without starting a new workflow.
+Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`. `/team-status` shows current runs and these commands. A manual retry starts a new wall-clock timeout and cancels any reconnect wait in the old run. An aborted Solver can be skipped when the configured quorum remains satisfied; otherwise the workflow blocks with the proposal count. A manually aborted non-Solver blocks until you retry that agent. `/team-retry` can recover a workflow blocked by the target agent without starting a new workflow.
 
 ### Runtime recovery
 
@@ -219,7 +219,7 @@ Normal `/team` execution never reads `~/.pi/agent/team.yaml` or bundled template
 
 The generated tree contains `.pi/team/team.yaml`, `.pi/team/agents/*.md`, `.pi/team/.gitignore` with `state/`, and `.pi/team/state/`. Initialization never commits files or edits the repository root `.gitignore`. Commit the YAML, prompts and nested `.gitignore` when they represent your team's reviewed policy; keep state private. If the directory already exists, default init does not change it. `--repair` creates only missing files. `--from-global` reads the legacy global config only when requested, transfers compatible settings into a new project YAML, preserves the old file and never overwrites an existing project YAML or prompt.
 
-Every fixed workflow slot has a configured logical `role`, `prompt`, `provider`, `model` and `thinking`. The agent key is its stable internal ID; optional `name` is only its user-facing label, and `role` defines logical behavior. Older configs without `name` keep the established display label. Commands such as `/team-retry solver1` still use the ID, regardless of the display name. Changing a name does not rename its prompt file. The prompt path is relative to `.pi/team/`. The three independent Solver instances can share a model or use different providers and prompts:
+Every active workflow slot has a configured logical `role`, `prompt`, `provider`, `model` and `thinking`. The agent key is its stable internal ID; optional `name` is only its user-facing label, and `role` defines logical behavior. Older configs without `name` keep the established display label. Commands such as `/team-retry solver1` still use the ID, regardless of the display name. Changing a name does not rename its prompt file. The prompt path is relative to `.pi/team/`. The default three independent Solver instances can share a model or use different providers and prompts:
 
 ```yaml
 agents:
@@ -248,6 +248,21 @@ agents:
     temperature: 0.8
     thinking: off
 ```
+
+Set `workflow.solverCount` to an integer from 1 to 10 (default 3). The active IDs are contiguous `solver1` through `solverN`. Each needs its own explicit `agents.solverN` entry with `role: solver`; extra configured Solvers remain inactive. To add `solver4` through `solver10`, add each agent entry and a prompt file under `.pi/team/agents/`, then set its `prompt:` path (for example, `agents/solver-performance.md`). The entries may use distinct prompts, models, providers, and temperatures. Quorum is 1 of 1, both of 2, and at least half rounded up for 3–10:
+
+| Configured | Required successful |
+| ---------: | ------------------: |
+|          1 |                   1 |
+|          2 |                   2 |
+|          3 |                   2 |
+|          4 |                   2 |
+|          5 |                   3 |
+|          6 |                   3 |
+|          7 |                   4 |
+|          8 |                   4 |
+|          9 |                   5 |
+|         10 |                   5 |
 
 The default solver prompts favor architecture, minimal change and alternative approaches respectively, while retaining the same output contract. For a Laravel project, add its conventions to `agents/implementor.md`; for Angular, tailor `agents/reviewer.md` to component and testing patterns. A security-heavy Solver can use a separate prompt file with its own `prompt:` path, and a minimal-change Solver can favor existing patterns in `agents/solver-pragmatic.md`. Keep the required slot names and logical roles; optional pentest may be disabled, but its slot remains defined for schema consistency. Set every placeholder `model: configure-model-id` to a model Pi can resolve, or use `--from-global` to carry over known-working assignments.
 
@@ -504,7 +519,7 @@ agents:
     timeoutMs: 900000
 ```
 
-Unlimited time can help slow local models, large repositories, long-running tool-heavy research, and implementation agents. It does not disable `maxToolCalls`, `maxAgentFailures`, `maxQuestions`, `maxFullCycles`, `maxLocalFixCycles`, `maxPentestCycles`, schema validation, tool permissions, command approval, Git safeguards, quality gates, provider failure handling, or manual cancellation. Keep prompts focused, preserve loop protection, and use `/team-abort` for one agent or `/team-stop` for the workflow when needed. Tester validation commands retain their separate `commands[].timeoutMs` budgets. Existing project YAML is never rewritten. Counters are global to the workflow and persist through resume. A read-only agent wall-clock timeout may trigger one hard retry; `retry 1/1` means the second and final attempt, and the widget shows the prior failure reason. Every attempt start/failure and retry is persisted in workflow history. Malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
+Unlimited time can help slow local models, large repositories, long-running tool-heavy research, and implementation agents. It does not disable `maxToolCalls`, `maxAgentFailures`, `maxQuestions`, `maxFullCycles`, `maxLocalFixCycles`, `maxPentestCycles`, schema validation, tool permissions, command approval, Git safeguards, quality gates, provider failure handling, or manual cancellation. Keep prompts focused, preserve loop protection, and use `/team-abort` for one agent or `/team-stop` for the workflow when needed. Tester validation commands retain their separate `commands[].timeoutMs` budgets. Existing project YAML is never rewritten. Counters persist through resume; failed Solver proposals in a SOLVE phase that met quorum remain recorded but do not consume the global failure budget. A read-only agent wall-clock timeout may trigger one hard retry; `retry 1/1` means the second and final attempt, and the widget shows the prior failure reason. Every attempt start/failure and retry is persisted in workflow history. Malformed JSON gets one output-only correction with all tools disabled. Persistent malformed output is an invocation failure. Mutating roles do not automatically replay after failures.
 
 ### Network reconnects vs agent retries
 

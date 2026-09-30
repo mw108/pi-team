@@ -2,6 +2,8 @@ import { digest } from "../agents/registry.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import type { TeamConfig } from "./schema.ts";
 import type { TeamDefinition } from "./loader.ts";
+import { getActiveSolverIds } from "./solvers.ts";
+import { solverIds } from "../agents/schemas.ts";
 
 export type ConfigDriftClass =
   "semantic" | "runtime" | "presentation" | "future-agent";
@@ -56,14 +58,20 @@ function semanticConfig(config: TeamConfig) {
       ),
     ),
     agents: Object.fromEntries(
-      Object.entries(config.agents).map(([role, agent]) => [
-        role,
-        Object.fromEntries(
-          Object.entries(agent).filter(
-            ([key]) => key !== "name" && !runtimeAgent.has(key),
+      Object.entries(config.agents)
+        .filter(
+          ([role]) =>
+            !solverIds.includes(role as any) ||
+            getActiveSolverIds(config).includes(role as any),
+        )
+        .map(([role, agent]) => [
+          role,
+          Object.fromEntries(
+            Object.entries(agent).filter(
+              ([key]) => key !== "name" && !runtimeAgent.has(key),
+            ),
           ),
-        ),
-      ]),
+        ]),
     ),
   };
 }
@@ -149,8 +157,28 @@ export function analyzeConfigDrift(
         "team.yaml (legacy state: field-level drift unavailable)",
       );
   } else {
+    const active = new Set([
+      ...getActiveSolverIds(state.config),
+      ...getActiveSolverIds(current.config),
+    ]);
+    const solveStarted =
+      state.history.some(
+        (event) =>
+          (event.phase === "SOLVE" && event.event === "phase_started") ||
+          (event.event === "agent_attempt_started" &&
+            !!event.meta?.agent &&
+            solverIds.includes(event.meta.agent as any)),
+      ) ||
+      solverIds.some((id) => !!state.results[id]) ||
+      !!state.results.critic;
     for (const path of differences(state.driftConfigSnapshot, current.config)) {
       const parts = path.split(".");
+      if (
+        parts[0] === "agents" &&
+        solverIds.includes(parts[1] as any) &&
+        !active.has(parts[1] as any)
+      )
+        continue;
       if (
         presentationRoots.has(parts[0]) ||
         (parts[0] === "agents" && parts[2] === "name")
@@ -158,6 +186,8 @@ export function analyzeConfigDrift(
         add("presentation", path);
       else if (parts[0] === "workflow" && runtimeWorkflow.has(parts[1]))
         add("runtime", path);
+      else if (path === "workflow.solverCount")
+        add(solveStarted ? "semantic" : "future-agent", path);
       else if (parts[0] === "agents") {
         if (runtimeAgent.has(parts[2])) add("runtime", path);
         else add(hasRun(state, parts[1]) ? "semantic" : "future-agent", path);
@@ -165,10 +195,14 @@ export function analyzeConfigDrift(
     }
   }
   for (const [role] of promptChanged)
-    add(
-      hasRun(state, role) ? "semantic" : "future-agent",
-      `agents.${role}.prompt`,
-    );
+    if (
+      !solverIds.includes(role as any) ||
+      getActiveSolverIds(current.config).includes(role as any)
+    )
+      add(
+        hasRun(state, role) ? "semantic" : "future-agent",
+        `agents.${role}.prompt`,
+      );
   for (const key of [
     "semanticChanges",
     "runtimeChanges",

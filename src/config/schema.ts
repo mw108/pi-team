@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { roles } from "../agents/schemas.ts";
+import { roles, solverIds } from "../agents/schemas.ts";
 import { httpMethods, localUrl } from "./http.ts";
 export const logicalRoles = [
   "orchestrator",
@@ -24,6 +24,13 @@ export const expectedRoles: Record<
   solver1: "solver",
   solver2: "solver",
   solver3: "solver",
+  solver4: "solver",
+  solver5: "solver",
+  solver6: "solver",
+  solver7: "solver",
+  solver8: "solver",
+  solver9: "solver",
+  solver10: "solver",
   critic: "critic",
   reviewer: "reviewer",
   implementor: "implementor",
@@ -129,6 +136,7 @@ export const configSchema = z
   .object({
     workflow: z
       .object({
+        solverCount: z.number().int().min(1).max(10).default(3),
         maxFullCycles: z.number().int().min(1).default(3),
         maxLocalFixCycles: z.number().int().min(0).default(5),
         maxPentestCycles: z.number().int().min(1).default(2),
@@ -226,9 +234,14 @@ export const configSchema = z
       .default({}),
     agents: z
       .object(
-        Object.fromEntries(roles.map((r) => [r, agent])) as Record<
+        Object.fromEntries(
+          roles.map((r) => [
+            r,
+            solverIds.includes(r as any) ? agent.optional() : agent,
+          ]),
+        ) as Record<
           (typeof roles)[number],
-          typeof agent
+          typeof agent | z.ZodOptional<typeof agent>
         >,
       )
       .strict(),
@@ -264,13 +277,30 @@ export const configSchema = z
   })
   .strict()
   .superRefine((v, ctx) => {
+    for (const slot of solverIds.slice(0, v.workflow.solverCount)) {
+      const definition = v.agents[slot];
+      if (!definition)
+        ctx.addIssue({
+          code: "custom",
+          path: ["agents", slot],
+          message: `workflow.solverCount=${v.workflow.solverCount} requires agents.solver1 through agents.solver${v.workflow.solverCount}. Missing agent configuration: ${slot}`,
+        });
+      else if (definition.role !== "solver")
+        ctx.addIssue({
+          code: "custom",
+          path: ["agents", slot, "role"],
+          message: `agents.${slot} must have role "solver" because workflow.solverCount=${v.workflow.solverCount}.`,
+        });
+    }
     for (const pattern of Object.keys(v.toolActivity.mappings))
       if (!/^[A-Za-z][A-Za-z0-9_.-]{0,79}\*?$/.test(pattern))
         ctx.addIssue({
           code: "custom",
           message: `Invalid tool activity pattern: ${pattern}`,
         });
-    for (const slot of roles) {
+    for (const slot of roles.filter(
+      (role) => !solverIds.includes(role as any),
+    )) {
       const definition = v.agents[slot];
       if (definition && definition.role !== expectedRoles[slot])
         ctx.addIssue({
@@ -317,7 +347,13 @@ export const configSchema = z
             message: "Pentest URLs must use explicit HTTP(S) loopback origins",
           });
         }
-  });
+  })
+  .transform(
+    (config) =>
+      config as typeof config & {
+        agents: Record<(typeof roles)[number], z.infer<typeof agent>>;
+      },
+  );
 export type TeamConfig = z.infer<typeof configSchema>;
 export type Command = z.infer<typeof commandSchema>;
 export type DiscoveredCommand = z.infer<typeof discoveredCommandSchema>;
