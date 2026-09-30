@@ -7,6 +7,7 @@ import type {
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { getErrorMessage } from "../agents/error-message.ts";
 import { packagePath } from "./resources.ts";
 import type { Question } from "../agents/schemas.ts";
 import type { ApprovalRequest } from "../workflow/state.ts";
@@ -52,7 +53,8 @@ export async function checkAskCompatibility(options: ProbeOptions = {}) {
     return { version, range: compatibleAskRange, tool };
   } catch (error) {
     throw new Error(
-      `pi-ask ${version}: integration API unavailable. Expected @eko24ive/pi-ask/src/ask-tool.ts → registerAskTool → ask_user (${compatibleAskRange}; tested ${testedAskVersion}). ${String(error)}. Run npm run doctor or /team doctor. See README → pi-ask compatibility.`,
+      `pi-ask ${version}: integration API unavailable. Expected @eko24ive/pi-ask/src/ask-tool.ts → registerAskTool → ask_user (${compatibleAskRange}; tested ${testedAskVersion}). ${getErrorMessage(error)}. Run npm run doctor or /team doctor. See README → pi-ask compatibility.`,
+      { cause: error },
     );
   }
 }

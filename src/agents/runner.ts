@@ -64,6 +64,7 @@ export type ActivityObserver = (
   toolCallId?: string,
   innerToolName?: string,
   success?: boolean,
+  input?: unknown,
 ) => void;
 export type OutputObserver = (text: string) => void;
 export type { GuardEvent } from "./doom-loop.ts";
@@ -193,12 +194,13 @@ export class PiRunner implements AgentRunner {
         }
       });
       pi.on("tool_execution_start", (event) => {
+        const invocation = toolInvocation(event.toolName, event.args);
         activity?.(
           event.toolName,
           event.toolCallId,
-          event.toolName === "mcp" && typeof event.args?.tool === "string"
-            ? event.args.tool
-            : undefined,
+          event.toolName === "mcp" ? invocation.tool : undefined,
+          undefined,
+          invocation.input,
         );
       });
       pi.on("tool_execution_end", (event) => {

@@ -3,7 +3,7 @@ import type { TeamConfig } from "../config/schema.ts";
 import { serenaRead, serenaWrite } from "./permissions.ts";
 import type { Role } from "./schemas.ts";
 
-export const DEFAULT_DOOM_LOOP_STEER = `You are repeating the same tool actions without making meaningful progress.
+export const DEFAULT_DOOM_LOOP_STEER = `You are repeating observational search/read operations without progress. Stop broad exploration. Summarize established facts, identify the next concrete action, and make the required change or finish with a structured result.
 
 Stop repeating tool calls that you have already performed. Review the information already available in your context. If a specific fact is still missing, use a materially different tool or approach. Otherwise stop gathering information and produce the best valid final result now. Do not repeat the same tool-call pattern again.`;
 export const DOOM_LOOP_FINALIZE = `Your tool-use loop has continued after multiple interventions.
@@ -122,7 +122,7 @@ export function toolBehavior(tool: string): ToolBehavior {
 }
 
 export interface LoopPattern {
-  patternType: "identical" | "cycle";
+  patternType: "identical" | "cycle" | "observational";
   tool: string;
   repeatCount: number;
   progressEpoch: number;
@@ -149,25 +149,38 @@ export class DoomLoopDetector {
   }[] = [];
   private successfulMutations = new Set<string>();
   private progressEpoch = 0;
+  private sinceProgress: { behavior: ToolBehavior; target: string }[] = [];
   constructor(private readonly config: ReturnType<typeof resolveDoomLoop>) {}
   clear() {
     this.history = [];
     this.successfulMutations.clear();
     this.progressEpoch = 0;
+    this.sinceProgress = [];
   }
   observe(tool: string, input: unknown): LoopPattern | undefined {
     if (!this.config.enabled) return;
     const signature = toolSignature(tool, input);
+    const behavior = toolBehavior(tool);
+    const args =
+      input && typeof input === "object"
+        ? (input as Record<string, unknown>)
+        : {};
+    const path = args.path ?? args.relative_path ?? args.file_path;
+    const target =
+      typeof path === "string" ? toolSignature("read", { path }) : signature;
+    this.sinceProgress.push({ behavior, target });
+    if (this.sinceProgress.length > 64) this.sinceProgress.shift();
     this.history.push({
       signature,
       tool,
-      behavior: toolBehavior(tool),
+      behavior,
       progressEpoch: this.progressEpoch,
     });
-    if (this.history.length > this.config.windowSize) this.history.shift();
-    const count = this.history.filter(
-      (item) => item.signature === signature,
-    ).length;
+    if (this.history.length > Math.max(this.config.windowSize, 64))
+      this.history.shift();
+    const count = this.history
+      .slice(-this.config.windowSize)
+      .filter((item) => item.signature === signature).length;
     if (count >= this.config.maxIdenticalCalls)
       return {
         patternType: "identical",
@@ -175,8 +188,10 @@ export class DoomLoopDetector {
         repeatCount: count,
         progressEpoch: this.progressEpoch,
       };
-    const signatures = this.history.map((item) => item.signature);
-    for (let length = 2; length <= 4; length++) {
+    for (let length = 2; length <= 16; length++) {
+      const signatures = (
+        length <= 4 ? this.history.slice(-this.config.windowSize) : this.history
+      ).map((item) => item.signature);
       const total = length * this.config.maxRepeatedPattern;
       if (signatures.length < total) continue;
       const tail = signatures.slice(-total);
@@ -190,6 +205,20 @@ export class DoomLoopDetector {
           progressEpoch: this.progressEpoch,
         };
     }
+    const recent = this.sinceProgress.slice(-40);
+    const observed = recent.filter((item) => item.behavior === "observational");
+    if (
+      recent.length >= 30 &&
+      observed.length / recent.length >= 0.9 &&
+      new Set(observed.map((item) => item.target)).size / observed.length <=
+        0.65
+    )
+      return {
+        patternType: "observational",
+        tool,
+        repeatCount: observed.length,
+        progressEpoch: this.progressEpoch,
+      };
   }
 
   /** Called only after execution; a repeated mutation signature is not new progress. */
@@ -202,6 +231,7 @@ export class DoomLoopDetector {
     if (!success || this.successfulMutations.has(signature)) return;
     this.successfulMutations.add(signature);
     this.progressEpoch++;
+    this.sinceProgress = [];
     // Retain the mutation itself so repeating it remains detectable.
     this.history = [
       {

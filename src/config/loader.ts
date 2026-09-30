@@ -6,6 +6,7 @@ import { configSchema, type TeamConfig } from "./schema.ts";
 import { contained, projectRoot, teamRoot } from "./project.ts";
 import { digest, promptHashes } from "../agents/registry.ts";
 import { semanticConfigHash } from "./drift.ts";
+import { getErrorMessage } from "../agents/error-message.ts";
 function compatibleConfig(source: string): TeamConfig {
   const value = YAML.parse(source, { uniqueKeys: true });
   if (value?.agents && !value.agents.reporter && value.agents.orchestrator) {
@@ -70,7 +71,8 @@ export async function loadConfig(cwd: string): Promise<TeamDefinition> {
     };
   } catch (error) {
     throw new Error(
-      `Invalid Pi Team configuration or prompts at ${path}: ${String(error)}`,
+      `Invalid Pi Team configuration or prompts at ${path}: ${getErrorMessage(error)}`,
+      { cause: error },
     );
   }
 }

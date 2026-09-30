@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { projectRootSync } from "../config/project.ts";
 import { validateState, type WorkflowState } from "./state.ts";
+import { getErrorMessage } from "../agents/error-message.ts";
 export class StateStore {
   readonly dir: string;
   readonly legacyDir: string;
@@ -55,7 +56,8 @@ export class StateStore {
           `Legacy state ${id} exists at .pi/team-state/. It has no project prompt hashes and cannot be resumed automatically. Preserve and inspect it; start a new workflow after /team-init --from-global.`,
         );
       throw new Error(
-        `Cannot load workflow ${id}; original state preserved: ${String(e)}`,
+        `Cannot load workflow ${id}; original state preserved: ${getErrorMessage(e)}`,
+        { cause: e },
       );
     }
   }

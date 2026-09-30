@@ -534,6 +534,56 @@ test("tool events, visible output and /team-log command remain concise", async (
   assert.match(notices.at(-1) ?? "", /No log/);
 });
 
+test("JSONL tool starts contain only sanitized summaries", async () => {
+  const cwd = await repository();
+  class SummaryFixture extends FixtureRunner {
+    override async run(
+      role: Role,
+      state: WorkflowState,
+      _signal?: AbortSignal,
+      activity?: ActivityObserver,
+    ) {
+      activity?.("read", "read-1", undefined, undefined, {
+        path: `${state.cwd}/src/foo.ts`,
+        offset: 120,
+        limit: 80,
+        content: "TOP_SECRET",
+      });
+      activity?.(undefined, "read-1", undefined, true);
+      activity?.("grep", "grep-1", undefined, undefined, {
+        path: "src",
+        pattern: "passwordsMismatch",
+        authorization: "TOP_SECRET",
+      });
+      activity?.(undefined, "grep-1", undefined, true);
+      activity?.("edit", "edit-1", undefined, undefined, {
+        path: "src/foo.ts",
+        replacement: "TOP_SECRET",
+      });
+      activity?.(undefined, "edit-1", undefined, true);
+      return super.run(role, state);
+    }
+  }
+  const engine = new WorkflowEngine(cwd, new SummaryFixture(), ui);
+  const state = await engine.start("Fix", config());
+  await engine.invoke("researcher", state);
+  const starts = (
+    await new AgentLogStore(cwd).read(state.id, "researcher", 1)
+  ).filter((event) => event.type === "tool_start");
+  assert.deepEqual(
+    starts.map((event) => event.summary),
+    [
+      { path: "src/foo.ts", offset: 120, limit: 80 },
+      { path: "src", pattern: "passwordsMismatch" },
+      { path: "src/foo.ts" },
+    ],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(starts),
+    /TOP_SECRET|authorization|Users\//,
+  );
+});
+
 test("running attempts are readable and logging off still preserves history", async () => {
   const cwd = await repository();
   const cfg = config();

@@ -9,6 +9,8 @@ import {
   getFailureBudgetUsed,
 } from "../config/solvers.ts";
 import type { Phase, WorkflowState } from "./state.ts";
+import { isLimitBlockerStillActive } from "./limit-blocker.ts";
+import { getErrorMessage } from "../agents/error-message.ts";
 
 const mutating = new Set<Role>([
   "implementor",
@@ -67,16 +69,30 @@ export async function getWorkflowRecoveryPlan(
   try {
     current = await loadConfig(cwd);
   } catch (error) {
-    return unsafe(`Cannot validate project configuration: ${String(error)}`);
+    return unsafe(
+      `Cannot validate project configuration: ${getErrorMessage(error)}`,
+    );
   }
   const drift = analyzeConfigDrift(state, current);
   if (drift.blocking)
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
+  const limitActive = isLimitBlockerStillActive(state, current.config);
+  if (limitActive) return unsafe(state.blocker!);
+  const staleLimit = limitActive === false;
 
   // Follow the ordinary router, on copies, through the current valid results.
   // Each copy starts from the original results because RESEARCH's transition
   // invalidates downstream results as a real workflow side effect.
-  let phase = "ORCHESTRATE" as Phase;
+  let phase = (
+    staleLimit && state.blocker === "Local fix cycle limit reached"
+      ? "IMPLEMENT"
+      : staleLimit && state.blocker === "Pentest cycle limit reached"
+        ? "PENTEST"
+        : staleLimit &&
+            state.blocker?.startsWith("Research clarification limit reached")
+          ? "WAITING_USER"
+          : "ORCHESTRATE"
+  ) as Phase;
   const seen = new Set<Phase>();
   const hasResult = (role: Role) => {
     if (!state.results[role]) return false;
@@ -98,7 +114,7 @@ export async function getWorkflowRecoveryPlan(
       lastCompletion > Math.max(lastFix, lastStart)
     );
   };
-  for (;;) {
+  for (; phase !== "WAITING_USER";) {
     if (seen.has(phase))
       return unsafe(
         "Workflow results require another design cycle; inspect the blocker.",
@@ -127,20 +143,23 @@ export async function getWorkflowRecoveryPlan(
       );
     const copy = structuredClone(state);
     copy.phase = phase;
+    copy.config = current.config;
     try {
       transition(copy);
     } catch (error) {
-      return unsafe(`Cannot verify ${phase} transition: ${String(error)}`);
+      return unsafe(
+        `Cannot verify ${phase} transition: ${getErrorMessage(error)}`,
+      );
     }
     if (
       copy.phase === "BLOCKED" ||
-      copy.phase === "WAITING_USER" ||
+      (copy.phase as Phase) === "WAITING_USER" ||
       seen.has(copy.phase)
     )
       return unsafe(`Completed ${phase} requires review before proceeding.`);
     phase = copy.phase;
   }
-  const roles = getPhaseRoles(state, phase)!;
+  const roles = getPhaseRoles(state, phase) ?? [];
   const pending = roles.filter((role) => !hasResult(role));
   const lastInvalidation = state.history.findLastIndex((event) =>
     [
@@ -184,6 +203,12 @@ export async function getWorkflowRecoveryPlan(
       return unsafe(
         `${started} started without a successful result; inspect repository changes before retrying.`,
       );
+    if (staleLimit && state.blocker === "Agent failure limit reached")
+      return {
+        kind: "retry-agent",
+        agentId: started,
+        reason: `Previous agent failure limit no longer applies; retry ${started}.`,
+      };
     return unsafe(
       `${started} already has an incomplete attempt; inspect workflow history before recovery.`,
     );
@@ -191,7 +216,8 @@ export async function getWorkflowRecoveryPlan(
   if (
     phase === "IMPLEMENT" &&
     state.results.implementor &&
-    !hasResult("implementor")
+    !hasResult("implementor") &&
+    state.blocker !== "Local fix cycle limit reached"
   )
     return unsafe(
       "A prior Implementor result does not complete the current local fix; inspect repository changes before continuing.",
@@ -207,6 +233,7 @@ export async function getWorkflowRecoveryPlan(
     (stopped !== "COMMIT" || !!state.commit);
   if (
     !interruptedAfterCompletedMutation &&
+    !staleLimit &&
     (!state.blocker ||
       !/^(?:Workflow stopped after|Recoverable transition interruption|Transition interrupted|Interrupted after)/i.test(
         state.blocker,
@@ -239,7 +266,9 @@ export async function getWorkflowRecoveryPlan(
           "Repository changed after a quality gate; inspect changes before continuing.",
         );
     } catch (error) {
-      return unsafe(`Cannot verify repository state: ${String(error)}`);
+      return unsafe(
+        `Cannot verify repository state: ${getErrorMessage(error)}`,
+      );
     }
   }
   if (phase === "CODE_REVIEW") {
@@ -268,7 +297,9 @@ export async function getWorkflowRecoveryPlan(
   return {
     kind: "continue",
     nextPhase: phase,
-    agentId: pending[0],
-    reason: `Continue at ${phase}.`,
+    agentId: pending[0] ?? "researcher",
+    reason: staleLimit
+      ? `Previous ${state.blocker} no longer applies. Continue at ${phase}.`
+      : `Continue at ${phase}.`,
   };
 }

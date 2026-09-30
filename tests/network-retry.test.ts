@@ -722,7 +722,7 @@ test("nested ETIMEDOUT exhausts two retries in one engine attempt", async () => 
   const state = await engine.start("Nested timeout exhaustion", cfg);
   await assert.rejects(
     () => engine.invoke("researcher", state),
-    /network retries exhausted; last provider code: ETIMEDOUT; Error: terminated/,
+    /network retries exhausted; last provider code: ETIMEDOUT; terminated/,
   );
   assert.equal(setup.sessions, 1);
   assert.equal(fixture.requests, 3);

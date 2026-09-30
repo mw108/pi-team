@@ -17,6 +17,8 @@ export interface ConfigDriftAnalysis {
 }
 
 const runtimeWorkflow = new Set([
+  "maxLocalFixCycles",
+  "maxPentestCycles",
   "maxAgentFailures",
   "maxResearchClarifications",
   "maxToolCalls",

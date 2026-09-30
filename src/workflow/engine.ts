@@ -57,6 +57,8 @@ import {
   acceptConfigDrift,
   driftSummary,
 } from "../config/drift.ts";
+import { getErrorMessage } from "../agents/error-message.ts";
+import { toolCallSummary } from "../agents/tool-summary.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -163,11 +165,17 @@ export class WorkflowEngine {
       throw new Error(
         `Agent "${getAgentDisplayName(state.config, role)}" (${role}) is not currently running.`,
       );
-    const entry = await this.sessions.steer(state.id, role, message);
-    entry.resetDoomLoop?.();
     const logger = new AttemptLogger(
       this.logs.path(state.id, role, attempt.attempt),
     );
+    logger.append({
+      type: "agent_steer_requested",
+      agent: role,
+      attempt: attempt.attempt,
+    });
+    await logger.flush();
+    const entry = await this.sessions.steer(state.id, role, message);
+    entry.resetDoomLoop?.();
     logger.append({
       type: "agent_steer",
       agent: role,
@@ -630,7 +638,7 @@ export class WorkflowEngine {
             role,
             s,
             control.controller.signal,
-            (toolName, toolCallId, innerToolName, success) => {
+            (toolName, toolCallId, innerToolName, success, input) => {
               const key = toolCallId ?? "single";
               if (toolName) {
                 const activity = classifyToolActivity(
@@ -648,11 +656,13 @@ export class WorkflowEngine {
                     : "unknown_tool",
                   started: Date.now(),
                 });
+                const summary = toolCallSummary(rawName, input, s.cwd);
                 logged?.logger.append({
                   type: "tool_start",
                   tool: calls.get(key)!.name,
                   activity: activity.label,
                   ...(activity.provider ? { provider: activity.provider } : {}),
+                  ...(summary ? { summary } : {}),
                 });
               } else {
                 const call = calls.get(key);
@@ -1046,13 +1056,14 @@ export class WorkflowEngine {
         ) {
           this.emitAgentEvent({ type: "fail", role, error: String(e) });
           const terminalError =
-            e instanceof AgentTimeoutError || e instanceof AgentDoomLoopError
-              ? e
-              : new Error(
-                  category === "network" && networkRetriesExhausted
-                    ? `network retries exhausted; last provider code: ${firstErrorCode(error) ?? "unknown"}; ${String(e)}`
-                    : String(e),
-                );
+            category === "network" && networkRetriesExhausted
+              ? new Error(
+                  `network retries exhausted; last provider code: ${firstErrorCode(error) ?? "unknown"}; ${getErrorMessage(e)}`,
+                  { cause: e },
+                )
+              : e instanceof Error
+                ? e
+                : new Error(String(e));
           Object.assign(terminalError, { failures });
           throw terminalError;
         }
@@ -1156,6 +1167,24 @@ export class WorkflowEngine {
       for (const key of Object.keys(s))
         delete (s as Record<string, unknown>)[key];
       Object.assign(s, latest);
+      if (s.blocker === "Local fix cycle limit reached") s.localFixCycle++;
+      if (s.blocker?.startsWith("Research clarification limit reached")) {
+        const questions = [
+          ...new Set(
+            (
+              (s.results.researcher as { unresolvedQuestions?: string[] })
+                ?.unresolvedQuestions ?? []
+            )
+              .map((question) => question.trim())
+              .filter(Boolean),
+          ),
+        ];
+        if (!questions.length)
+          throw new Error("Research questions are missing");
+        s.pendingResearchQuestions = questions;
+        s.resumePhase = "RESEARCH";
+        s.researchClarificationCount++;
+      }
       record(s, "workflow_continue_requested", "", undefined);
       s.phase = plan.nextPhase;
       delete s.blocker;
@@ -1918,7 +1947,7 @@ export class WorkflowEngine {
       this.ui.progress(s);
       return s;
     } catch (e) {
-      block(s, String(e));
+      block(s, getErrorMessage(e));
       await this.store.save(s);
       this.ui.progress(s);
       return s;

@@ -129,6 +129,65 @@ function guardHarness() {
   return { guard, events, steers, step, detections };
 }
 
+test("long read/grep exploration of recurring targets triggers a steer", async () => {
+  const fixture = guardHarness();
+  for (let i = 0; i < 40 && !fixture.detections().length; i++) {
+    const path = `src/file${i % 6}.ts`;
+    await fixture.step(i % 7 === 0 ? "read" : "grep", {
+      path,
+      pattern: `symbol${i}`,
+      offset: i,
+    });
+  }
+  assert.equal(fixture.detections()[0]?.patternType, "observational");
+  assert.equal(fixture.steers.length, 1);
+});
+
+test("forty distinct one-pass reads do not trigger observational detection", () => {
+  const detector = new DoomLoopDetector(options());
+  for (let i = 0; i < 40; i++)
+    assert.equal(
+      detector.observe("read", call(`src/unique${i}.ts`)),
+      undefined,
+    );
+});
+
+test("a six-call exact cycle is detected before the observational threshold", () => {
+  const detector = new DoomLoopDetector(options());
+  let loop;
+  for (let i = 0; i < 18; i++)
+    loop = detector.observe("read", call(`src/cycle${i % 6}.ts`));
+  assert.equal(loop?.patternType, "cycle");
+});
+
+test("a distinct successful mutation resets observational no-progress history", () => {
+  const detector = new DoomLoopDetector(options());
+  for (let i = 0; i < 20; i++)
+    assert.equal(
+      detector.observe("read", call(`src/file${i % 6}.ts`, i)),
+      undefined,
+    );
+  const input = { path: "src/change.ts", content: "changed" };
+  detector.observe("write", input);
+  detector.completeMutation("write", toolSignature("write", input), true);
+  for (let i = 0; i < 20; i++)
+    assert.equal(
+      detector.observe("read", call(`src/file${i % 6}.ts`, i + 20)),
+      undefined,
+    );
+});
+
+test("validation calls do not reset observational no-progress history", () => {
+  const detector = new DoomLoopDetector(options());
+  let loop;
+  for (let i = 0; i < 31; i++) {
+    if (i === 25)
+      assert.equal(detector.observe("team_command", { id: "test" }), undefined);
+    else loop = detector.observe("read", call(`src/file${i % 6}.ts`, i));
+  }
+  assert.equal(loop?.patternType, "observational");
+});
+
 test("real Implementor sequence preserves implementation and validation progress", async () => {
   const run = guardHarness();
   await run.step("serena_search_for_pattern", { substring_pattern: "status" });

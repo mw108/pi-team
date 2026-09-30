@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config/loader.ts";
 import { PiRunner } from "./agents/runner.ts";
 import { WorkflowEngine } from "./workflow/engine.ts";
@@ -23,6 +26,7 @@ import {
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
 import { getAgentDisplayName } from "./ui/agent-name.ts";
 import { inactiveSolverError } from "./config/solvers.ts";
+import { formatErrorForUser } from "./agents/error-message.ts";
 import {
   buildCompletionReportInput,
   fallbackReport,
@@ -51,20 +55,60 @@ async function finalText(state: WorkflowState) {
   return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
 }
 export default function teamExtension(pi: ExtensionAPI) {
-  let active:
-    | {
-        controller: AbortController;
-        runtime: ProgressRuntime;
-        state?: WorkflowState;
-        engine?: WorkflowEngine;
-      }
-    | undefined;
+  type ActiveWorkflow = {
+    controller: AbortController;
+    runtime: ProgressRuntime;
+    state?: WorkflowState;
+    engine?: WorkflowEngine;
+    task?: Promise<void>;
+  };
+  let active: ActiveWorkflow | undefined;
   let continuationPending = false;
+  function launch(
+    entry: ActiveWorkflow,
+    run: () => Promise<WorkflowState>,
+    ctx: ExtensionCommandContext,
+    append = false,
+  ) {
+    const task = Promise.resolve()
+      .then(run)
+      .then(async (finished) => {
+        if (append)
+          pi.appendEntry("pi-team:workflow", {
+            id: finished.id,
+            phase: finished.phase,
+          });
+        ctx.ui.notify(
+          await finalText(finished),
+          finished.phase === "DONE"
+            ? "info"
+            : finished.phase === "BLOCKED"
+              ? "error"
+              : "warning",
+        );
+      })
+      .catch((error) => {
+        try {
+          ctx.ui.notify(formatErrorForUser(error), "error");
+        } catch {
+          // A closed UI must not leave the background task unhandled.
+        }
+      })
+      .finally(() => {
+        if (active === entry) active = undefined;
+        try {
+          entry.runtime.dispose();
+        } catch {
+          // Cleanup remains best effort after the workflow has settled.
+        }
+      });
+    entry.task = task;
+  }
   pi.on("session_start", async (_event, ctx) => {
     try {
       await checkAskCompatibility();
     } catch (error) {
-      ctx.ui.notify(String(error), "error");
+      ctx.ui.notify(formatErrorForUser(error), "error");
     }
   });
   pi.on("session_shutdown", () => {
@@ -93,7 +137,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(String(error), "error");
+        ctx.ui.notify(formatErrorForUser(error), "error");
       }
     },
   });
@@ -134,7 +178,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
+        ctx.ui.notify(formatErrorForUser(e), "error");
       }
     },
   });
@@ -155,7 +199,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
+        ctx.ui.notify(formatErrorForUser(e), "error");
       }
     },
   });
@@ -226,17 +270,15 @@ export default function teamExtension(pi: ExtensionAPI) {
         );
         runtime.bind(state);
         try {
-          const finished = await engine.run(state, controller.signal);
-          ctx.ui.notify(
-            await finalText(finished),
-            finished.phase === "BLOCKED" ? "error" : "info",
-          );
-        } finally {
+          launch(active, () => engine.run(state, controller.signal), ctx);
+          ownedRuntime = undefined;
+        } catch (error) {
           runtime.dispose();
           active = undefined;
+          throw error;
         }
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
+        ctx.ui.notify(formatErrorForUser(e), "error");
       } finally {
         ownedRuntime?.dispose();
       }
@@ -256,6 +298,7 @@ export default function teamExtension(pi: ExtensionAPI) {
       }
       continuationPending = true;
       let runtime: ProgressRuntime | undefined;
+      let launched = false;
       try {
         const root = await projectRoot(ctx.cwd);
         const state = await new StateStore(root).latest();
@@ -281,16 +324,19 @@ export default function teamExtension(pi: ExtensionAPI) {
           state.config.ui.progress.enabled,
         );
         runtime.bind(state);
-        const finished = await engine.continueBlocked(state, controller.signal);
-        ctx.ui.notify(
-          await finalText(finished),
-          finished.phase === "BLOCKED" ? "error" : "info",
+        launch(
+          active,
+          () => engine.continueBlocked(state, controller.signal),
+          ctx,
         );
+        launched = true;
       } catch (error) {
-        ctx.ui.notify(String(error), "error");
+        ctx.ui.notify(formatErrorForUser(error), "error");
       } finally {
-        runtime?.dispose();
-        active = undefined;
+        if (!launched) {
+          runtime?.dispose();
+          if (runtime && active?.runtime === runtime) active = undefined;
+        }
         continuationPending = false;
       }
     },
@@ -318,12 +364,12 @@ export default function teamExtension(pi: ExtensionAPI) {
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
+            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
+        ctx.ui.notify(formatErrorForUser(e), "error");
       }
     },
   });
@@ -355,7 +401,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(String(error), "error");
+        ctx.ui.notify(formatErrorForUser(error), "error");
       }
     },
   });
@@ -405,7 +451,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
+        ctx.ui.notify(formatErrorForUser(e), "error");
       }
     },
   });
@@ -470,24 +516,11 @@ export default function teamExtension(pi: ExtensionAPI) {
           state.config.ui.progress.enabled,
         );
         runtime.bind(state);
-        const result = await engine.run(state, controller.signal);
-        pi.appendEntry("pi-team:workflow", {
-          id: result.id,
-          phase: result.phase,
-        });
-        ctx.ui.notify(
-          await finalText(result),
-          result.phase === "DONE"
-            ? "info"
-            : result.phase === "BLOCKED"
-              ? "error"
-              : "warning",
-        );
+        launch(active, () => engine.run(state, controller.signal), ctx, true);
       } catch (e) {
-        ctx.ui.notify(String(e), "error");
-      } finally {
+        ctx.ui.notify(formatErrorForUser(e), "error");
         runtime.dispose();
-        active = undefined;
+        if (active?.runtime === runtime) active = undefined;
       }
     },
   });

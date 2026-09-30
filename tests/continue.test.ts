@@ -17,12 +17,17 @@ import {
 import { renderBlocked } from "../src/workflow/report.ts";
 import { FixtureRunner, config, repository } from "./helpers.ts";
 import { semanticConfigHash } from "../src/config/drift.ts";
+import { analyzeConfigDrift } from "../src/config/drift.ts";
+import { loadConfig } from "../src/config/loader.ts";
+import { fix } from "../src/workflow/router.ts";
+import { isLimitBlockerStillActive } from "../src/workflow/limit-blocker.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
-async function completed(commit = false) {
+async function completed(commit = false, pentest = false) {
   const cwd = await repository();
   const cfg = config();
   cfg.qualityGates.commit.enabled = commit;
+  cfg.qualityGates.pentest.enabled = pentest;
   cfg.logging.agentLogs.level = "off";
   const runner = new FixtureRunner();
   const engine = new WorkflowEngine(cwd, runner, ui);
@@ -73,6 +78,138 @@ test("semantic fingerprint ignores runtime and presentation fields", () => {
   assert.equal(semanticConfigHash(previous), semanticConfigHash(current));
   current.agents.reviewer.model = "different-model";
   assert.notEqual(semanticConfigHash(previous), semanticConfigHash(current));
+});
+
+test("stale local fix limit 5→10 permits /team-continue and retains the counter", async () => {
+  const { cwd, state, engine, runner } = await completed();
+  state.localFixCycle = 5;
+  state.phase = "CODE_REVIEW";
+  (state.results.codeReviewer as { status: string }).status = "FIX_LOCAL";
+  (state.results.codeReviewer as { findings: unknown[] }).findings = [
+    {
+      severity: "medium",
+      file: "math.js",
+      problem: "Missing edge case",
+      suggestedFix: "Handle the edge case",
+      requiresRedesign: false,
+    },
+  ];
+  fix(state, "FIX_LOCAL");
+  assert.equal(state.phase, "BLOCKED");
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxLocalFixCycles = 10;
+  });
+  const drift = analyzeConfigDrift(state, await loadConfig(cwd));
+  assert.deepEqual(drift.runtimeChanges, ["workflow.maxLocalFixCycles"]);
+  assert.equal(drift.blocking, false);
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "continue", plan.reason);
+  assert.equal(plan.kind === "continue" && plan.nextPhase, "IMPLEMENT");
+  assert.match(plan.reason, /no longer applies/);
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.localFixCycle, 6);
+  assert.equal(state.config.workflow.maxLocalFixCycles, 10);
+  assert.equal(runner.counts.implementor, 2);
+});
+
+test("other limit blockers are reevaluated against current counters", async () => {
+  const { state } = await completed();
+  state.blocker = "Pentest cycle limit reached";
+  state.pentestCycle = 2;
+  assert.equal(isLimitBlockerStillActive(state, state.config), true);
+  state.config.workflow.maxPentestCycles = 3;
+  assert.equal(isLimitBlockerStillActive(state, state.config), false);
+  state.blocker = "Research clarification limit reached. Questions remain.";
+  state.researchClarificationCount = 5;
+  assert.equal(isLimitBlockerStillActive(state, state.config), true);
+  state.config.workflow.maxResearchClarifications = 0;
+  assert.equal(isLimitBlockerStillActive(state, state.config), false);
+  state.blocker = "Agent failure limit reached";
+  state.agentFailures = 2;
+  assert.equal(isLimitBlockerStillActive(state, state.config), true);
+  state.config.workflow.maxAgentFailures = 3;
+  assert.equal(isLimitBlockerStillActive(state, state.config), false);
+  state.blocker = "Repository changed";
+  assert.equal(isLimitBlockerStillActive(state, state.config), undefined);
+});
+
+test("raised research clarification limit restores the pending question dialog", async () => {
+  const { cwd, state, engine } = await completed();
+  (
+    state.results.researcher as { unresolvedQuestions: string[] }
+  ).unresolvedQuestions = ["Which outcome is required?"];
+  state.researchClarificationCount = 5;
+  state.phase = "RESEARCH";
+  block(state, "Research clarification limit reached. Questions remain.");
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxResearchClarifications = 10;
+  });
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "continue", plan.reason);
+  assert.equal(plan.kind === "continue" && plan.nextPhase, "WAITING_USER");
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "WAITING_USER");
+  assert.deepEqual(state.pendingResearchQuestions, [
+    "Which outcome is required?",
+  ]);
+  assert.equal(state.researchClarificationCount, 6);
+});
+
+test("raised pentest cycle limit permits the next pentest pass", async () => {
+  const { cwd, state, engine, runner } = await completed(false, true);
+  state.pentestCycle = 2;
+  for (const role of ["pentester", "securityReviewer", "tester", "reporter"])
+    delete state.results[role];
+  state.history.push({
+    at: new Date().toISOString(),
+    phase: "PENTEST",
+    event: "FIX_LOCAL",
+    detail: "prior fix completed",
+  });
+  state.phase = "PENTEST";
+  block(state, "Pentest cycle limit reached");
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxPentestCycles = 3;
+  });
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "continue", plan.reason);
+  assert.equal(plan.kind === "continue" && plan.nextPhase, "PENTEST");
+  await engine.continueBlocked(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.pentestCycle, 3);
+  assert.equal(runner.counts.pentester, 2);
+});
+
+test("raised agent failure limit recommends retry for an incomplete read-only agent", async () => {
+  const { cwd, state, engine } = await completed();
+  for (const role of [
+    "researcher",
+    "solver1",
+    "solver2",
+    "solver3",
+    "critic",
+    "reviewer",
+    "implementor",
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ])
+    delete state.results[role];
+  state.agentFailures = 2;
+  state.phase = "RESEARCH";
+  block(state, "Agent failure limit reached");
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.maxAgentFailures = 3;
+  });
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "retry-agent", plan.reason);
+  assert.equal(plan.kind === "retry-agent" && plan.agentId, "researcher");
+  assert.equal(state.agentFailures, 2);
 });
 
 test("runtime guardrail drift 2→3 and 80→9999 allows Code Reviewer continuation", async () => {
