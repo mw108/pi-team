@@ -50,7 +50,7 @@ const agent = z
     model: z.string().min(1),
     temperature: z.number().finite().min(0).max(2).optional(),
     timeoutMs: z
-      .union([z.literal(0), z.number().int().min(1000).max(3600000)])
+      .union([z.literal(0), z.number().int().min(1000).max(86400000)])
       .optional(),
     maxToolCalls: z.number().int().min(0).optional(),
     doomLoop: z
@@ -144,7 +144,7 @@ export const configSchema = z
         maxQuestions: z.number().int().min(1).default(5),
         maxResearchClarifications: z.number().int().min(0).default(5),
         agentTimeoutMs: z
-          .union([z.literal(0), z.number().int().min(1000).max(3600000)])
+          .union([z.literal(0), z.number().int().min(1000).max(86400000)])
           .default(300000),
         networkRetry: z
           .object({
