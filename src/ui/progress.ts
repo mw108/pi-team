@@ -148,6 +148,12 @@ export function elapsed(ms: number) {
   const minutes = Math.floor(seconds / 60);
   return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
+function activityAge(ms: number) {
+  if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 60000) return `${Math.floor(ms / 1000)}s`;
+  const seconds = Math.floor(ms / 1000);
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
 function visibleRoles(state: WorkflowState) {
   return roles.filter((role) => {
     if (
@@ -249,6 +255,22 @@ function displayAgent(
     status === "running" && live?.networkRetry
       ? `  ↳ Reconnecting · ${live.networkRetry.category === "transport" ? "network error" : live.networkRetry.category === "rate_limit" ? "rate limited" : "provider temporarily unavailable"} · ${live.networkRetry.maxRetries === 0 ? `attempt ${live.networkRetry.retry}` : `${live.networkRetry.retry}/${live.networkRetry.maxRetries}`}${live.networkRetry.retryAt === undefined ? "" : ` · retry in ${Math.ceil(Math.max(0, live.networkRetry.retryAt - Date.now()) / 1000)}s`}`
       : undefined;
+  const provider = live?.providerProgress;
+  const providerAge = provider
+    ? Math.max(
+        0,
+        (runtime?.nowMs() ?? Date.now()) -
+          (provider.lastActivityAt ?? provider.startedAt),
+      )
+    : 0;
+  const providerStatus =
+    status !== "running" || !provider
+      ? undefined
+      : providerAge >= 60000
+        ? `  ↳ provider idle · ${activityAge(providerAge)} since ${provider.lastActivityAt === undefined ? "request start" : "last event"}`
+        : provider.state === "waiting"
+          ? "  ↳ waiting for model response"
+          : `  ↳ ${provider.state === "tool_calling" ? "preparing tool call" : provider.state} · active ${activityAge(providerAge)} ago`;
   const error =
     status === "aborted"
       ? "  ↳ Aborted by user"
@@ -300,7 +322,7 @@ function displayAgent(
     returnedBy && derived.attempt && derived.attempt > 1
       ? `  ↳ returned by ${returnedBy}`
       : undefined,
-    control ?? reconnect ?? activity,
+    control ?? reconnect ?? activity ?? providerStatus,
     guardStatus,
     finalError?.message
       ? `  ↳ Final error: ${finalError.name ?? "Error"}: ${finalError.message}`

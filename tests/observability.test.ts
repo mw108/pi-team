@@ -64,7 +64,7 @@ test("agent and global timeout validation, inheritance, and runtime resolution",
   delete cfg.agents.researcher.timeoutMs;
   assert.equal(getAgentTimeoutMs(cfg, "researcher"), undefined);
   assert.equal(configSchema.safeParse(cfg).success, true);
-  for (const timeoutMs of [-1, 500, 999, 3600001, 1.5, NaN, Infinity, "1000"])
+  for (const timeoutMs of [-1, 500, 999, 86400001, 1.5, NaN, Infinity, "1000"])
     assert.equal(
       configSchema.safeParse({
         ...cfg,
@@ -75,7 +75,7 @@ test("agent and global timeout validation, inheritance, and runtime resolution",
       }).success,
       false,
     );
-  for (const agentTimeoutMs of [-1, 500, 3600001, 1.5, NaN, Infinity, "1000"])
+  for (const agentTimeoutMs of [-1, 500, 86400001, 1.5, NaN, Infinity, "1000"])
     assert.equal(
       configSchema.safeParse({
         ...cfg,

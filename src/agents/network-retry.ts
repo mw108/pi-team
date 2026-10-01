@@ -47,7 +47,8 @@ export type ProviderRequestEvent = {
   type:
     | "provider_request_start"
     | "provider_request_end"
-    | "provider_request_failure";
+    | "provider_request_failure"
+    | "provider_progress";
   providerRequest: number;
   provider: string;
   model: string;
@@ -57,6 +58,10 @@ export type ProviderRequestEvent = {
   requestDurationMs?: number;
   timeToFirstEventMs?: number;
   timeSinceLastActivityMs?: number;
+  elapsedMs?: number;
+  lastActivityMs?: number;
+  state?: ProviderProgressState;
+  streamEventCount?: number;
   success?: boolean;
   error?: ErrorDiagnostics;
   classification?: "network" | "provider" | "rate_limit" | "other";
@@ -67,6 +72,26 @@ export type ProviderRequestEvent = {
     httpIdleTimeoutMs?: { value: number; source: string };
   };
 };
+
+export type ProviderProgressState =
+  "waiting" | "generating" | "reasoning" | "tool_calling";
+export interface ProviderLiveProgress {
+  providerRequest: number;
+  startedAt: number;
+  firstActivityAt?: number;
+  lastActivityAt?: number;
+  state: ProviderProgressState;
+  streamEventCount: number;
+}
+export type ProviderProgressUpdate =
+  ProviderLiveProgress | { providerRequest: number; ended: true };
+
+const progressIntervalMs = 5000;
+function progressInterval(tick: () => void) {
+  const timer = setInterval(tick, progressIntervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 const transportCodes = new Set([
   "ECONNRESET",
@@ -191,6 +216,8 @@ export function configureNetworkRetry(
   observe?: (event: NetworkRetryEvent) => void,
   observeRequest?: (event: ProviderRequestEvent) => void,
   now: () => number = Date.now,
+  observeProgress?: (update: ProviderProgressUpdate) => void,
+  scheduleProgress: (tick: () => void) => () => void = progressInterval,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -217,6 +244,45 @@ export function configureNetworkRetry(
           networkRetry: retry,
           requestStartedAt,
         };
+        const progress: ProviderLiveProgress = {
+          providerRequest,
+          startedAt: requestStarted,
+          state: "waiting",
+          streamEventCount: 0,
+        };
+        const publishProgress = () => {
+          try {
+            observeProgress?.({ ...progress });
+          } catch {
+            // Telemetry must not affect the provider stream.
+          }
+        };
+        publishProgress();
+        const progressTick = () => {
+          try {
+            const at = now();
+            observeRequest?.({
+              type: "provider_progress",
+              ...identity,
+              elapsedMs: Math.max(0, at - requestStarted),
+              ...(progress.lastActivityAt === undefined
+                ? {}
+                : {
+                    lastActivityMs: Math.max(0, at - progress.lastActivityAt),
+                  }),
+              state: progress.state,
+              streamEventCount: progress.streamEventCount,
+            });
+          } catch {
+            // Logging telemetry must not interrupt generation.
+          }
+        };
+        let stopProgress = () => {};
+        try {
+          stopProgress = scheduleProgress(progressTick);
+        } catch {
+          // A telemetry timer failure must not prevent the request.
+        }
         const providerTimeouts = {
           ...(typeof options?.timeoutMs === "number"
             ? { requestTimeoutMs: options.timeoutMs }
@@ -235,6 +301,23 @@ export function configureNetworkRetry(
           ...options,
           signal,
           maxRetries: 0,
+          onProviderStreamEvent: async (
+            data: unknown,
+            streamModel: Model<Api>,
+          ) => {
+            try {
+              // This hook is supported by Pi's openai-completions adapter.
+              // It also sees usage-only chunks that produce no normalized event.
+              const at = now();
+              progress.firstActivityAt ??= at;
+              progress.lastActivityAt = at;
+              lastActivityAt = at;
+              publishProgress();
+            } catch {
+              // Raw provider data is never required for agent execution.
+            }
+            await options?.onProviderStreamEvent?.(data, streamModel);
+          },
           fetch: async (...args: Parameters<typeof fetch>) => {
             let response: Response;
             try {
@@ -282,6 +365,15 @@ export function configureNetworkRetry(
             ) {
               firstEventAt ??= at;
               lastActivityAt = at;
+              progress.firstActivityAt ??= at;
+              progress.lastActivityAt = at;
+              progress.streamEventCount++;
+              if (event.type.startsWith("thinking_"))
+                progress.state = "reasoning";
+              else if (event.type.startsWith("toolcall_"))
+                progress.state = "tool_calling";
+              else progress.state = "generating";
+              publishProgress();
             }
             events.push(event);
           }
@@ -289,6 +381,16 @@ export function configureNetworkRetry(
           rawError ??= error;
           // A synchronous provider failure has no assistant event to forward.
           events = [providerErrorEvent(model, String(error), signal?.aborted)];
+        }
+        try {
+          stopProgress();
+        } catch {
+          // Telemetry cleanup must not affect retries or outcomes.
+        }
+        try {
+          observeProgress?.({ providerRequest, ended: true });
+        } catch {
+          // Telemetry must not affect retries or outcomes.
         }
         const terminal = events.at(-1);
         const failed = terminal?.type === "error";

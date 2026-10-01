@@ -5,6 +5,10 @@ import type { CommandSummary } from "../agents/command-observability.ts";
 import type { GuardEvent } from "../agents/runner.ts";
 import type { ContextUsage } from "@earendil-works/pi-coding-agent";
 import type { ActiveSessionRegistry } from "../agents/active-sessions.ts";
+import type {
+  ProviderLiveProgress,
+  ProviderProgressUpdate,
+} from "../agents/network-retry.ts";
 
 export type AgentRuntimeStatus =
   "pending" | "running" | "completed" | "failed" | "stopped" | "aborted";
@@ -34,6 +38,7 @@ export interface AgentProgress {
     category: string;
   };
   contextUsage?: ContextUsage;
+  providerProgress?: ProviderLiveProgress;
 }
 export type AgentEvent =
   | {
@@ -72,6 +77,13 @@ export type AgentEvent =
     }
   | { type: "networkStarted"; role: Role }
   | { type: "networkClear"; role: Role }
+  | {
+      type: "providerProgress";
+      role: Role;
+      workflowId: string;
+      attempt: number;
+      update: ProviderProgressUpdate;
+    }
   | {
       type: "activity";
       role: Role;
@@ -157,6 +169,7 @@ export class ProgressRuntime {
           agent.completedAt = this.now();
           agent.activity = undefined;
           agent.toolCallId = undefined;
+          agent.providerProgress = undefined;
           if (state.phase === "BLOCKED")
             agent.error = "Workflow blocked; inspect state";
         }
@@ -173,6 +186,22 @@ export class ProgressRuntime {
   event(event: AgentEvent) {
     if (this.disposed || this.stopped) return;
     const existing = this.agents[event.role];
+    if (event.type === "providerProgress") {
+      if (
+        this.state?.id !== event.workflowId ||
+        existing?.status !== "running" ||
+        existing.attempt !== event.attempt
+      )
+        return;
+      const currentRequest = existing.providerProgress?.providerRequest ?? 0;
+      if (event.update.providerRequest < currentRequest) return;
+      if ("ended" in event.update) {
+        if (event.update.providerRequest === currentRequest)
+          existing.providerProgress = undefined;
+      } else existing.providerProgress = event.update;
+      // The existing UI heartbeat renders timestamps without a repaint per delta.
+      return;
+    }
     if (event.type === "start")
       this.agents[event.role] = {
         instanceId: event.role,
@@ -215,16 +244,19 @@ export class ProgressRuntime {
     else if (event.type === "restarting" && existing) {
       existing.controlActivity = `Restarting as run ${event.attempt}`;
       existing.networkRetry = undefined;
+      existing.providerProgress = undefined;
     } else if (event.type === "aborted" && existing) {
       existing.status = "aborted";
       existing.completedAt = this.now();
       existing.controlActivity = undefined;
       existing.error = "Aborted by user";
+      existing.providerProgress = undefined;
     } else if (event.type === "superseded" && existing) {
       existing.status = "stopped";
       existing.completedAt = this.now();
       existing.controlActivity = undefined;
       existing.error = "Stopped for upstream retry";
+      existing.providerProgress = undefined;
     } else if (event.type === "complete" || event.type === "fail") {
       this.agents[event.role] = {
         ...existing,
@@ -233,6 +265,7 @@ export class ProgressRuntime {
         completedAt: this.now(),
         activity: undefined,
         toolCallId: undefined,
+        providerProgress: undefined,
         controlActivity: undefined,
         error:
           event.type === "fail"
@@ -244,6 +277,7 @@ export class ProgressRuntime {
       existing.previousFailure = event.reason;
       existing.activity = undefined;
       existing.toolCallId = undefined;
+      existing.providerProgress = undefined;
     } else if (event.type === "networkRetry" && existing) {
       existing.networkRetry = {
         retry: event.retry,
@@ -287,6 +321,7 @@ export class ProgressRuntime {
         agent.completedAt = this.now();
         agent.activity = undefined;
         agent.toolCallId = undefined;
+        agent.providerProgress = undefined;
       }
     this.updateTimer();
     this.emit();
@@ -301,6 +336,9 @@ export class ProgressRuntime {
       0,
       (agent.completedAt ?? this.now()) - (agent.startedAt ?? this.now()),
     );
+  }
+  nowMs() {
+    return this.now();
   }
   private updateTimer() {
     const running = Object.values(this.agents).some(

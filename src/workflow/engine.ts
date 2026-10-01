@@ -790,6 +790,18 @@ export class WorkflowEngine {
               this.emitAgentEvent({ type: "guard", role, event });
             },
             (event) => {
+              if (event.type === "provider_progress") {
+                try {
+                  logged?.logger.append({
+                    ...event,
+                    agent: role,
+                    attempt: attemptNumber,
+                  });
+                } catch {
+                  // Progress logging is best effort; final request events remain authoritative.
+                }
+                return;
+              }
               providerRequests = Math.max(
                 providerRequests,
                 event.providerRequest,
@@ -839,6 +851,16 @@ export class WorkflowEngine {
                   abortSignalAborted: event.abortSignalAborted,
                   abortReason,
                 });
+            },
+            (update) => {
+              if (control.intention || control.settled) return;
+              this.emitAgentEvent({
+                type: "providerProgress",
+                role,
+                workflowId: s.id,
+                attempt: attemptNumber,
+                update,
+              });
             },
           ),
         );

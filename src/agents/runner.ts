@@ -53,6 +53,7 @@ import {
   resolveNetworkRetry,
   type NetworkRetryEvent,
   type ProviderRequestEvent,
+  type ProviderProgressUpdate,
 } from "./network-retry.ts";
 import {
   ActiveSessionRegistry,
@@ -83,6 +84,7 @@ export interface AgentRunner {
     providerEvent?: (
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
+    providerProgress?: (update: ProviderProgressUpdate) => void,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -100,6 +102,7 @@ export class PiRunner implements AgentRunner {
     providerEvent?: (
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
+    providerProgress?: (update: ProviderProgressUpdate) => void,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
       selected = config.agents[role];
@@ -131,16 +134,22 @@ export class PiRunner implements AgentRunner {
       getSignal,
       network,
       (event) =>
-        providerEvent?.({
-          ...event,
-          providerTimeouts: {
-            ...event.providerTimeouts,
-            httpIdleTimeoutMs: {
-              value: httpIdleTimeoutMs,
-              source: "pi-default",
-            },
-          },
-        }),
+        providerEvent?.(
+          event.type === "provider_progress"
+            ? event
+            : {
+                ...event,
+                providerTimeouts: {
+                  ...event.providerTimeouts,
+                  httpIdleTimeoutMs: {
+                    value: httpIdleTimeoutMs,
+                    source: "pi-default",
+                  },
+                },
+              },
+        ),
+      Date.now,
+      providerProgress,
     );
     const paths: string[] = [],
       factories: any[] = [];
@@ -285,6 +294,7 @@ export class PiRunner implements AgentRunner {
     providerEvent?: (
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
+    providerProgress?: (update: ProviderProgressUpdate) => void,
   ) {
     const evidence: CommandEvidence[] = [];
     let executionSignal: AbortSignal | undefined;
@@ -324,7 +334,11 @@ export class PiRunner implements AgentRunner {
       network,
       () => executionSignal,
       guardState,
-      (event) =>
+      (event) => {
+        if (event.type === "provider_progress") {
+          providerEvent?.(event);
+          return;
+        }
         providerEvent?.({
           ...event,
           abortSignalAborted: executionSignal?.aborted ?? false,
@@ -356,7 +370,9 @@ export class PiRunner implements AgentRunner {
             maxRetries: retryPolicy.maxRetries,
             waiting: false,
           },
-        }),
+        });
+      },
+      providerProgress,
     );
     entry.session = session;
     try {

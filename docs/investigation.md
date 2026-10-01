@@ -1,5 +1,54 @@
 # Investigation and implementation choices
 
+## Pi 0.99 provider streaming and live progress (2026-10-01)
+
+Inspected the installed `@earendil-works/pi-ai@0.99.0` declarations in
+`node_modules/@earendil-works/pi-ai/dist/types.d.ts` and the implementation in
+`dist/api/openai-completions.js`, plus Pi Team's `configureNetworkRetry` wrapper.
+The `AssistantMessageEvent` union emits `start`, `text_start`, `text_delta`,
+`text_end`, `thinking_start`, `thinking_delta`, `thinking_end`,
+`toolcall_start`, `toolcall_delta`, `toolcall_end`, `done`, and `error`.
+Each nonterminal event has a shared mutable `partial: AssistantMessage`;
+`done.message` and `error.error` are the settled messages. There is no
+normalized per-token usage event or output-token delta. `Usage.output` and
+optional `Usage.reasoning` are provider-reported values on the message, but
+the initial partial has zero usage and a provider may supply exact counts only
+near completion. Pi Team therefore shows no live token count or tokens per
+second and does not infer them from text or chunk sizes.
+
+`StreamOptions.onProviderStreamEvent(data, model)` observes parsed raw provider
+events only for adapters that explicitly support it. The local
+`openai-completions` adapter invokes it for every parsed chunk, including
+usage-only chunks. It maps `choice.delta.content` to `text_delta`,
+`choice.delta.tool_calls` to `toolcall_delta`, and the first nonempty of
+`reasoning_content`, `reasoning`, or `reasoning_text` to `thinking_delta`.
+For llama.cpp, separate `reasoning_content` therefore supports a safe
+`reasoning` activity indicator. Literal `<think>` tags inside ordinary
+`content` remain normal text and are not interpreted here. No raw reasoning
+text is copied into progress events or JSONL logs.
+
+Pi Team already wraps `ModelRuntime.streamSimple` to own network retries and
+observe each `AssistantMessageEvent`. It recorded request start, first
+normalized nonterminal event, last normalized activity, duration, provider,
+model, and retry number, but emitted no intermediate event. The wrapper also
+buffers the assistant stream until the attempt ends, so the session's normal
+assistant output and tool callbacks cannot reveal liveness during a long
+request. Live telemetry now updates a small per-request snapshot from Pi
+events and supported raw-chunk callbacks. The existing two-second UI heartbeat
+renders it without redrawing for each delta. One five-second timer per open
+request emits `provider_progress` JSONL snapshots after the first interval;
+short requests emit none. The event carries request identity, `elapsedMs`,
+optional `lastActivityMs`, state, and normalized `streamEventCount`. It never
+contains text or inferred token metrics. `provider_request_end` retains the
+authoritative duration and time-to-first-event values. The existing timeout
+and retry behavior is unchanged.
+
+Progress is live only and scoped by workflow runtime, agent role, attempt, and
+provider request number. It clears when the request ends, when a new attempt
+starts, and when the agent stops. Existing tool activity takes display priority
+over provider progress. The TUI marks a still-open request idle after 60 seconds
+without a provider event; that status does not abort the request.
+
 Inspected before changes on 2026-09-27:
 
 - macOS Darwin 24.4.0 on arm64; zsh; Node 24.16.0; npm 11.13.0.
