@@ -7,75 +7,89 @@ import {
   SettingsManager,
   SessionManager,
   ModelRuntime,
+  type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import YAML from "yaml";
 import { loadConfig, agentDir } from "../src/config/loader.ts";
 import { StateStore } from "../src/workflow/persistence.ts";
-import { repository } from "../tests/helpers.ts";
+import {
+  repository,
+  disposeSerenaTestRuntime,
+  isolateSerenaTestHome,
+} from "../tests/helpers.ts";
+import { packagePath } from "../src/integrations/resources.ts";
 const resume = process.argv[2];
 const cwd = resume ? realpathSync(resume) : realpathSync(await repository());
-const { config } = await loadConfig(process.cwd());
-config.commands = [
-  {
-    id: "test",
-    executable: process.execPath,
-    args: ["--test", "tests/math.test.mjs"],
-    purpose: "test",
-    timeoutMs: 120000,
-  },
-];
-// Enable the optional security gates in the live acceptance run.
-config.qualityGates.pentest.enabled = true;
-await mkdir(join(cwd, ".pi", "team"), { recursive: true });
-await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(config));
-const runtime = await ModelRuntime.create({
-  authPath: `${agentDir()}/auth.json`,
-  modelsPath: `${agentDir()}/models.json`,
-});
-const model = runtime.getModel(
-  config.agents.orchestrator.provider,
-  config.agents.orchestrator.model,
-);
-if (!model) throw new Error("Model missing");
-const settings = SettingsManager.inMemory({
-  packages: [],
-  extensions: [],
-  retry: { enabled: false },
-  cacheWarming: "off",
-});
-const loader = new DefaultResourceLoader({
-  cwd,
-  agentDir: agentDir(),
-  settingsManager: settings,
-  noExtensions: true,
-  noSkills: true,
-  noThemes: true,
-  noPromptTemplates: true,
-  additionalExtensionPaths: [join(process.cwd(), "src/index.ts")],
-});
-await loader.reload();
-if (loader.getExtensions().errors.length)
-  throw new Error(JSON.stringify(loader.getExtensions().errors));
-const { session } = await createAgentSession({
-  cwd,
-  modelRuntime: runtime,
-  model,
-  settingsManager: settings,
-  sessionManager: SessionManager.inMemory(cwd),
-  resourceLoader: loader,
-  tools: [],
-});
-await session.bindExtensions({
-  mode: "print",
-  uiContext: {
-    setWidget: (_key: string, lines: any) => {
-      if (Array.isArray(lines)) console.log(lines[0]);
-    },
-    setStatus: () => {},
-    notify: (message: string) => console.log(message),
-  } as any,
-});
+const serenaHome = resume ? undefined : await isolateSerenaTestHome();
+let session: AgentSession | undefined;
 try {
+  const { config } = await loadConfig(process.cwd());
+  config.commands = [
+    {
+      id: "test",
+      executable: process.execPath,
+      args: ["--test", "tests/math.test.mjs"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+  ];
+  // Enable the optional security gates in the live acceptance run.
+  config.qualityGates.pentest.enabled = true;
+  await mkdir(join(cwd, ".pi", "team"), { recursive: true });
+  await writeFile(
+    join(cwd, ".pi", "team", "team.yaml"),
+    YAML.stringify(config),
+  );
+  const runtime = await ModelRuntime.create({
+    authPath: `${agentDir()}/auth.json`,
+    modelsPath: `${agentDir()}/models.json`,
+  });
+  const model = runtime.getModel(
+    config.agents.orchestrator.provider,
+    config.agents.orchestrator.model,
+  );
+  if (!model) throw new Error("Model missing");
+  const settings = SettingsManager.inMemory({
+    packages: [],
+    extensions: [],
+    retry: { enabled: false },
+    cacheWarming: "off",
+  });
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir: agentDir(),
+    settingsManager: settings,
+    noExtensions: true,
+    noSkills: true,
+    noThemes: true,
+    noPromptTemplates: true,
+    additionalExtensionPaths: [
+      join(process.cwd(), "src/index.ts"),
+      packagePath("@bacnh85/pi-serena", "extensions/index.ts"),
+    ],
+  });
+  await loader.reload();
+  if (loader.getExtensions().errors.length)
+    throw new Error(JSON.stringify(loader.getExtensions().errors));
+  ({ session } = await createAgentSession({
+    cwd,
+    modelRuntime: runtime,
+    model,
+    settingsManager: settings,
+    sessionManager: SessionManager.inMemory(cwd),
+    resourceLoader: loader,
+    tools: [],
+  }));
+  await session.bindExtensions({
+    mode: "print",
+    uiContext: {
+      setWidget: (_key: string, lines: any) => {
+        if (Array.isArray(lines)) console.log(lines[0]);
+      },
+      setStatus: () => {},
+      notify: (message: string) => console.log(message),
+    } as any,
+  });
   console.log(`Live /team fixture: ${cwd}`);
   await session.prompt(
     resume
@@ -113,8 +127,20 @@ try {
   );
   if (state.phase !== "DONE") process.exitCode = 1;
 } finally {
-  await session.extensionRunner
-    .emit({ type: "session_shutdown", reason: "quit" })
-    .catch(() => {});
-  session.dispose();
+  try {
+    if (resume) {
+      try {
+        await session?.extensionRunner.emit({
+          type: "session_shutdown",
+          reason: "quit",
+        });
+      } finally {
+        session?.dispose();
+      }
+    } else {
+      await disposeSerenaTestRuntime(cwd, session);
+    }
+  } finally {
+    await serenaHome?.dispose();
+  }
 }

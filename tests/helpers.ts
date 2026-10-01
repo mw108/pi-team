@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import YAML from "yaml";
 import { initTeam } from "../src/config/init.ts";
@@ -10,6 +10,7 @@ import { git } from "../src/workflow/git.ts";
 import { execute } from "../src/agents/commands.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
 import type { AgentRunner } from "../src/agents/runner.ts";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { effectiveConfig } from "../src/agents/discovery.ts";
 export function config() {
   const defaults = YAML.parse(
@@ -170,6 +171,45 @@ export async function repository() {
     "test: fixture baseline",
   ]);
   return cwd;
+}
+
+/** Shut down Serena before Pi invalidates extension handlers or the project disappears. */
+export async function disposeSerenaTestRuntime(
+  cwd: string,
+  session?: Pick<AgentSession, "extensionRunner" | "dispose">,
+) {
+  try {
+    await session?.extensionRunner.emit({
+      type: "session_shutdown",
+      reason: "quit",
+    });
+  } finally {
+    try {
+      session?.dispose();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+}
+
+/** Keep temporary projects out of Serena's persistent user project registry. */
+export async function isolateSerenaTestHome() {
+  const home = await mkdtemp(join(tmpdir(), "pi-team-serena-home-"));
+  const priorHome = process.env.SERENA_HOME;
+  const priorDashboard = process.env.SERENA_BRIDGE_WEB_DASHBOARD;
+  process.env.SERENA_HOME = home;
+  process.env.SERENA_BRIDGE_WEB_DASHBOARD = "false";
+  return {
+    home,
+    async dispose() {
+      if (priorHome === undefined) delete process.env.SERENA_HOME;
+      else process.env.SERENA_HOME = priorHome;
+      if (priorDashboard === undefined)
+        delete process.env.SERENA_BRIDGE_WEB_DASHBOARD;
+      else process.env.SERENA_BRIDGE_WEB_DASHBOARD = priorDashboard;
+      await rm(home, { recursive: true, force: true });
+    },
+  };
 }
 export class FixtureRunner implements AgentRunner {
   calls: Role[] = [];

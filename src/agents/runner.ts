@@ -488,9 +488,8 @@ export class PiRunner implements AgentRunner {
       signal?.removeEventListener("abort", abort);
       registry?.remove(entry);
       await abortTask;
-      await session.extensionRunner
-        .emit({ type: "session_shutdown", reason: "quit" })
-        .catch(() => {});
+      // pi-serena shares one worker with the parent and sibling sessions. Pi
+      // child disposal does not emit session_shutdown; the parent owns shutdown.
       session.dispose();
     }
   }

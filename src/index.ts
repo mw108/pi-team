@@ -111,10 +111,12 @@ export default function teamExtension(pi: ExtensionAPI) {
       ctx.ui.notify(formatErrorForUser(error), "error");
     }
   });
-  pi.on("session_shutdown", () => {
-    active?.controller.abort();
-    active?.runtime.cancel();
-    active?.runtime.dispose();
+  pi.on("session_shutdown", async () => {
+    const stopping = active;
+    stopping?.controller.abort();
+    stopping?.runtime.cancel();
+    await stopping?.task;
+    stopping?.runtime.dispose();
   });
   pi.registerCommand("team-init", {
     description:
