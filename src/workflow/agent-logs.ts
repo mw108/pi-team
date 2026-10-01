@@ -9,24 +9,15 @@ import type { TeamConfig } from "../config/schema.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
+import { formatApprovedCommand } from "../ui/activity.ts";
+
+export { redactVisibleText } from "../agents/redaction.ts";
 
 export type LogEvent = {
   type: string;
   at?: string;
   [key: string]: unknown;
 };
-
-export function redactVisibleText(text: string) {
-  return text
-    .slice(0, 65536)
-    .replace(/\b(Bearer\s+)\S+/gi, "$1[REDACTED]")
-    .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, "[REDACTED]")
-    .replace(
-      /\b([A-Za-z_][A-Za-z0-9_]*(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)|API_KEY|TOKEN|SECRET|PASSWORD)\s*[:=]\s*\S+/gi,
-      "$1=[REDACTED]",
-    )
-    .replace(/\b(https?:\/\/[^\s?]+)\?\S+/gi, "$1?[REDACTED]");
-}
 
 export class AttemptLogger {
   private queue = Promise.resolve();
@@ -263,7 +254,9 @@ export class AgentLogStore {
                                 : event.type === "agent_retry_requested_by_user"
                                   ? `manual retry → attempt ${event.nextAttempt}`
                                   : event.type === "tool_start"
-                                    ? event.activity
+                                    ? event.tool === "team_command"
+                                      ? `team_command · ${formatApprovedCommand(event.summary) ?? event.activity}`
+                                      : event.activity
                                     : event.type === "network_error"
                                       ? "network connection lost"
                                       : event.type === "network_retry_scheduled"

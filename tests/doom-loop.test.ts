@@ -238,6 +238,25 @@ test("identical validation calls without repository progress still trigger", asy
   }
 });
 
+test("different approved command IDs with the same rendered command stay distinct", () => {
+  const detector = new DoomLoopDetector(options());
+  assert.notEqual(
+    toolSignature("team_command", { id: "detected-a" }),
+    toolSignature("team_command", { id: "detected-b" }),
+  );
+  for (const id of ["detected-a", "detected-b", "detected-a", "detected-b"])
+    assert.equal(detector.observe("team_command", { id }), undefined);
+  const repeated = new DoomLoopDetector(options());
+  for (const id of ["detected-a", "detected-a", "detected-a"])
+    assert.equal(repeated.observe("team_command", { id }), undefined);
+  assert.deepEqual(repeated.observe("team_command", { id: "detected-a" }), {
+    patternType: "identical",
+    tool: "team_command",
+    repeatCount: 4,
+    progressEpoch: 0,
+  });
+});
+
 test("failed writes do not break repeated validation calls", async () => {
   const run = guardHarness();
   for (let i = 0; i < 4; i++) {

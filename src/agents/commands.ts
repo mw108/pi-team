@@ -86,17 +86,7 @@ export function commandTool(
   cwd: string,
   evidence: CommandEvidence[],
 ): ToolDefinition {
-  const purposes =
-    role === "implementor"
-      ? ["development", "test", "static"]
-      : role === "tester"
-        ? ["test", "static"]
-        : role === "codeReviewer"
-          ? ["static"]
-          : role === "pentester"
-            ? ["pentest"]
-            : [];
-  const allowed = config.commands.filter((c) => purposes.includes(c.purpose));
+  const allowed = approvedCommandsForRole(role, config);
   return {
     name: "team_command",
     label: "Approved project command",
@@ -115,5 +105,20 @@ export function commandTool(
       };
     },
   };
+}
+
+/** Same role allowlist used by execution and observational logging. */
+export function approvedCommandsForRole(role: Role, config: TeamConfig) {
+  const purposes =
+    role === "implementor"
+      ? ["development", "test", "static"]
+      : role === "tester"
+        ? ["test", "static"]
+        : role === "codeReviewer"
+          ? ["static"]
+          : role === "pentester"
+            ? ["pentest"]
+            : [];
+  return config.commands.filter((c) => purposes.includes(c.purpose));
 }
 export { localHttpTool } from "./http.ts";

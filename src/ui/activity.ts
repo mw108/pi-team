@@ -1,4 +1,5 @@
 import type { TeamConfig } from "../config/schema.ts";
+import type { CommandSummary } from "../agents/command-observability.ts";
 
 export type ToolActivityKind =
   | "serena-symbols"
@@ -99,9 +100,34 @@ export function formatToolActivity(
   name: string,
   config?: TeamConfig,
   innerToolName?: string,
+  command?: CommandSummary,
 ): string {
+  if (name === "team_command" && command?.executable)
+    return formatApprovedCommand(command)!;
   const activity = classifyToolActivity(name, config, innerToolName);
   return `${activity.label}${config?.ui.progress.showToolProvider && activity.provider && activity.label !== activity.provider ? ` · ${activity.provider}` : ""}`;
+}
+
+/** Shared, bounded label for live progress and /team-log. */
+export function formatApprovedCommand(summary: unknown): string | undefined {
+  if (!summary || typeof summary !== "object") return;
+  const command = summary as Partial<CommandSummary>;
+  if (typeof command.executable !== "string" || !command.executable) return;
+  const labels: Record<string, string> = {
+    test: "Test",
+    build: "Build",
+    static: "Static check",
+    lint: "Lint",
+  };
+  const label = labels[command.purpose ?? ""] ?? "Command";
+  const args = Array.isArray(command.args)
+    ? command.args.filter((arg): arg is string => typeof arg === "string")
+    : [];
+  const value = [command.executable, ...args]
+    .map((part) => (/[\s"']/.test(part) ? JSON.stringify(part) : part))
+    .join(" ");
+  const full = `${label}: ${value}`;
+  return full.length > 76 ? `${full.slice(0, 75)}…` : full;
 }
 
 export function validationActivity(purpose: string): string {

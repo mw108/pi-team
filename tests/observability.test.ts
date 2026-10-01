@@ -24,6 +24,8 @@ import {
 } from "../src/agents/runner.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { AgentLogStore } from "../src/workflow/agent-logs.ts";
+import { commandTool } from "../src/agents/commands.ts";
+import { effectiveConfig } from "../src/agents/discovery.ts";
 import {
   classifyToolActivity,
   formatToolActivity,
@@ -581,6 +583,128 @@ test("JSONL tool starts contain only sanitized summaries", async () => {
   assert.doesNotMatch(
     JSON.stringify(starts),
     /TOP_SECRET|authorization|Users\//,
+  );
+});
+
+test("team_command JSONL and /team-log use only resolved approved metadata", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.commands = [];
+  const approvedCommands = [
+    {
+      id: "detected-e3bc24c70676",
+      executable: "vendor/bin/phpunit",
+      args: [],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+    {
+      id: "detected-abc",
+      executable: "php",
+      args: ["artisan", "test", "--filter=test_register_with_valid_data"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+    {
+      id: "detected-secret",
+      executable: "php",
+      args: ["artisan", "test", "--token", "super-secret-value"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+  ] as const;
+  class CommandFixture extends FixtureRunner {
+    override async run(
+      role: Role,
+      state: WorkflowState,
+      _signal?: AbortSignal,
+      activity?: ActivityObserver,
+    ) {
+      for (const id of [
+        "detected-e3bc24c70676",
+        "detected-abc",
+        "detected-secret",
+        "detected-unknown",
+      ]) {
+        activity?.("team_command", id, undefined, undefined, {
+          id,
+          executable: "untrusted-shell",
+          args: ["TOP_SECRET"],
+          purpose: "development",
+        });
+        activity?.(undefined, id, undefined, id !== "detected-unknown");
+      }
+      return output(role);
+    }
+  }
+  const engine = new WorkflowEngine(cwd, new CommandFixture(), ui);
+  const state = await engine.start("Fix", cfg);
+  state.approvedCommands = approvedCommands.map((command) => ({
+    ...command,
+    args: [...command.args],
+  }));
+  state.discoveredCommands = state.approvedCommands.map((command) => ({
+    command,
+    source: "test fixture",
+    category: "test",
+    confidence: "high",
+  }));
+  state.commandApprovalComplete = true;
+  await engine.store.save(state);
+  await engine.invoke("implementor", state);
+  const logs = new AgentLogStore(cwd);
+  const starts = (await logs.read(state.id, "implementor", 1)).filter(
+    (event) => event.type === "tool_start",
+  );
+  assert.deepEqual(
+    starts.map((event) => event.summary),
+    [
+      {
+        command: "detected-e3bc24c70676",
+        commandId: "detected-e3bc24c70676",
+        executable: "vendor/bin/phpunit",
+        args: [],
+        purpose: "test",
+      },
+      {
+        command: "detected-abc",
+        commandId: "detected-abc",
+        executable: "php",
+        args: ["artisan", "test", "--filter=test_register_with_valid_data"],
+        purpose: "test",
+      },
+      {
+        command: "detected-secret",
+        commandId: "detected-secret",
+        executable: "php",
+        args: ["artisan", "test", "--token", "[REDACTED]"],
+        purpose: "test",
+      },
+      { command: "detected-unknown", commandId: "detected-unknown" },
+    ],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(starts),
+    /untrusted-shell|TOP_SECRET|super-secret-value/,
+  );
+  assert.match(
+    await logs.timeline(state.id, "implementor", 1),
+    /team_command · Test: vendor\/bin\/phpunit/,
+  );
+  assert.doesNotMatch(
+    await logs.timeline(state.id, "implementor", 1),
+    /super-secret-value/,
+  );
+  await assert.rejects(
+    () =>
+      commandTool("implementor", effectiveConfig(state), cwd, []).execute(
+        "unknown",
+        { id: "detected-unknown" },
+        undefined,
+        undefined,
+        {} as any,
+      ),
+    /not approved/,
   );
 });
 

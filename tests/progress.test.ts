@@ -424,6 +424,51 @@ test("tool labels are safe and clear only when the matching call ends", () => {
   runtime.dispose();
 });
 
+test("live approved-command activity shows a bounded resolved label", () => {
+  const s = state();
+  const runtime = new ProgressRuntime(
+    () => {},
+    2000,
+    () => 0,
+    false,
+  );
+  runtime.bind(s);
+  runtime.event({ type: "start", role: "implementor" });
+  runtime.event({
+    type: "activity",
+    role: "implementor",
+    toolName: "team_command",
+    toolCallId: "approved-1",
+    command: {
+      command: "detected-e3bc24c70676",
+      commandId: "detected-e3bc24c70676",
+      executable: "vendor/bin/phpunit",
+      args: [],
+      purpose: "test",
+    },
+  });
+  assert.match(lines(s, runtime), /↳ Test: vendor\/bin\/phpunit/);
+  runtime.event({
+    type: "activity",
+    role: "implementor",
+    toolName: "team_command",
+    toolCallId: "approved-2",
+    command: {
+      command: "detected-long",
+      commandId: "detected-long",
+      executable: "php",
+      args: ["artisan", "test", "--filter=" + "x".repeat(120)],
+      purpose: "test",
+    },
+  });
+  const activity = lines(s, runtime)
+    .split("\n")
+    .find((line) => line.includes("↳ Test:"))!;
+  assert.ok(activity.endsWith("…"));
+  assert.ok(activity.length <= 80);
+  runtime.dispose();
+});
+
 test("waiting for pi-ask replaces working state and restart never fabricates live timing", () => {
   const s = state(),
     runtime = new ProgressRuntime(

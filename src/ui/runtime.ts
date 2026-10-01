@@ -1,6 +1,7 @@
 import type { Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { formatToolActivity } from "./activity.ts";
+import type { CommandSummary } from "../agents/command-observability.ts";
 import type { GuardEvent } from "../agents/runner.ts";
 import type { ContextUsage } from "@earendil-works/pi-coding-agent";
 import type { ActiveSessionRegistry } from "../agents/active-sessions.ts";
@@ -77,6 +78,7 @@ export type AgentEvent =
       toolName: string;
       toolCallId?: string;
       innerToolName?: string;
+      command?: CommandSummary;
     }
   | { type: "activityEnd"; role: Role; toolCallId?: string }
   | { type: "guard"; role: Role; event: GuardEvent };
@@ -262,6 +264,7 @@ export class ProgressRuntime {
         event.toolName,
         this.state?.config,
         event.innerToolName,
+        event.command,
       );
       existing.toolCallId = event.toolCallId;
     } else if (

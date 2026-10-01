@@ -59,6 +59,8 @@ import {
 } from "../config/drift.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 import { toolCallSummary } from "../agents/tool-summary.ts";
+import { commandSummary } from "../agents/command-observability.ts";
+import { approvedCommandsForRole } from "../agents/commands.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -640,6 +642,7 @@ export class WorkflowEngine {
             control.controller.signal,
             (toolName, toolCallId, innerToolName, success, input) => {
               const key = toolCallId ?? "single";
+              let command: ReturnType<typeof commandSummary> | undefined;
               if (toolName) {
                 const activity = classifyToolActivity(
                   toolName,
@@ -656,7 +659,21 @@ export class WorkflowEngine {
                     : "unknown_tool",
                   started: Date.now(),
                 });
-                const summary = toolCallSummary(rawName, input, s.cwd);
+                const inputSummary = toolCallSummary(rawName, input, s.cwd);
+                const commandId =
+                  rawName === "team_command" &&
+                  typeof inputSummary?.command === "string"
+                    ? inputSummary.command
+                    : undefined;
+                command = commandId
+                  ? commandSummary(
+                      commandId,
+                      approvedCommandsForRole(role, effectiveConfig(s)).find(
+                        (approved) => approved.id === commandId,
+                      ),
+                    )
+                  : undefined;
+                const summary = command ?? inputSummary;
                 logged?.logger.append({
                   type: "tool_start",
                   tool: calls.get(key)!.name,
@@ -684,6 +701,7 @@ export class WorkflowEngine {
                       toolName,
                       toolCallId,
                       innerToolName,
+                      ...(command ? { command } : {}),
                     }
                   : { type: "activityEnd", role, toolCallId },
               );
