@@ -3,6 +3,16 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TeamConfig, Command } from "../config/schema.ts";
 import type { Role } from "./schemas.ts";
+import { commandKey } from "./discovery.ts";
+import {
+  normalizedRuntimeCommand,
+  type RuntimeCommandRequest,
+} from "./runtime-commands.ts";
+export type RuntimeCommandApprover = (
+  command: Command,
+  request: RuntimeCommandRequest,
+  signal?: AbortSignal,
+) => Promise<"allow" | "deny" | "pending">;
 export interface CommandEvidence {
   id: string;
   exitCode: number;
@@ -85,18 +95,68 @@ export function commandTool(
   config: TeamConfig,
   cwd: string,
   evidence: CommandEvidence[],
+  runtimeApproval?: RuntimeCommandApprover,
+  currentCommands?: () => Command[],
 ): ToolDefinition {
   const allowed = approvedCommandsForRole(role, config);
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute an explicitly configured argv command. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
-    parameters: Type.Object({ id: Type.String() }),
+    description: `Execute an approved argv command by ID, or request a new structured argv command for user approval. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    parameters: Type.Union([
+      Type.Object({ id: Type.String() }),
+      Type.Object({
+        executable: Type.String(),
+        args: Type.Array(Type.String()),
+        purpose: Type.String(),
+        category: Type.Optional(
+          Type.Union([
+            Type.Literal("development"),
+            Type.Literal("test"),
+            Type.Literal("static"),
+            Type.Literal("pentest"),
+          ]),
+        ),
+      }),
+    ]),
     async execute(_id, params, signal) {
-      const command = allowed.find(
-        (c) => c.id === (params as { id: string }).id,
-      );
-      if (!command) throw new Error("Command not approved for this role");
+      const approvedNow = currentCommands?.() ?? allowed;
+      let command: Command | undefined;
+      if ("id" in (params as object)) {
+        command = approvedNow.find(
+          (c) => c.id === (params as { id: string }).id,
+        );
+        if (!command) throw new Error("Command not approved for this role");
+      } else {
+        const normalized = normalizedRuntimeCommand(params, role);
+        command = approvedNow.find(
+          (c) => commandKey(c) === commandKey(normalized.command),
+        );
+        if (!command) {
+          if (!runtimeApproval)
+            throw new Error("Runtime command approval is unavailable");
+          const decision = await runtimeApproval(
+            normalized.command,
+            normalized.request,
+            signal,
+          );
+          if (decision !== "allow" || signal?.aborted) {
+            const denied = {
+              status: decision === "deny" ? "denied" : "pending",
+              code:
+                decision === "deny"
+                  ? "COMMAND_APPROVAL_DENIED"
+                  : "COMMAND_APPROVAL_PENDING",
+              commandId: normalized.command.id,
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(denied) }],
+              details: denied,
+            };
+          }
+          command = normalized.command;
+        }
+      }
       const result = await execute(command, cwd, signal);
       evidence.push(result);
       return {

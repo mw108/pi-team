@@ -5,6 +5,7 @@ import type { AgentProgress, ProgressRuntime } from "./runtime.ts";
 import { getAgentDisplayName } from "./agent-name.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
+import { formatCommandLine } from "../agents/command-observability.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -81,6 +82,12 @@ export function deriveAgentProgressState(
     !!state.results[role] &&
     (invalidation < 0 || completion > invalidation) &&
     (latestStart < 0 || completion >= latestStart);
+  if (state.pendingRuntimeCommands?.some((request) => request.agentId === role))
+    return {
+      status: "waiting",
+      attempt: live?.attempt ?? latest?.meta?.attempt,
+      detail: "waiting for command approval",
+    };
   if (
     role === "researcher" &&
     state.pendingResearchQuestions?.length &&
@@ -344,6 +351,10 @@ export function renderProgress(
     `Team ${state.id.slice(0, 8)} · ${phase} · Design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`,
   ];
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
+  for (const request of state.pendingRuntimeCommands ?? [])
+    lines.push(
+      `◉ ${getAgentDisplayName(state.config, request.agentId)} · command approval required\n  ↳ ${formatCommandLine(request.command)}`,
+    );
   if (state.pendingResearchQuestions?.length)
     lines.push(
       `Pending research questions: ${state.pendingResearchQuestions.length}`,

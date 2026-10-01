@@ -44,11 +44,14 @@ export async function getWorkflowRecoveryPlan(
   if (
     state.phase === "WAITING_USER" ||
     state.pendingQuestion ||
-    state.pendingApproval
+    state.pendingApproval ||
+    state.pendingRuntimeCommands?.length
   )
     return {
       kind: "waiting-user",
-      reason: "Workflow is waiting for user input.",
+      reason: state.pendingRuntimeCommands?.length
+        ? "Waiting for command approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
+        : "Workflow is waiting for user input.",
     };
   if (state.phase === "DONE")
     return { kind: "none", reason: "Workflow is already DONE." };
@@ -76,6 +79,23 @@ export async function getWorkflowRecoveryPlan(
   const drift = analyzeConfigDrift(state, current);
   if (drift.blocking)
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
+  if (state.blocker?.startsWith("Command approval pending for ")) {
+    const role = state.blocker
+      .slice("Command approval pending for ".length)
+      .split(/[;,]/, 1)[0] as Role;
+    if (
+      getPhaseRoles(
+        state,
+        state.history.findLast((event) => event.event === "blocked")?.phase ??
+          state.phase,
+      )?.includes(role)
+    )
+      return {
+        kind: "retry-agent",
+        agentId: role,
+        reason: `Command approval was reviewed after ${role} run ended. Inspect repository effects, then retry ${role}.`,
+      };
+  }
   const limitActive = isLimitBlockerStillActive(state, current.config);
   if (limitActive) return unsafe(state.blocker!);
   const staleLimit = limitActive === false;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { TeamConfig } from "../config/schema.ts";
 import { serenaRead, serenaWrite } from "./permissions.ts";
 import type { Role } from "./schemas.ts";
+import { detectedCommandId } from "./discovery.ts";
 
 export const DEFAULT_DOOM_LOOP_STEER = `You are repeating observational search/read operations without progress. Stop broad exploration. Summarize established facts, identify the next concrete action, and make the required change or finish with a structured result.
 
@@ -50,7 +51,21 @@ export function toolSignature(tool: string, input: unknown) {
       ? (input as Record<string, unknown>)
       : {};
   let relevant: unknown = args;
-  if (/^(read|serena_read_file)$/i.test(tool))
+  if (tool === "team_command")
+    relevant =
+      typeof args.id === "string"
+        ? { id: args.id }
+        : typeof args.executable === "string" &&
+            Array.isArray(args.args) &&
+            args.args.every((arg) => typeof arg === "string")
+          ? {
+              id: detectedCommandId({
+                executable: args.executable,
+                args: args.args,
+              }),
+            }
+          : args;
+  else if (/^(read|serena_read_file)$/i.test(tool))
     relevant = {
       path: args.path ?? args.relative_path ?? args.file_path,
       offset: args.offset ?? args.start_line,

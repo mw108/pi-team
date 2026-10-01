@@ -7,6 +7,8 @@ import {
   type TeamConfig,
 } from "../config/schema.ts";
 import { assertRelative } from "../agents/permissions.ts";
+import { detectedCommandId } from "../agents/discovery.ts";
+import { similarCommandRuleSchema } from "../agents/runtime-commands.ts";
 import { posix } from "node:path";
 const exactPath = z.string().superRefine((path, ctx) => {
   try {
@@ -33,6 +35,7 @@ export const approvalSchema = z.object({
     "manualCommit",
     "configDrift",
     "manualRetry",
+    "runtimeCommand",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -160,6 +163,22 @@ export const stateSchema = z.object({
   ),
   discoveredCommands: z.array(discoveredCommandSchema).default([]),
   approvedCommands: z.array(commandSchema).default([]),
+  runtimeApprovedCommandIds: z.array(z.string()).default([]),
+  similarCommandRules: z.array(similarCommandRuleSchema).default([]),
+  pendingRuntimeCommands: z
+    .array(
+      z
+        .object({
+          workflowId: z.string().uuid(),
+          agentId: z.enum(roles),
+          run: z.number().int().positive(),
+          requestId: z.string().uuid(),
+          command: commandSchema,
+          purpose: z.string().max(500),
+        })
+        .strict(),
+    )
+    .default([]),
   commandApprovalComplete: z.boolean().default(false),
   approvedDirtyPaths: z.array(exactPath).default([]),
   pendingApproval: approvalSchema.optional(),
@@ -236,11 +255,27 @@ export function validateState(value: unknown): WorkflowState {
   const state = stateSchema.parse(migrateState(value));
   for (const command of state.approvedCommands)
     if (
+      !state.runtimeApprovedCommandIds.includes(command.id) &&
       !state.discoveredCommands.some(
         (c) => JSON.stringify(c.command) === JSON.stringify(command),
       )
     )
       throw new Error("Approved command is not an exact discovered command");
+  for (const id of state.runtimeApprovedCommandIds)
+    if (
+      !state.approvedCommands.some(
+        (command) => command.id === id && detectedCommandId(command) === id,
+      )
+    )
+      throw new Error(
+        "Runtime command approval has no matching deterministic command",
+      );
+  for (const pending of state.pendingRuntimeCommands)
+    if (
+      pending.workflowId !== state.id ||
+      pending.command.id !== detectedCommandId(pending.command)
+    )
+      throw new Error("Pending command approval identity mismatch");
   for (const path of state.approvedDirtyPaths)
     if (!state.baseline.dirtyPaths.includes(path))
       throw new Error("Approved dirty path is not in the baseline");
@@ -275,6 +310,9 @@ export function newState(
     answers: [],
     discoveredCommands: [],
     approvedCommands: [],
+    runtimeApprovedCommandIds: [],
+    similarCommandRules: [],
+    pendingRuntimeCommands: [],
     approvedDirtyPaths: [],
     commandApprovalComplete: false,
   };

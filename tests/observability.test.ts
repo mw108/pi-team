@@ -612,6 +612,13 @@ test("team_command JSONL and /team-log use only resolved approved metadata", asy
       purpose: "test",
       timeoutMs: 120000,
     },
+    {
+      id: "detected-inline-secret",
+      executable: "php",
+      args: ["artisan", "test", "--api-key=super-secret-value"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
   ] as const;
   class CommandFixture extends FixtureRunner {
     override async run(
@@ -624,6 +631,7 @@ test("team_command JSONL and /team-log use only resolved approved metadata", asy
         "detected-e3bc24c70676",
         "detected-abc",
         "detected-secret",
+        "detected-inline-secret",
         "detected-unknown",
       ]) {
         activity?.("team_command", id, undefined, undefined, {
@@ -678,6 +686,13 @@ test("team_command JSONL and /team-log use only resolved approved metadata", asy
         commandId: "detected-secret",
         executable: "php",
         args: ["artisan", "test", "--token", "[REDACTED]"],
+        purpose: "test",
+      },
+      {
+        command: "detected-inline-secret",
+        commandId: "detected-inline-secret",
+        executable: "php",
+        args: ["artisan", "test", "--api-key=[REDACTED]"],
         purpose: "test",
       },
       { command: "detected-unknown", commandId: "detected-unknown" },

@@ -45,6 +45,8 @@ async function completionText(state: WorkflowState) {
 }
 async function finalText(state: WorkflowState) {
   if (state.phase === "DONE") return completionText(state);
+  if (state.pendingRuntimeCommands?.length)
+    return `Waiting for command approval (${state.pendingRuntimeCommands.length} request${state.pendingRuntimeCommands.length === 1 ? "" : "s"}). Run /team resume ${state.id} to review.`;
   if (state.phase === "BLOCKED")
     return renderBlocked(
       state,

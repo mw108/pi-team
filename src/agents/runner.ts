@@ -20,6 +20,8 @@ import {
   execute,
   localHttpTool,
   type CommandEvidence,
+  type RuntimeCommandApprover,
+  approvedCommandsForRole,
 } from "./commands.ts";
 import { deleteTool } from "./files.ts";
 import { gitInspectTool } from "../workflow/git.ts";
@@ -85,6 +87,7 @@ export interface AgentRunner {
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
     providerProgress?: (update: ProviderProgressUpdate) => void,
+    runtimeApproval?: RuntimeCommandApprover,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -103,6 +106,7 @@ export class PiRunner implements AgentRunner {
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
     providerProgress?: (update: ProviderProgressUpdate) => void,
+    runtimeApproval?: RuntimeCommandApprover,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
       selected = config.agents[role];
@@ -267,7 +271,9 @@ export class PiRunner implements AgentRunner {
         role === "reporter"
           ? []
           : [
-              commandTool(role, config, s.cwd, evidence),
+              commandTool(role, config, s.cwd, evidence, runtimeApproval, () =>
+                approvedCommandsForRole(role, effectiveConfig(s)),
+              ),
               gitInspectTool(s.cwd),
               localHttpTool(config),
               deleteTool(
@@ -295,6 +301,7 @@ export class PiRunner implements AgentRunner {
       event: ProviderRequestEvent & Record<string, unknown>,
     ) => void,
     providerProgress?: (update: ProviderProgressUpdate) => void,
+    runtimeApproval?: RuntimeCommandApprover,
   ) {
     const evidence: CommandEvidence[] = [];
     let executionSignal: AbortSignal | undefined;
@@ -373,6 +380,7 @@ export class PiRunner implements AgentRunner {
         });
       },
       providerProgress,
+      runtimeApproval,
     );
     entry.session = session;
     try {

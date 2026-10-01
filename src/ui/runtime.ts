@@ -93,6 +93,7 @@ export type AgentEvent =
       command?: CommandSummary;
     }
   | { type: "activityEnd"; role: Role; toolCallId?: string }
+  | { type: "commandApproved"; role: Role; command: CommandSummary }
   | { type: "guard"; role: Role; event: GuardEvent };
 
 function interval(callback: () => void, ms: number) {
@@ -290,6 +291,16 @@ export class ProgressRuntime {
       existing.networkRetry.retryAt = undefined;
     } else if (event.type === "networkClear" && existing) {
       existing.networkRetry = undefined;
+    } else if (
+      event.type === "commandApproved" &&
+      existing?.status === "running"
+    ) {
+      existing.activity = formatToolActivity(
+        "team_command",
+        this.state?.config,
+        undefined,
+        event.command,
+      );
     } else if (event.type === "activity" && existing?.status === "running") {
       existing.toolCalls = (existing.toolCalls ?? 0) + 1;
       if (!existing.toolsDisabledForFinalization)

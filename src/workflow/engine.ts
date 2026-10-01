@@ -1,4 +1,5 @@
 import { appendFile, readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { projectRootSync } from "../config/project.ts";
 import {
@@ -23,7 +24,13 @@ import {
   commandKey,
   effectiveConfig,
 } from "../agents/discovery.ts";
-import type { TeamConfig } from "../config/schema.ts";
+import type { TeamConfig, Command } from "../config/schema.ts";
+import {
+  normalizedRuntimeCommand,
+  proposeSimilarRule,
+  ruleMatches,
+  type RuntimeCommandRequest,
+} from "../agents/runtime-commands.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { StateStore } from "./persistence.ts";
 import {
@@ -59,7 +66,10 @@ import {
 } from "../config/drift.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 import { toolCallSummary } from "../agents/tool-summary.ts";
-import { commandSummary } from "../agents/command-observability.ts";
+import {
+  commandSummary,
+  formatCommandLine,
+} from "../agents/command-observability.ts";
 import { approvedCommandsForRole } from "../agents/commands.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
@@ -125,6 +135,243 @@ export class WorkflowEngine {
   private runningWorkflowId?: string;
   private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
+  private commandApprovalQueue = Promise.resolve();
+  private runtimeApprovalPrompt(
+    s: WorkflowState,
+    role: Role,
+    command: Command,
+    purpose: string,
+  ): ApprovalRequest {
+    const rule = proposeSimilarRule(command);
+    const line = formatCommandLine(command);
+    const label = getAgentDisplayName(s.config, role);
+    const ruleLine = rule
+      ? [rule.executable, ...rule.argsPrefix, "*"].join(" ")
+      : "";
+    const examples = rule
+      ? [
+          [rule.executable, ...rule.argsPrefix].join(" "),
+          [rule.executable, ...rule.argsPrefix, "--filter=OtherTest"].join(" "),
+          [
+            rule.executable,
+            ...rule.argsPrefix,
+            "tests/Feature/AuthTest.php",
+          ].join(" "),
+        ].join("\n")
+      : "";
+    return {
+      kind: "runtimeCommand",
+      title: `${label} requests command approval`,
+      prompt: `${label} wants to run:\n${line}\n\nPurpose:\n${redactVisibleText(purpose)}${rule ? `\n\nAllow similar rule: ${ruleLine}\nThis would also allow:\n${examples}\nIt would NOT allow:\nphp artisan migrate:fresh` : ""}`,
+      options: [
+        {
+          value: "allow_once",
+          label: "Allow once",
+          description: "Execute this exact command one time",
+        },
+        {
+          value: "allow_workflow",
+          label: "Allow for workflow",
+          description: "Approve this exact argv for this workflow",
+        },
+        ...(rule
+          ? [
+              {
+                value: "allow_similar",
+                label: "Allow similar",
+                description: `Approve the displayed prefix rule: ${ruleLine}`,
+              },
+            ]
+          : []),
+        {
+          value: "deny",
+          label: "Deny",
+          description: "Do not execute this command",
+        },
+      ],
+    };
+  }
+  private saveRuntimeApproval(
+    s: WorkflowState,
+    command: Command,
+    choice: string,
+  ) {
+    if (choice === "allow_workflow" || choice === "allow_similar") {
+      if (
+        !s.approvedCommands.some(
+          (item) => commandKey(item) === commandKey(command),
+        )
+      )
+        s.approvedCommands.push(command);
+      if (!s.runtimeApprovedCommandIds.includes(command.id))
+        s.runtimeApprovedCommandIds.push(command.id);
+      const rule =
+        choice === "allow_similar" ? proposeSimilarRule(command) : undefined;
+      if (
+        rule &&
+        !s.similarCommandRules.some(
+          (item) => JSON.stringify(item) === JSON.stringify(rule),
+        )
+      )
+        s.similarCommandRules.push(rule);
+    }
+  }
+  private async runtimeCommandApproval(
+    s: WorkflowState,
+    agentState: WorkflowState,
+    role: Role,
+    control: AttemptControl,
+    command: Command,
+    request: RuntimeCommandRequest,
+    signal: AbortSignal | undefined,
+    log: (event: { type: string; [key: string]: unknown }) => void,
+  ): Promise<"allow" | "deny" | "pending"> {
+    const current = () =>
+      control.workflowId === s.id &&
+      this.activeAttempts.get(role) === control &&
+      !control.intention &&
+      !control.settled &&
+      !signal?.aborted;
+    if (!current()) return "pending";
+    const approved = () =>
+      approvedCommandsForRole(role, effectiveConfig(s)).some(
+        (item) => commandKey(item) === commandKey(command),
+      ) || s.similarCommandRules.some((rule) => ruleMatches(rule, command));
+    if (approved()) {
+      agentState.approvedCommands = structuredClone(s.approvedCommands);
+      agentState.similarCommandRules = structuredClone(s.similarCommandRules);
+      this.emitAgentEvent({
+        type: "commandApproved",
+        role,
+        command: commandSummary(command.id, command),
+      });
+      return "allow";
+    }
+    const pending = {
+      workflowId: s.id,
+      agentId: role,
+      run: control.attempt,
+      requestId: randomUUID(),
+      command,
+      purpose: request.purpose,
+    };
+    s.pendingRuntimeCommands.push(pending);
+    const safe = commandSummary(command.id, command);
+    log({
+      type: "command_approval_requested",
+      agent: role,
+      run: control.attempt,
+      requestId: pending.requestId,
+      ...safe,
+      purpose: redactVisibleText(request.purpose),
+    });
+    await this.persistAttempt(
+      s,
+      "command_approval_requested",
+      `${role} requested ${command.id}`,
+      { agent: role, attempt: control.attempt },
+    );
+    this.ui.progress(s);
+    const decide = async (): Promise<"allow" | "deny" | "pending"> => {
+      if (!current()) return "pending";
+      if (approved()) {
+        s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
+          (item) => item.requestId !== pending.requestId,
+        );
+        await this.store.save(s);
+        agentState.approvedCommands = structuredClone(s.approvedCommands);
+        agentState.similarCommandRules = structuredClone(s.similarCommandRules);
+        this.emitAgentEvent({
+          type: "commandApproved",
+          role,
+          command: commandSummary(command.id, command),
+        });
+        return "allow";
+      }
+      const approval = this.runtimeApprovalPrompt(
+        s,
+        role,
+        command,
+        request.purpose,
+      );
+      const aborted = new Promise<undefined>((resolve) => {
+        if (signal?.aborted) resolve(undefined);
+        else
+          signal?.addEventListener("abort", () => resolve(undefined), {
+            once: true,
+          });
+      });
+      const selected = await Promise.race([
+        this.ui.approve?.(approval) ?? Promise.resolve(undefined),
+        aborted,
+      ]);
+      if (
+        !current() ||
+        !s.pendingRuntimeCommands.some(
+          (item) =>
+            item.requestId === pending.requestId &&
+            item.workflowId === s.id &&
+            item.agentId === role &&
+            item.run === control.attempt,
+        )
+      )
+        return "pending";
+      const choice = selected?.length === 1 ? selected[0] : undefined;
+      if (!choice) return "pending";
+      if (
+        !["allow_once", "allow_workflow", "allow_similar", "deny"].includes(
+          choice,
+        ) ||
+        (choice === "allow_similar" && !proposeSimilarRule(command))
+      )
+        return "pending";
+      this.saveRuntimeApproval(s, command, choice);
+      agentState.approvedCommands = structuredClone(s.approvedCommands);
+      agentState.similarCommandRules = structuredClone(s.similarCommandRules);
+      s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
+        (item) => item.requestId !== pending.requestId,
+      );
+      log({
+        type: "command_approval_decided",
+        agent: role,
+        run: control.attempt,
+        requestId: pending.requestId,
+        decision: choice,
+        ...(choice === "allow_similar"
+          ? { rule: proposeSimilarRule(command) }
+          : {}),
+      });
+      await this.persistAttempt(
+        s,
+        "command_approval_decided",
+        `${role} ${choice} ${command.id}`,
+        { agent: role, attempt: control.attempt },
+      );
+      if (choice !== "deny")
+        this.emitAgentEvent({
+          type: "commandApproved",
+          role,
+          command: commandSummary(command.id, command),
+        });
+      this.ui.progress(s);
+      return choice === "deny" ? "deny" : "allow";
+    };
+    const turn = this.commandApprovalQueue.then(decide);
+    this.commandApprovalQueue = turn.then(
+      () => {},
+      () => {},
+    );
+    try {
+      return await turn;
+    } finally {
+      if (!current()) {
+        s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
+          (item) => item.requestId !== pending.requestId,
+        );
+        await this.store.save(s);
+      }
+    }
+  }
   private async persistAttempt(
     state: WorkflowState,
     event: string,
@@ -378,6 +625,13 @@ export class WorkflowEngine {
         if (failure?.detail.startsWith(`${role}:`))
           state.agentFailures = Math.max(0, state.agentFailures - 1);
         else if (!state.blocker.includes(`Agent ${role} aborted by user`))
+          throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
+      } else if (state.blocker?.startsWith("Command approval pending for ")) {
+        const waiting = state.blocker
+          .slice("Command approval pending for ".length)
+          .split(";", 1)[0]
+          .split(", ");
+        if (!waiting.includes(role))
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
@@ -665,14 +919,32 @@ export class WorkflowEngine {
                   typeof inputSummary?.command === "string"
                     ? inputSummary.command
                     : undefined;
-                command = commandId
-                  ? commandSummary(
-                      commandId,
-                      approvedCommandsForRole(role, effectiveConfig(s)).find(
-                        (approved) => approved.id === commandId,
-                      ),
+                let approved = commandId
+                  ? approvedCommandsForRole(role, effectiveConfig(s)).find(
+                      (item) => item.id === commandId,
                     )
                   : undefined;
+                if (!commandId && rawName === "team_command") {
+                  try {
+                    const requested = normalizedRuntimeCommand(
+                      input,
+                      role,
+                    ).command;
+                    approved = approvedCommandsForRole(
+                      role,
+                      effectiveConfig(s),
+                    ).find(
+                      (item) => commandKey(item) === commandKey(requested),
+                    );
+                  } catch {
+                    /* Malformed model input is never resolved for logging. */
+                  }
+                }
+                command = approved
+                  ? commandSummary(approved.id, approved)
+                  : commandId
+                    ? commandSummary(commandId)
+                    : undefined;
                 const summary = command ?? inputSummary;
                 logged?.logger.append({
                   type: "tool_start",
@@ -862,6 +1134,17 @@ export class WorkflowEngine {
                 update,
               });
             },
+            (command, request, commandSignal) =>
+              this.runtimeCommandApproval(
+                authoritative,
+                s,
+                role,
+                control,
+                command,
+                request,
+                commandSignal,
+                (event) => logged?.logger.append(event),
+              ),
           ),
         );
         if (control.intention)
@@ -1247,6 +1530,62 @@ export class WorkflowEngine {
     this.running = true;
     this.runningWorkflowId = s.id;
     try {
+      // A process restart loses the suspended agent session. Re-present saved
+      // requests without ever replaying the command or consuming an allow-once grant.
+      if (s.pendingRuntimeCommands.length && this.activeAttempts.size === 0) {
+        for (const pending of [...s.pendingRuntimeCommands]) {
+          if (signal?.aborted) break;
+          const request = this.runtimeApprovalPrompt(
+            s,
+            pending.agentId,
+            pending.command,
+            pending.purpose,
+          );
+          request.prompt +=
+            "\n\nThe requesting run has ended. This decision will not execute the command; retry the agent after recovery.";
+          request.options = request.options.filter(
+            (option) => option.value !== "allow_once",
+          );
+          const selected = await this.ui.approve?.(request);
+          const choice = selected?.length === 1 ? selected[0] : undefined;
+          if (
+            !choice ||
+            !request.options.some((option) => option.value === choice)
+          )
+            break;
+          this.saveRuntimeApproval(s, pending.command, choice);
+          s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
+            (item) => item.requestId !== pending.requestId,
+          );
+          if (s.config.logging.agentLogs.level !== "off") {
+            const log = new AttemptLogger(
+              this.logs.path(s.id, pending.agentId, pending.run),
+            );
+            log.append({
+              type: "command_approval_decided",
+              agent: pending.agentId,
+              run: pending.run,
+              requestId: pending.requestId,
+              decision: choice,
+              ...(choice === "allow_similar"
+                ? { rule: proposeSimilarRule(pending.command) }
+                : {}),
+            });
+            await log.flush();
+          }
+          record(
+            s,
+            "command_approval_decided",
+            `${pending.agentId} ${choice} ${pending.command.id}`,
+            { agent: pending.agentId, attempt: pending.run },
+          );
+          await this.store.save(s);
+        }
+        if (s.pendingRuntimeCommands.length) {
+          this.ui.progress(s);
+          return s;
+        }
+      }
       await this.recover(s);
       while (!["DONE", "BLOCKED"].includes(s.phase)) {
         if (signal?.aborted) {
@@ -1722,6 +2061,20 @@ export class WorkflowEngine {
             };
           }),
         );
+        if (s.pendingRuntimeCommands.length) {
+          const waiting = [
+            ...new Set(
+              s.pendingRuntimeCommands.map((request) => request.agentId),
+            ),
+          ];
+          block(
+            s,
+            `Command approval pending for ${waiting.join(", ")}; review it with /team resume, then inspect and retry the agent.`,
+          );
+          delete s.inFlight;
+          await this.store.save(s);
+          break;
+        }
         if (this.continuingPhase === s.phase) this.continuingPhase = undefined;
         // Failure accounting belongs to the authoritative parent, not the isolated snapshots.
         let error: string | undefined;

@@ -12,6 +12,12 @@ import type { WorkflowState } from "../workflow/state.ts";
 export function commandKey(c: Pick<Command, "executable" | "args">) {
   return JSON.stringify([c.executable, c.args]);
 }
+export function detectedCommandId(c: Pick<Command, "executable" | "args">) {
+  return (
+    "detected-" +
+    createHash("sha256").update(commandKey(c)).digest("hex").slice(0, 12)
+  );
+}
 export function effectiveConfig(s: WorkflowState) {
   const config = {
     ...s.config,
@@ -60,12 +66,7 @@ export async function discoverCommands(
     category: DiscoveredCommand["category"],
     confidence: DiscoveredCommand["confidence"] = "high",
   ) {
-    const id =
-      "detected-" +
-      createHash("sha256")
-        .update(commandKey({ executable, args }))
-        .digest("hex")
-        .slice(0, 12);
+    const id = detectedCommandId({ executable, args });
     const value = commandSchema.safeParse({
       id,
       executable,
