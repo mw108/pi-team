@@ -26,7 +26,7 @@ import {
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
 import { getAgentDisplayName } from "./ui/agent-name.ts";
 import { inactiveSolverError } from "./config/solvers.ts";
-import { formatErrorForUser } from "./agents/error-message.ts";
+import { formatErrorForPiNotification } from "./agents/error-message.ts";
 import {
   buildCompletionReportInput,
   fallbackReport,
@@ -91,7 +91,7 @@ export default function teamExtension(pi: ExtensionAPI) {
       })
       .catch((error) => {
         try {
-          ctx.ui.notify(formatErrorForUser(error), "error");
+          ctx.ui.notify(formatErrorForPiNotification(error), "error");
         } catch {
           // A closed UI must not leave the background task unhandled.
         }
@@ -110,7 +110,7 @@ export default function teamExtension(pi: ExtensionAPI) {
     try {
       await checkAskCompatibility();
     } catch (error) {
-      ctx.ui.notify(formatErrorForUser(error), "error");
+      ctx.ui.notify(formatErrorForPiNotification(error), "error");
     }
   });
   pi.on("session_shutdown", async () => {
@@ -141,7 +141,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(formatErrorForUser(error), "error");
+        ctx.ui.notify(formatErrorForPiNotification(error), "error");
       }
     },
   });
@@ -182,7 +182,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
       }
     },
   });
@@ -203,7 +203,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
       }
     },
   });
@@ -283,7 +283,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           throw error;
         }
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
       } finally {
         ownedRuntime?.dispose();
       }
@@ -337,7 +337,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         );
         launched = true;
       } catch (error) {
-        ctx.ui.notify(formatErrorForUser(error), "error");
+        ctx.ui.notify(formatErrorForPiNotification(error), "error");
       } finally {
         if (!launched) {
           runtime?.dispose();
@@ -375,7 +375,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
       }
     },
   });
@@ -407,7 +407,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(formatErrorForUser(error), "error");
+        ctx.ui.notify(formatErrorForPiNotification(error), "error");
       }
     },
   });
@@ -457,7 +457,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           "info",
         );
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
       }
     },
   });
@@ -525,7 +525,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         runtime.bind(state);
         launch(active, () => engine.run(state, controller.signal), ctx, true);
       } catch (e) {
-        ctx.ui.notify(formatErrorForUser(e), "error");
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
         runtime.dispose();
         if (active?.runtime === runtime) active = undefined;
       }

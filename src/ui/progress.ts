@@ -17,6 +17,18 @@ const symbols = {
   stopped: "–",
   aborted: "⊘",
 };
+export function formatCycleProgress(state: WorkflowState): string | undefined {
+  const parts: string[] = [];
+  if (state.pentestCycle > 0)
+    parts.push(
+      `Pentest cycle ${state.pentestCycle}/${state.config.workflow.maxPentestCycles}`,
+    );
+  if (state.localFixCycle > 0)
+    parts.push(
+      `Local fixes ${state.localFixCycle}/${state.config.workflow.maxLocalFixCycles}`,
+    );
+  return parts.length ? parts.join(" · ") : undefined;
+}
 export type AgentProgressStatus = keyof typeof symbols;
 export interface DerivedAgentProgress {
   status: AgentProgressStatus;
@@ -381,10 +393,7 @@ export function renderProgress(
   for (const role of visibleRoles(state))
     lines.push(...displayAgent(role, state, runtime, showIds));
   const gates = [
-    `Local fixes ${state.localFixCycle}/${state.config.workflow.maxLocalFixCycles}`,
-    state.config.qualityGates.pentest.enabled
-      ? `Pentest cycle ${state.pentestCycle}/${state.config.workflow.maxPentestCycles}`
-      : "Pentest disabled",
+    ...(!state.config.qualityGates.pentest.enabled ? ["Pentest disabled"] : []),
     ...(
       [
         ["codeReview", "Code review"],
@@ -395,7 +404,9 @@ export function renderProgress(
       .filter(([gate]) => !state.config.qualityGates[gate].enabled)
       .map(([, label]) => `${label} disabled`),
   ];
-  lines.push(gates.join(" · "));
+  const counters = formatCycleProgress(state);
+  if (counters) lines.push(counters);
+  if (gates.length) lines.push(gates.join(" · "));
   if (state.blocker) lines.push(`Blocked: ${state.blocker}`);
   if (state.phase === "DONE")
     lines.push(
@@ -431,7 +442,7 @@ export function renderLiveProgress(
         !active.includes(role) &&
         deriveAgentProgressState(state, role, runtime).status === "completed",
     );
-  const counters = `Pentest cycle ${state.pentestCycle}/${state.config.workflow.maxPentestCycles} · Local fixes ${state.localFixCycle}/${state.config.workflow.maxLocalFixCycles}`;
+  const counters = formatCycleProgress(state);
   if (state.phase === "BLOCKED") {
     const pentest = state.results.pentester as any;
     const pentestBlocked = pentest?.status === "BLOCKED";
@@ -505,7 +516,12 @@ export function renderLiveProgress(
       ? ["◉ Waiting for user input"]
       : [];
   const reserved =
-    1 + activeLines.length + waiting.length + (next ? 1 : 0) + 1 + 1;
+    1 +
+    activeLines.length +
+    waiting.length +
+    (next ? 1 : 0) +
+    (counters ? 1 : 0) +
+    1;
   const historyCount = Math.max(0, Math.min(2, rowBudget - reserved));
   const recent = completed.slice(0, historyCount).reverse();
   return [
@@ -514,7 +530,7 @@ export function renderLiveProgress(
     ...activeLines,
     ...waiting,
     ...(next ? [next] : []),
-    counters,
+    ...(counters ? [counters] : []),
     footer,
   ];
 }

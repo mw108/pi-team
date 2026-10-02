@@ -145,6 +145,36 @@ test("allow once executes exactly once per prompt and keeps workflow approvals e
   assert.equal(f.state.runtimeApprovedCommandIds.length, 0);
 });
 
+test("discovered command metadata appears when runtime approval is requested", async () => {
+  const f = await fixture([["deny"]]);
+  const command = normalizedRuntimeCommand(
+    {
+      executable: "vendor/bin/phpunit",
+      args: [],
+      purpose: "Run repository tests",
+      category: "test",
+    },
+    "tester",
+  ).command;
+  f.state.discoveredCommands = [
+    { command, source: "phpunit.xml", category: "test", confidence: "medium" },
+  ];
+  assert.equal(
+    await f.approve("tester", f.control("tester"), {
+      executable: "vendor/bin/phpunit",
+      args: [],
+      purpose: "Run repository tests",
+      category: "test",
+    }),
+    "deny",
+  );
+  assert.equal(f.requests.length, 1);
+  assert.match(f.requests[0].prompt, /Purpose: test/);
+  assert.match(f.requests[0].prompt, /Source: phpunit.xml/);
+  assert.match(f.requests[0].prompt, /Confidence: medium/);
+  assert.equal(f.state.approvedCommands.length, 0);
+});
+
 test("workflow exact approval is reused and survives state reload; configured commands stay immediate", async () => {
   const f = await fixture([["allow_workflow"]]);
   const run = f.control("implementor");

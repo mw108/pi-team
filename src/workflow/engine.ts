@@ -159,10 +159,16 @@ export class WorkflowEngine {
           ].join(" "),
         ].join("\n")
       : "";
+    const discovered = s.discoveredCommands.find(
+      (item) => commandKey(item.command) === commandKey(command),
+    );
+    const metadata = discovered
+      ? `\nSource: ${redactVisibleText(discovered.source)}\nConfidence: ${discovered.confidence}`
+      : "";
     return {
       kind: "runtimeCommand",
       title: `${label} requests command approval`,
-      prompt: `${label} wants to run:\n${line}\n\nPurpose:\n${redactVisibleText(purpose)}${rule ? `\n\nAllow similar rule: ${ruleLine}\nThis would also allow:\n${examples}\nIt would NOT allow:\nphp artisan migrate:fresh` : ""}`,
+      prompt: `${label} wants to run:\n${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}${rule ? `\n\nAllow similar rule: ${ruleLine}\nThis would also allow:\n${examples}\nIt would NOT allow:\nphp artisan migrate:fresh` : ""}`,
       options: [
         {
           value: "allow_once",
@@ -1614,6 +1620,14 @@ export class WorkflowEngine {
         }
       }
       await this.recover(s);
+      if (s.pendingApproval?.kind === "commands") {
+        s.phase = s.resumePhase ?? "RESEARCH";
+        delete s.pendingApproval;
+        delete s.resumePhase;
+        s.commandApprovalComplete = false;
+        record(s, "legacy_command_approval_skipped");
+        await this.store.save(s);
+      }
       while (!["DONE", "BLOCKED"].includes(s.phase)) {
         if (signal?.aborted) {
           record(s, "interrupted");
@@ -1928,35 +1942,13 @@ export class WorkflowEngine {
         }
         if (s.phase !== "ORCHESTRATE" && !s.commandApprovalComplete) {
           s.discoveredCommands = await discoverCommands(this.cwd);
-          const candidates = s.discoveredCommands.filter(
-            (c) =>
-              !s.config.commands.some(
-                (known) => commandKey(known) === commandKey(c.command),
-              ),
-          );
-          if (candidates.length) {
-            await this.requestApproval(s, {
-              kind: "commands",
-              title: "Approve repository validation commands",
-              prompt:
-                "Select commands to approve for this workflow only. Select none to reject all. Repository scripts execute local code; inspect the listed sources before approving.",
-              options: candidates.map((c) => ({
-                value: c.command.id,
-                label: JSON.stringify([
-                  c.command.executable,
-                  ...c.command.args,
-                ]),
-                description: `${c.category}; ${c.source}; confidence ${c.confidence}`,
-              })),
-            });
-            continue;
-          }
           s.commandApprovalComplete = true;
           if (
             s.config.qualityGates.testing.enabled &&
-            !effectiveConfig(s).commands.some((command) =>
-              ["test", "static"].includes(command.purpose),
-            )
+            ![
+              ...effectiveConfig(s).commands,
+              ...s.discoveredCommands.map((item) => item.command),
+            ].some((command) => ["test", "static"].includes(command.purpose))
           ) {
             block(
               s,

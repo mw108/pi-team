@@ -8,7 +8,7 @@ import { localHttpTool } from "../src/agents/http.ts";
 import { config, repository, FixtureRunner } from "./helpers.ts";
 import { git, head } from "../src/workflow/git.ts";
 import teamExtension from "../src/index.ts";
-test("fixture integrates discovered command approval, implementation, POST pentest, security, real tests and intended commit", async () => {
+test("fixture integrates command discovery, implementation, POST pentest, security, real tests and intended commit", async () => {
   const cwd = await repository();
   await writeFile(
     join(cwd, "package.json"),
@@ -39,7 +39,6 @@ test("fixture integrates discovered command approval, implementation, POST pente
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const cfg = config();
-    cfg.commands = [];
     cfg.qualityGates.pentest.enabled = true;
     const origin = `http://127.0.0.1:${(server.address() as any).port}`;
     cfg.pentest.localHttp.allowedOrigins = [origin];
@@ -73,19 +72,18 @@ test("fixture integrates discovered command approval, implementation, POST pente
         progress: () => {},
         ask: async () => undefined,
         approve: async (request) => {
-          assert.equal(request.kind, "commands");
-          assert.equal(request.options.length, 1);
           approvals++;
-          return request.options.map((o) => o.value);
+          return undefined;
         },
       }),
       s = await engine.start("Fix addition with local POST validation", cfg);
     const before = await head(cwd);
     await engine.run(s);
     assert.equal(s.phase, "DONE", s.blocker);
-    assert.equal(approvals, 1);
+    assert.equal(approvals, 0);
     assert.equal(requests, 1);
-    assert.equal(s.approvedCommands.length, 1);
+    assert.equal(s.approvedCommands.length, 0);
+    assert.equal(s.discoveredCommands.length, 1);
     assert.equal((s.results.tester as any).commands[0].exitCode, 0);
     assert.notEqual(await head(cwd), before);
     assert.deepEqual(s.commit?.files, ["math.js"]);

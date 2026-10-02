@@ -6,7 +6,7 @@ export function getErrorMessage(error: unknown): string {
 export function formatErrorForUser(error: unknown): string {
   const name = error instanceof Error ? error.name || "Error" : "Error";
   let message = getErrorMessage(error);
-  for (let i = 0; i < 3; i++) {
+  while (true) {
     const prefix = [`${name}: `, "Error: "].find((value) =>
       message.startsWith(value),
     );
@@ -14,4 +14,9 @@ export function formatErrorForUser(error: unknown): string {
     message = message.slice(prefix.length);
   }
   return `${name}: ${message}`;
+}
+
+/** Pi adds `Error: ` when it renders an error notification. */
+export function formatErrorForPiNotification(error: unknown): string {
+  return formatErrorForUser(error).replace(/^Error: /, "");
 }

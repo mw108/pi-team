@@ -14,6 +14,7 @@ import {
   deriveAgentProgressState,
   elapsed,
   renderProgress,
+  renderLiveProgress,
 } from "../src/ui/progress.ts";
 import { fix } from "../src/workflow/router.ts";
 import { formatToolActivity } from "../src/ui/activity.ts";
@@ -84,7 +85,7 @@ test("disabled gates are explicit; only enabled gates show counters and agents",
   const s = state();
   let text = lines(s);
   assert.match(text, /Design cycle 1\/3/);
-  assert.match(text, /Local fixes 0\/5/);
+  assert.doesNotMatch(text, /Local fixes/);
   assert.match(text, /Pentest disabled/);
   assert.doesNotMatch(text, /Pentest cycle|Pen Tester|Security Reviewer/);
   s.config.qualityGates.pentest.enabled = true;
@@ -104,6 +105,26 @@ test("disabled gates are explicit; only enabled gates show counters and agents",
     /Code review disabled · Testing disabled · Commit disabled/,
   );
   assert.doesNotMatch(text, /○ Code Reviewer|○ Tester|○ Commit Agent/);
+});
+
+test("cycle counters appear only after use in status and live progress", () => {
+  const s = state();
+  s.config.qualityGates.pentest.enabled = true;
+  for (const [pentest, local, expected] of [
+    [0, 0, undefined],
+    [1, 0, "Pentest cycle 1/2"],
+    [0, 2, "Local fixes 2/5"],
+    [1, 2, "Pentest cycle 1/2 · Local fixes 2/5"],
+  ] as const) {
+    s.pentestCycle = pentest;
+    s.localFixCycle = local;
+    for (const rendered of [renderProgress(s), renderLiveProgress(s)]) {
+      const line = rendered.find((item) =>
+        /Pentest cycle|Local fixes/.test(item),
+      );
+      assert.equal(line, expected);
+    }
+  }
 });
 
 test("configured names and legacy fallback render without changing agent IDs", () => {

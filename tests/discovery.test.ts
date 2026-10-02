@@ -67,17 +67,35 @@ test("duplicate command sources deduplicated and malformed data ignored", async 
   assert.equal(commands.length, 3);
   assert.ok(!commands.some((c) => c.command.executable === "touch"));
 });
-test("discovered commands cannot execute before approval; selection persists across resume", async () => {
+test("workflow discovers commands without a startup approval or implicit trust", async () => {
   const cwd = await discoveredFixture();
   const cfg = config();
   cfg.commands = [];
   const runner = new FixtureRunner();
-  let engine = new WorkflowEngine(cwd, runner, ui);
+  const requests: string[] = [];
+  const engine = new WorkflowEngine(cwd, runner, {
+    ...ui,
+    approve: async (request) => {
+      requests.push(request.kind);
+      return undefined;
+    },
+  });
   const s = await engine.start("Fix", cfg);
   await engine.run(s);
-  assert.equal(s.phase, "WAITING_USER");
+  assert.equal(s.phase, "BLOCKED");
+  assert.ok(
+    s.discoveredCommands.some((item) => item.source.includes("package.json")),
+  );
   assert.equal(s.approvedCommands.length, 0);
-  assert.equal(runner.counts.implementor, undefined);
+  assert.deepEqual(requests, []);
+  assert.ok(
+    !s.history.some(
+      (entry) =>
+        entry.event === "approval_requested" && entry.detail === "commands",
+    ),
+  );
+  assert.ok((runner.counts.orchestrator ?? 0) >= 1);
+  assert.ok((runner.counts.implementor ?? 0) >= 1);
   await assert.rejects(
     () =>
       commandTool("tester", effectiveConfig(s), cwd, []).execute(
@@ -89,49 +107,34 @@ test("discovered commands cannot execute before approval; selection persists acr
       ),
     /not approved/,
   );
-  engine = new WorkflowEngine(cwd, runner, {
-    ...ui,
-    approve: async (request) =>
-      request.options
-        .filter((o) => o.label === '["npm","test"]')
-        .map((o) => o.value),
-  });
-  const loaded = await engine.store.load(s.id);
-  await engine.run(loaded);
-  assert.equal(loaded.phase, "DONE", loaded.blocker);
-  assert.equal(loaded.approvedCommands.length, 1);
-  assert.equal(loaded.config.commands.length, 0);
-  const resumed = await engine.store.load(s.id);
-  assert.equal(resumed.approvedCommands.length, 1);
-  assert.equal(effectiveConfig(resumed).commands.length, 1);
-  const lint = s.discoveredCommands.find((c) => c.category === "lint")!;
-  await assert.rejects(
-    () =>
-      commandTool("tester", effectiveConfig(resumed), cwd, []).execute(
-        "x",
-        { id: lint.command.id },
-        undefined,
-        undefined,
-        {} as any,
-      ),
-    /not approved/,
-  );
-  assert.match((loaded.results.tester as any).commands[0].output, /pass 1/);
 });
-test("rejecting every discovered check blocks validation without running commands", async () => {
-  const cwd = await discoveredFixture(),
-    cfg = config();
-  cfg.commands = [];
-  const runner = new FixtureRunner(),
-    engine = new WorkflowEngine(cwd, runner, {
-      ...ui,
-      approve: async () => [],
-    }),
-    s = await engine.start("Fix", cfg);
+test("legacy startup command approval resumes without prompting and retains exact approvals", async () => {
+  const cwd = await discoveredFixture();
+  const requests: string[] = [];
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async (request) => {
+      requests.push(request.kind);
+      return undefined;
+    },
+  });
+  const s = await engine.start("Fix", config());
+  s.discoveredCommands = await discoverCommands(cwd);
+  s.approvedCommands = [s.discoveredCommands[0].command];
+  s.phase = "WAITING_USER";
+  s.resumePhase = "RESEARCH";
+  s.pendingApproval = {
+    kind: "commands",
+    title: "Approve repository validation commands",
+    prompt: "Legacy request",
+    options: [],
+  };
+  await engine.store.save(s);
   await engine.run(s);
-  assert.equal(s.phase, "BLOCKED");
-  assert.match(s.blocker ?? "", /No validation commands approved/);
-  assert.equal(runner.counts.tester, undefined);
+  assert.equal(s.phase, "DONE", s.blocker);
+  assert.deepEqual(requests, []);
+  assert.equal(s.approvedCommands.length, 1);
+  assert.equal(s.pendingApproval, undefined);
 });
 test("missing validation configuration fails early without running implementation", async () => {
   const cwd = await repository(),
@@ -148,16 +151,17 @@ test("missing validation configuration fails early without running implementatio
   );
   assert.equal(runner.counts.implementor, undefined);
 });
-test("approved/configured ID collisions fail closed", async () => {
+test("persisted approved/configured ID collisions fail closed", async () => {
   const cwd = await discoveredFixture(),
     cfg = config();
   const candidate = (await discoverCommands(cwd))[0];
   cfg.commands[0].id = candidate.command.id;
   const engine = new WorkflowEngine(cwd, new FixtureRunner(), {
       ...ui,
-      approve: async (request) => request.options.map((option) => option.value),
     }),
     s = await engine.start("Fix", cfg);
+  s.discoveredCommands = [candidate];
+  s.approvedCommands = [candidate.command];
   await engine.run(s);
   assert.equal(s.phase, "BLOCKED");
   assert.match(s.blocker ?? "", /command ID conflicts/);
