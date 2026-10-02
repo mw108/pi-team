@@ -1072,6 +1072,14 @@ export class WorkflowEngine {
               this.emitAgentEvent({ type: "guard", role, event });
             },
             (event) => {
+              if (!("providerRequest" in event)) {
+                logged?.logger.append({
+                  ...event,
+                  agent: role,
+                  attempt: attemptNumber,
+                });
+                return;
+              }
               if (event.type === "provider_progress") {
                 try {
                   logged?.logger.append({
@@ -1136,13 +1144,22 @@ export class WorkflowEngine {
             },
             (update) => {
               if (control.intention || control.settled) return;
-              this.emitAgentEvent({
-                type: "providerProgress",
-                role,
-                workflowId: s.id,
-                attempt: attemptNumber,
-                update,
-              });
+              if ("kind" in update)
+                this.emitAgentEvent({
+                  type: "modelPreflight",
+                  role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  update,
+                });
+              else
+                this.emitAgentEvent({
+                  type: "providerProgress",
+                  role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  update,
+                });
             },
             (command, request, commandSignal) =>
               this.runtimeCommandApproval(

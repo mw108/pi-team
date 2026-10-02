@@ -58,6 +58,11 @@ import {
   type ProviderProgressUpdate,
 } from "./network-retry.ts";
 import {
+  ensureRouterModelReady,
+  type ModelPreflightEvent,
+  type ModelPreflightUpdate,
+} from "./model-preflight.ts";
+import {
   ActiveSessionRegistry,
   type ActiveAgentSession,
 } from "./active-sessions.ts";
@@ -84,9 +89,12 @@ export interface AgentRunner {
     registry?: ActiveSessionRegistry,
     guardEvent?: (event: GuardEvent) => void,
     providerEvent?: (
-      event: ProviderRequestEvent & Record<string, unknown>,
+      event:
+        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
     ) => void,
-    providerProgress?: (update: ProviderProgressUpdate) => void,
+    providerProgress?: (
+      update: ProviderProgressUpdate | ModelPreflightUpdate,
+    ) => void,
     runtimeApproval?: RuntimeCommandApprover,
   ): Promise<any>;
 }
@@ -103,9 +111,12 @@ export class PiRunner implements AgentRunner {
       guard: ToolUseGuard;
     },
     providerEvent?: (
-      event: ProviderRequestEvent & Record<string, unknown>,
+      event:
+        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
     ) => void,
-    providerProgress?: (update: ProviderProgressUpdate) => void,
+    providerProgress?: (
+      update: ProviderProgressUpdate | ModelPreflightUpdate,
+    ) => void,
     runtimeApproval?: RuntimeCommandApprover,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s),
@@ -153,6 +164,15 @@ export class PiRunner implements AgentRunner {
               },
         ),
       Date.now,
+      providerProgress,
+      undefined,
+      (requestModel, options, signal, onEvent, onUpdate) =>
+        ensureRouterModelReady(runtime, requestModel, options, {
+          signal,
+          onEvent,
+          onUpdate,
+        }),
+      providerEvent,
       providerProgress,
     );
     const paths: string[] = [],
@@ -298,9 +318,12 @@ export class PiRunner implements AgentRunner {
     registry?: ActiveSessionRegistry,
     guardEvent?: (event: GuardEvent) => void,
     providerEvent?: (
-      event: ProviderRequestEvent & Record<string, unknown>,
+      event:
+        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
     ) => void,
-    providerProgress?: (update: ProviderProgressUpdate) => void,
+    providerProgress?: (
+      update: ProviderProgressUpdate | ModelPreflightUpdate,
+    ) => void,
     runtimeApproval?: RuntimeCommandApprover,
   ) {
     const evidence: CommandEvidence[] = [];
@@ -342,6 +365,10 @@ export class PiRunner implements AgentRunner {
       () => executionSignal,
       guardState,
       (event) => {
+        if (!("providerRequest" in event)) {
+          providerEvent?.(event);
+          return;
+        }
         if (event.type === "provider_progress") {
           providerEvent?.(event);
           return;

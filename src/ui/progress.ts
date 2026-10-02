@@ -285,6 +285,10 @@ function displayAgent(
         : provider.state === "waiting"
           ? "  ↳ waiting for model response"
           : `  ↳ ${provider.state === "tool_calling" ? "preparing tool call" : provider.state} · active ${activityAge(providerAge)} ago`;
+  const preflight = status === "running" ? live?.modelPreflight : undefined;
+  const modelStatus = preflight
+    ? `  ↳ ${preflight.state === "checking" ? "checking model" : preflight.state === "downloading" || preflight.state === "downloaded" ? "downloading model" : preflight.state === "sleeping" ? "waking model" : "loading model"}${preflight.progress === undefined ? "" : ` · ${Math.round(preflight.progress * 100)}%`}`
+    : undefined;
   const error =
     status === "aborted"
       ? "  ↳ Aborted by user"
@@ -336,7 +340,7 @@ function displayAgent(
     returnedBy && derived.attempt && derived.attempt > 1
       ? `  ↳ returned by ${returnedBy}`
       : undefined,
-    control ?? reconnect ?? activity ?? providerStatus,
+    control ?? reconnect ?? activity ?? modelStatus ?? providerStatus,
     guardStatus,
     finalError?.message
       ? `  ↳ Final error: ${finalError.name ?? "Error"}: ${finalError.message}`

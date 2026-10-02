@@ -9,6 +9,7 @@ import type {
   ProviderLiveProgress,
   ProviderProgressUpdate,
 } from "../agents/network-retry.ts";
+import type { ModelPreflightUpdate } from "../agents/model-preflight.ts";
 
 export type AgentRuntimeStatus =
   "pending" | "running" | "completed" | "failed" | "stopped" | "aborted";
@@ -39,6 +40,7 @@ export interface AgentProgress {
   };
   contextUsage?: ContextUsage;
   providerProgress?: ProviderLiveProgress;
+  modelPreflight?: Extract<ModelPreflightUpdate, { kind: "model_preflight" }>;
 }
 export type AgentEvent =
   | {
@@ -83,6 +85,13 @@ export type AgentEvent =
       workflowId: string;
       attempt: number;
       update: ProviderProgressUpdate;
+    }
+  | {
+      type: "modelPreflight";
+      role: Role;
+      workflowId: string;
+      attempt: number;
+      update: ModelPreflightUpdate;
     }
   | {
       type: "activity";
@@ -171,6 +180,7 @@ export class ProgressRuntime {
           agent.activity = undefined;
           agent.toolCallId = undefined;
           agent.providerProgress = undefined;
+          agent.modelPreflight = undefined;
           if (state.phase === "BLOCKED")
             agent.error = "Workflow blocked; inspect state";
         }
@@ -187,6 +197,18 @@ export class ProgressRuntime {
   event(event: AgentEvent) {
     if (this.disposed || this.stopped) return;
     const existing = this.agents[event.role];
+    if (event.type === "modelPreflight") {
+      if (
+        this.state?.id !== event.workflowId ||
+        existing?.status !== "running" ||
+        existing.attempt !== event.attempt
+      )
+        return;
+      existing.modelPreflight =
+        event.update.kind === "model_preflight" ? event.update : undefined;
+      this.emit();
+      return;
+    }
     if (event.type === "providerProgress") {
       if (
         this.state?.id !== event.workflowId ||
@@ -199,7 +221,10 @@ export class ProgressRuntime {
       if ("ended" in event.update) {
         if (event.update.providerRequest === currentRequest)
           existing.providerProgress = undefined;
-      } else existing.providerProgress = event.update;
+      } else {
+        existing.providerProgress = event.update;
+        existing.modelPreflight = undefined;
+      }
       // The existing UI heartbeat renders timestamps without a repaint per delta.
       return;
     }
@@ -246,18 +271,21 @@ export class ProgressRuntime {
       existing.controlActivity = `Restarting as run ${event.attempt}`;
       existing.networkRetry = undefined;
       existing.providerProgress = undefined;
+      existing.modelPreflight = undefined;
     } else if (event.type === "aborted" && existing) {
       existing.status = "aborted";
       existing.completedAt = this.now();
       existing.controlActivity = undefined;
       existing.error = "Aborted by user";
       existing.providerProgress = undefined;
+      existing.modelPreflight = undefined;
     } else if (event.type === "superseded" && existing) {
       existing.status = "stopped";
       existing.completedAt = this.now();
       existing.controlActivity = undefined;
       existing.error = "Stopped for upstream retry";
       existing.providerProgress = undefined;
+      existing.modelPreflight = undefined;
     } else if (event.type === "complete" || event.type === "fail") {
       this.agents[event.role] = {
         ...existing,
@@ -267,6 +295,7 @@ export class ProgressRuntime {
         activity: undefined,
         toolCallId: undefined,
         providerProgress: undefined,
+        modelPreflight: undefined,
         controlActivity: undefined,
         error:
           event.type === "fail"
@@ -279,6 +308,7 @@ export class ProgressRuntime {
       existing.activity = undefined;
       existing.toolCallId = undefined;
       existing.providerProgress = undefined;
+      existing.modelPreflight = undefined;
     } else if (event.type === "networkRetry" && existing) {
       existing.networkRetry = {
         retry: event.retry,
@@ -333,6 +363,7 @@ export class ProgressRuntime {
         agent.activity = undefined;
         agent.toolCallId = undefined;
         agent.providerProgress = undefined;
+        agent.modelPreflight = undefined;
       }
     this.updateTimer();
     this.emit();

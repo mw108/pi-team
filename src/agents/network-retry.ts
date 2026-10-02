@@ -8,6 +8,10 @@ import {
   serializeErrorDiagnostics,
   type ErrorDiagnostics,
 } from "./error-diagnostics.ts";
+import type {
+  ModelPreflightEvent,
+  ModelPreflightUpdate,
+} from "./model-preflight.ts";
 
 export interface ResolvedNetworkRetry {
   maxRetries: number; // 0 means unlimited.
@@ -218,6 +222,15 @@ export function configureNetworkRetry(
   now: () => number = Date.now,
   observeProgress?: (update: ProviderProgressUpdate) => void,
   scheduleProgress: (tick: () => void) => () => void = progressInterval,
+  preflight?: (
+    model: Model<Api>,
+    options: Parameters<ModelRuntime["streamSimple"]>[2],
+    signal: AbortSignal | undefined,
+    onEvent: (event: ModelPreflightEvent) => void,
+    onUpdate: (update: ModelPreflightUpdate) => void,
+  ) => Promise<void>,
+  observePreflight?: (event: ModelPreflightEvent) => void,
+  observePreflightProgress?: (update: ModelPreflightUpdate) => void,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -230,6 +243,29 @@ export function configureNetworkRetry(
         const signal = getSignal();
         if (signal?.aborted) {
           result.push(providerErrorEvent(model, "Request aborted", true));
+          result.end();
+          return;
+        }
+        if (preflight) {
+          try {
+            await preflight(
+              model,
+              options,
+              signal,
+              (event) => observePreflight?.(event),
+              (update) => observePreflightProgress?.(update),
+            );
+          } catch (error) {
+            result.push(
+              providerErrorEvent(model, String(error), signal?.aborted),
+            );
+            result.end();
+            return;
+          }
+        }
+        if (signal?.aborted) {
+          result.push(providerErrorEvent(model, "Request aborted", true));
+          result.end();
           return;
         }
         let retryAfter: number | undefined;
