@@ -34,6 +34,7 @@ import {
   resultSchemas,
   questionSchema,
   type Role,
+  type OutputRecovery,
 } from "./schemas.ts";
 import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
@@ -96,6 +97,7 @@ export interface AgentRunner {
       update: ProviderProgressUpdate | ModelPreflightUpdate,
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
+    outputRecovered?: (recovery: OutputRecovery) => void,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -325,6 +327,7 @@ export class PiRunner implements AgentRunner {
       update: ProviderProgressUpdate | ModelPreflightUpdate,
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
+    outputRecovered?: (recovery: OutputRecovery) => void,
   ) {
     const evidence: CommandEvidence[] = [];
     let executionSignal: AbortSignal | undefined;
@@ -479,7 +482,11 @@ export class PiRunner implements AgentRunner {
         throw new Error(last.errorMessage ?? `Provider ${last.stopReason}`);
       let result: any;
       try {
-        result = parseText(role, session.getLastAssistantText() ?? "");
+        result = parseText(
+          role,
+          session.getLastAssistantText() ?? "",
+          outputRecovered,
+        );
         if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
           await validateContractPaths(state.cwd, result);
       } catch (error) {
@@ -495,7 +502,11 @@ export class PiRunner implements AgentRunner {
         if (signal?.aborted)
           throw new Error("Agent interrupted during schema correction");
         try {
-          result = parseText(role, session.getLastAssistantText() ?? "");
+          result = parseText(
+            role,
+            session.getLastAssistantText() ?? "",
+            outputRecovered,
+          );
         } catch (finalError) {
           if (guard.finalizationReason === "doom_loop")
             throw new AgentDoomLoopError(role, attempt, guard.interventions);

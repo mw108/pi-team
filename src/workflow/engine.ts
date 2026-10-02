@@ -1178,6 +1178,13 @@ export class WorkflowEngine {
                 commandSignal,
                 (event) => logged?.logger.append(event),
               ),
+            (recovery) =>
+              logged?.logger.append({
+                type: "agent_output_recovered",
+                agent: role,
+                attempt: attemptNumber,
+                ...recovery,
+              }),
           ),
         );
         if (control.intention)

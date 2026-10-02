@@ -36,8 +36,106 @@ import teamExtension from "../src/index.ts";
 import { doctor } from "../src/integrations/doctor.ts";
 import type { Role } from "../src/agents/schemas.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
+import type { AgentRunner } from "../src/agents/runner.ts";
+import { research } from "./helpers.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
+
+test("recovered Critic output is logged and workflow continues to Reviewer", async () => {
+  const cwd = await repository();
+  const fixture = new FixtureRunner();
+  const pi = new PiRunner();
+  let prompts = 0;
+  pi.createSession = async () =>
+    ({
+      messages: [{ role: "assistant", stopReason: "end" }],
+      prompt: async () => {
+        prompts++;
+      },
+      getLastAssistantText: () => JSON.stringify(output("critic")) + "}",
+      setActiveToolsByName: () => {},
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const runner: AgentRunner = {
+    run: (
+      role,
+      state,
+      signal,
+      activity,
+      attempt,
+      visible,
+      network,
+      registry,
+      guardEvent,
+      providerEvent,
+      providerProgress,
+      runtimeApproval,
+      outputRecovered,
+    ) =>
+      role === "critic"
+        ? pi.run(
+            role,
+            state,
+            signal,
+            activity,
+            attempt,
+            visible,
+            network,
+            registry,
+            guardEvent,
+            providerEvent,
+            providerProgress,
+            runtimeApproval,
+            outputRecovered,
+          )
+        : fixture.run(role, state),
+  };
+  const engine = new WorkflowEngine(cwd, runner, ui);
+  const state = await engine.start("Fix", config());
+  state.phase = "CRITIQUE";
+  state.requirements = ["Fix addition"];
+  state.results = {
+    researcher: research,
+    solver1: output("solver1"),
+    solver2: output("solver2"),
+    solver3: output("solver3"),
+  };
+  await engine.run(state);
+  assert.equal(prompts, 1);
+  assert.deepEqual(state.results.critic, output("critic"));
+  assert.ok(fixture.calls.includes("reviewer"));
+  assert.equal(
+    state.history.some(
+      (event) =>
+        event.event === "agent_failure" && event.detail?.includes("critic"),
+    ),
+    false,
+  );
+  const events = await new AgentLogStore(cwd).read(state.id, "critic", 1);
+  assert.deepEqual(
+    events
+      .filter((event) => event.type === "agent_output_recovered")
+      .map(({ agent, attempt, reason, discardedLength, discardedPreview }) => ({
+        agent,
+        attempt,
+        reason,
+        discardedLength,
+        discardedPreview,
+      })),
+    [
+      {
+        agent: "critic",
+        attempt: 1,
+        reason: "trailing_closing_delimiter",
+        discardedLength: 1,
+        discardedPreview: "}",
+      },
+    ],
+  );
+  assert.ok(events.some((event) => event.type === "agent_complete"));
+});
 
 test("agent and global timeout validation, inheritance, and runtime resolution", () => {
   const cfg = config();

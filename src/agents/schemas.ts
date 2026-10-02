@@ -339,10 +339,65 @@ export function parseResult(role: Role, value: unknown): any {
     return questionSchema.parse(value);
   return resultSchemas[role].parse(value);
 }
-export function parseText(role: Role, text: string): any {
+export type OutputRecovery = {
+  reason: "trailing_closing_delimiter";
+  discardedLength: number;
+  discardedPreview: string;
+};
+
+function leadingJsonEnd(text: string): number | undefined {
+  if (text[0] !== "{" && text[0] !== "[") return undefined;
+  const closing: string[] = [text[0] === "{" ? "}" : "]"];
+  let inString = false;
+  let escaped = false;
+  for (let i = 1; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[")
+      closing.push(char === "{" ? "}" : "]");
+    else if (char === "}" || char === "]") {
+      if (closing.pop() !== char) return undefined;
+      if (closing.length === 0) return i + 1;
+    }
+  }
+  return undefined;
+}
+
+export function parseText(
+  role: Role,
+  text: string,
+  onRecovered?: (recovery: OutputRecovery) => void,
+): any {
   const trimmed = text
     .trim()
     .replace(/^```(?:json)?\s*/, "")
     .replace(/\s*```$/, "");
-  return parseResult(role, JSON.parse(trimmed));
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch (originalError) {
+    const end = leadingJsonEnd(trimmed);
+    const trailing = end === undefined ? "" : trimmed.slice(end);
+    if (!trailing || !/^[\s}\]]+$/.test(trailing) || !/[}\]]/.test(trailing))
+      throw originalError;
+    try {
+      value = JSON.parse(trimmed.slice(0, end));
+    } catch {
+      throw originalError;
+    }
+    const result = parseResult(role, value);
+    onRecovered?.({
+      reason: "trailing_closing_delimiter",
+      discardedLength: trailing.length,
+      discardedPreview: trailing.slice(0, 32),
+    });
+    return result;
+  }
+  return parseResult(role, value);
 }
