@@ -188,6 +188,11 @@ export function analyzeConfigDrift(
         add("presentation", path);
       else if (parts[0] === "workflow" && runtimeWorkflow.has(parts[1]))
         add("runtime", path);
+      else if (
+        (state.results.pentester as any)?.status === "BLOCKED" &&
+        ["pentest.localHttp.allowedOrigins", "pentest.localUrls"].includes(path)
+      )
+        add("runtime", path);
       else if (path === "workflow.solverCount")
         add(solveStarted ? "semantic" : "future-agent", path);
       else if (parts[0] === "agents") {

@@ -159,6 +159,7 @@ test("report input preserves review findings, limitations, cycles, and failed co
     ],
   };
   s.results.pentester = {
+    status: "PASS",
     findings: [],
     coverage: ["math.js"],
     limitations: ["No browser was available"],
@@ -188,6 +189,7 @@ test("report input preserves review findings, limitations, cycles, and failed co
     "passed",
   );
   s.results.pentester = {
+    status: "FINDINGS",
     findings: [{ id: "P1", title: "Suspected issue", severity: "low" }],
     coverage: [],
     limitations: [],

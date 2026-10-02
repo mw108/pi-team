@@ -120,7 +120,12 @@ export function output(role: Role): any {
     case "codeReviewer":
       return { status: "APPROVED", findings: [] };
     case "pentester":
-      return { findings: [], coverage: ["Arithmetic only"], limitations: [] };
+      return {
+        status: "PASS",
+        findings: [],
+        coverage: ["Arithmetic only"],
+        limitations: [],
+      };
     case "securityReviewer":
       return { findings: [], summary: "No findings" };
     case "tester":

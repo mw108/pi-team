@@ -220,11 +220,33 @@ export const pentestFindingSchema = z.object({
   impact: text,
   suggestedFix: text,
 });
-export const pentestSchema = z.object({
-  findings: z.array(pentestFindingSchema),
-  coverage: strings,
-  limitations: strings,
+export const pentestBlockerSchema = z.object({
+  code: z.string().regex(/^[A-Z][A-Z0-9_]*$/),
+  message: text,
+  remediation: text.optional(),
 });
+export const pentestSchema = z
+  .object({
+    status: z.enum(["PASS", "FINDINGS", "BLOCKED"]),
+    findings: z.array(pentestFindingSchema),
+    coverage: strings,
+    limitations: strings,
+    blocker: pentestBlockerSchema.optional(),
+  })
+  .superRefine((result, ctx) => {
+    if (result.status === "PASS" && result.findings.length)
+      ctx.addIssue({ code: "custom", message: "PASS cannot have findings" });
+    if (result.status === "FINDINGS" && !result.findings.length)
+      ctx.addIssue({ code: "custom", message: "FINDINGS requires findings" });
+    if (result.status === "BLOCKED" && !result.blocker)
+      ctx.addIssue({ code: "custom", message: "BLOCKED requires a blocker" });
+    if (result.status !== "BLOCKED" && result.blocker)
+      ctx.addIssue({
+        code: "custom",
+        message: "Only BLOCKED may have a blocker",
+      });
+  });
+export type PentestResult = z.infer<typeof pentestSchema>;
 export const securitySchema = z.object({
   findings: z.array(
     z.object({

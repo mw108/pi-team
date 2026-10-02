@@ -6,6 +6,7 @@ import { getAgentDisplayName } from "./agent-name.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
 import { formatCommandLine } from "../agents/command-observability.ts";
+import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -121,6 +122,12 @@ export function deriveAgentProgressState(
     state.inFlight?.roles.includes(role)
   )
     return { status: "completed", attempt: latest.meta?.attempt };
+  if (
+    role === "pentester" &&
+    state.phase === "BLOCKED" &&
+    (state.results.pentester as any)?.status === "BLOCKED"
+  )
+    return { status: "failed", attempt: latest?.meta?.attempt };
   if (currentResult)
     return { status: "completed", attempt: latest?.meta?.attempt };
   if (latest?.event === "agent_attempt_started" && lifecycle > invalidation)
@@ -385,7 +392,7 @@ export function renderProgress(
       .map(([, label]) => `${label} disabled`),
   ];
   lines.push(gates.join(" · "));
-  if (state.blocker) lines.push("Blocked; inspect workflow state for details");
+  if (state.blocker) lines.push(`Blocked: ${state.blocker}`);
   if (state.phase === "DONE")
     lines.push(
       `Report: ${state.results.reporter ? "available" : "deterministic fallback available"} · /team-report`,
@@ -396,6 +403,116 @@ export function renderProgress(
   )
     lines.push(`Logs: .pi/team/state/${state.id}.logs/ · /team-log`);
   return lines;
+}
+// The widget has a bounded history; /team-status uses renderProgress above.
+export function renderLiveProgress(
+  state: WorkflowState,
+  runtime?: ProgressRuntime,
+  rowBudget = 12,
+) {
+  const header = `Team ${state.id.slice(0, 8)} · ${state.phase === "BLOCKED" ? "BLOCKED" : runtime?.stopped ? "stopped" : state.phase.replaceAll("_", " ").toLowerCase()} · Design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`;
+  const available = visibleRoles(state);
+  const active = available.filter((role) => {
+    const status = deriveAgentProgressState(state, role, runtime).status;
+    return status === "running" || status === "waiting";
+  });
+  const completed = state.history
+    .filter((entry) => entry.event === "agent_attempt_completed" && entry.meta)
+    .map((entry) => entry.meta!.agent)
+    .reverse()
+    .filter((role, index, all) => all.indexOf(role) === index)
+    .filter(
+      (role) =>
+        available.includes(role) &&
+        !active.includes(role) &&
+        deriveAgentProgressState(state, role, runtime).status === "completed",
+    );
+  const counters = `Pentest cycle ${state.pentestCycle}/${state.config.workflow.maxPentestCycles} · Local fixes ${state.localFixCycle}/${state.config.workflow.maxLocalFixCycles}`;
+  if (state.phase === "BLOCKED") {
+    const pentest = state.results.pentester as any;
+    const pentestBlocked = pentest?.status === "BLOCKED";
+    const blockedRole: Role | undefined = pentestBlocked
+      ? "pentester"
+      : state.history.findLast(
+          (event) => event.event === "agent_attempt_failed",
+        )?.meta?.agent;
+    const blockedRow = blockedRole
+      ? displayAgent(blockedRole, state, runtime)[0].replace(
+          /^[^ ]+/,
+          symbols.failed,
+        )
+      : undefined;
+    const waitingLines = active.flatMap((role) => [
+      ...displayAgent(role, state, runtime),
+      ...(state.pendingRuntimeCommands ?? [])
+        .filter((request) => request.agentId === role)
+        .map((request) => `  ↳ ${formatCommandLine(request.command)}`),
+    ]);
+    const focused = [
+      header,
+      ...waitingLines,
+      ...(blockedRow ? [blockedRow] : []),
+      "",
+      pentestBlocked ? "Pentest blocked:" : "Workflow blocked:",
+      pentestBlocked
+        ? pentest.blocker.message
+        : (state.blocker ?? "Unknown blocker"),
+      ...(pentestBlocked && pentest.blocker.remediation
+        ? [pentest.blocker.remediation]
+        : []),
+      ...(pentestBlocked ? ["Then: /team-retry pentester"] : []),
+      "/team-status for full workflow",
+    ];
+    const history = completed
+      .filter((role) => role !== blockedRole)
+      .slice(0, Math.max(0, Math.min(2, rowBudget - focused.length)))
+      .reverse();
+    return [
+      header,
+      ...history.map((role) => displayAgent(role, state, runtime)[0]),
+      ...focused.slice(1),
+    ];
+  }
+  const activeLines = active.flatMap((role) => {
+    const request = state.pendingRuntimeCommands?.find(
+      (item) => item.agentId === role,
+    );
+    return [
+      ...displayAgent(role, state, runtime),
+      ...(request ? [`  ↳ ${formatCommandLine(request.command)}`] : []),
+    ];
+  });
+  const phases = Object.keys(phaseRoles) as (keyof typeof phaseRoles)[];
+  const index = phases.indexOf(state.phase as keyof typeof phaseRoles);
+  const nextPhase = (index < 0 ? [] : phases.slice(index + 1)).find((phase) =>
+    getPhaseRoles(state, phase)?.some((role) => available.includes(role)),
+  );
+  const nextRoles = nextPhase
+    ? (getPhaseRoles(state, nextPhase)?.filter((role) =>
+        available.includes(role),
+      ) ?? [])
+    : [];
+  const next = nextRoles.length
+    ? `Next: ${nextRoles.map((role) => getAgentDisplayName(state.config, role)).join(", ")}`
+    : undefined;
+  const footer = "/team-status for full workflow";
+  const waiting =
+    state.phase === "WAITING_USER" && !active.length
+      ? ["◉ Waiting for user input"]
+      : [];
+  const reserved =
+    1 + activeLines.length + waiting.length + (next ? 1 : 0) + 1 + 1;
+  const historyCount = Math.max(0, Math.min(2, rowBudget - reserved));
+  const recent = completed.slice(0, historyCount).reverse();
+  return [
+    header,
+    ...recent.map((role) => displayAgent(role, state, runtime)[0]),
+    ...activeLines,
+    ...waiting,
+    ...(next ? [next] : []),
+    counters,
+    footer,
+  ];
 }
 export function progress(
   ctx: ExtensionContext,
@@ -413,7 +530,18 @@ export function progress(
   ctx.ui.setWidget(
     "pi-team",
     state.config.ui.progress.enabled
-      ? renderProgress(state, runtime)
+      ? renderLiveProgress(state, runtime).map((line) => {
+          const theme = ctx.ui.theme;
+          if (!theme?.fg) return line;
+          if (line.startsWith("✓ ")) return theme.fg("dim", line);
+          if (line.startsWith("● ")) return theme.fg("accent", line);
+          if (line.startsWith("◉ ")) return theme.fg("warning", line);
+          if (line.startsWith("✗ ") || line.includes(" blocked:"))
+            return theme.fg("error", line);
+          if (line.startsWith("Next:") || line.startsWith("/team-status"))
+            return theme.fg("dim", line);
+          return line;
+        })
       : undefined,
   );
 }

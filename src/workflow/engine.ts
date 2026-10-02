@@ -471,6 +471,11 @@ export class WorkflowEngine {
   }
   retryConfirmation(state: WorkflowState, role: Role) {
     if (role === "reporter" && state.reportFailure) return undefined;
+    if (
+      role === "pentester" &&
+      (state.results.pentester as any)?.status === "BLOCKED"
+    )
+      return undefined;
     const settled = this.activeAttempts.get(role);
     if (
       !state.results[role] &&
@@ -635,6 +640,11 @@ export class WorkflowEngine {
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
+      } else if (
+        role === "pentester" &&
+        state.blocker?.startsWith("Pentest blocked:")
+      ) {
+        // An environmental block is a completed result, not an agent failure.
       } else if (!(
         (state.blocker?.startsWith("Insufficient Solver proposals") ||
           state.blocker?.startsWith("Solver quorum not reached")) &&

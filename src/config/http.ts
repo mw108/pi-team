@@ -7,6 +7,8 @@ export const httpMethods = [
   "HEAD",
   "OPTIONS",
 ] as const;
+// allowedOrigins entries are scheme + loopback host + port only. A path such
+// as http://127.0.0.1:8000/api is an endpoint URL, not an origin.
 export function localUrl(value: string, originOnly = false): URL {
   const url = new URL(value);
   if (

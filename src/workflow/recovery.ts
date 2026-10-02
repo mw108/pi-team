@@ -79,6 +79,16 @@ export async function getWorkflowRecoveryPlan(
   const drift = analyzeConfigDrift(state, current);
   if (drift.blocking)
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
+  if (
+    state.blocker?.startsWith("Pentest blocked:") &&
+    (state.results.pentester as any)?.status === "BLOCKED"
+  )
+    return {
+      kind: "retry-agent",
+      agentId: "pentester",
+      reason:
+        "Restore the required Pentest capability, then retry the Pentester. Upstream results remain valid.",
+    };
   if (state.blocker?.startsWith("Command approval pending for ")) {
     const role = state.blocker
       .slice("Command approval pending for ".length)

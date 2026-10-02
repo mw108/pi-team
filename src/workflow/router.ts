@@ -1,5 +1,6 @@
 import { block, record, type WorkflowState, type Phase } from "./state.ts";
-import type { Role } from "../agents/schemas.ts";
+import { pentestSchema, type Role } from "../agents/schemas.ts";
+import { enforcePentestPolicy } from "./pentest-policy.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 export const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
@@ -144,9 +145,18 @@ export function transition(s: WorkflowState) {
       else fix(s, r.status, r.question);
       break;
     }
-    case "PENTEST":
-      s.phase = "SECURITY_REVIEW";
+    case "PENTEST": {
+      const result = enforcePentestPolicy(
+        s,
+        pentestSchema.parse(s.results.pentester),
+      );
+      s.results.pentester = result;
+      if (result.status === "BLOCKED") {
+        s.pentestCycle = Math.max(0, s.pentestCycle - 1);
+        block(s, `Pentest blocked: ${result.blocker!.message}`);
+      } else s.phase = "SECURITY_REVIEW";
       break;
+    }
     case "SECURITY_REVIEW": {
       const review = s.results.securityReviewer as any,
         pentest = s.results.pentester as any;

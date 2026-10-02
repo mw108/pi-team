@@ -86,12 +86,19 @@ export async function buildCompletionReportInput(
     "Pentest",
     s.config.qualityGates.pentest.enabled,
     pentest,
-    !!pentest && pentest.findings.length === 0,
+    pentest?.status === "PASS",
+    pentest?.status === "BLOCKED"
+      ? `BLOCKED: ${pentest.blocker?.message ?? "Required testing incomplete"}`
+      : pentest?.status === "FINDINGS"
+        ? `FINDINGS: ${pentest.findings.length} issue(s)`
+        : pentest?.status === "PASS"
+          ? "PASS"
+          : undefined,
   );
   const security = s.results.securityReviewer as any;
   if (
     s.config.qualityGates.pentest.enabled &&
-    pentest?.findings.length &&
+    pentest?.status === "FINDINGS" &&
     security?.findings.every((finding: any) =>
       ["FALSE_POSITIVE", "ENVIRONMENT_ARTIFACT"].includes(
         finding.classification,
@@ -100,7 +107,7 @@ export async function buildCompletionReportInput(
   ) {
     const pentestGate = validation.find((entry) => entry.label === "Pentest")!;
     pentestGate.status = "warning";
-    pentestGate.detail = `${pentest.findings.length} finding(s) classified by security review`;
+    pentestGate.detail = `FINDINGS: ${pentest.findings.length} finding(s) classified by security review`;
   }
   gate(
     "Security review",
@@ -337,15 +344,17 @@ export function renderBlocked(
   )?.meta;
   const next = recovery
     ? recoveryAction(recovery)
-    : s.pendingQuestion
-      ? "Answer the pending question."
-      : s.blocker?.includes("repository") ||
-          s.blocker?.includes("commit") ||
-          s.blocker?.includes("mutating")
-        ? "Inspect repository changes before retrying."
-        : role && s.blocker?.startsWith("Agent execution failed:")
-          ? `/team-retry ${role}`
-          : "Use /team-status and /team-log for details.";
+    : (s.results.pentester as any)?.status === "BLOCKED"
+      ? "/team-retry pentester"
+      : s.pendingQuestion
+        ? "Answer the pending question."
+        : s.blocker?.includes("repository") ||
+            s.blocker?.includes("commit") ||
+            s.blocker?.includes("mutating")
+          ? "Inspect repository changes before retrying."
+          : role && s.blocker?.startsWith("Agent execution failed:")
+            ? `/team-retry ${role}`
+            : "Use /team-status and /team-log for details.";
   const reason =
     role && s.blocker
       ? s.blocker

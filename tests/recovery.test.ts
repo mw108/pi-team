@@ -223,6 +223,7 @@ test("pentest global limit prevents infinite security repair loops", async () =>
   const runner = new FixtureRunner(async (role) => {
     if (role === "pentester")
       return {
+        status: "FINDINGS",
         findings: [
           {
             id: "F1",

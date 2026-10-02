@@ -60,6 +60,7 @@ test("fixture integrates discovered command approval, implementation, POST pente
         );
         assert.equal((response.details as any).status, 200);
         return {
+          status: "PASS",
           findings: [],
           coverage: ["Real local HTTP POST JSON request"],
           limitations: [

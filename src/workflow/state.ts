@@ -253,6 +253,49 @@ function migrateState(value: unknown): unknown {
 }
 export function validateState(value: unknown): WorkflowState {
   const state = stateSchema.parse(migrateState(value));
+  // Version 3 predates explicit Pentest completion. Legacy empty findings
+  // cannot be promoted to PASS on reload.
+  const oldPentest = state.results.pentester as Record<string, any> | undefined;
+  if (oldPentest && !oldPentest.status) {
+    if (Array.isArray(oldPentest.findings) && oldPentest.findings.length) {
+      state.results.pentester = { ...oldPentest, status: "FINDINGS" };
+    } else {
+      state.results.pentester = {
+        ...oldPentest,
+        status: "BLOCKED",
+        blocker: {
+          code: "LEGACY_PENTEST_REQUIRES_RERUN",
+          message:
+            "Legacy Pentest result has no completion status; rerun required.",
+          remediation: "Use /team-retry pentester.",
+        },
+      };
+      if (
+        [
+          "PENTEST",
+          "SECURITY_REVIEW",
+          "TEST",
+          "COMMIT",
+          "REPORT",
+          "DONE",
+        ].includes(state.phase)
+      ) {
+        state.pentestCycle = Math.max(0, state.pentestCycle - 1);
+        state.phase = "PENTEST";
+        block(
+          state,
+          "Pentest blocked: Legacy Pentest result has no completion status; rerun required.",
+        );
+        for (const role of [
+          "securityReviewer",
+          "tester",
+          "commitAgent",
+          "reporter",
+        ])
+          delete state.results[role];
+      }
+    }
+  }
   for (const command of state.approvedCommands)
     if (
       !state.runtimeApprovedCommandIds.includes(command.id) &&
