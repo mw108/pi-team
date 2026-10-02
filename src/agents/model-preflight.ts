@@ -1,4 +1,3 @@
-import { setTimeout as delay } from "node:timers/promises";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
@@ -14,6 +13,7 @@ export type ModelPreflightEvent = {
   type:
     | "model_preflight_start"
     | "model_status"
+    | "model_preflight_progress"
     | "model_load_requested"
     | "model_preflight_ready"
     | "model_preflight_failed"
@@ -67,6 +67,103 @@ const states = new Set([
   "downloading",
   "downloaded",
 ]);
+
+/** Router sends one JSON envelope per plain SSE data frame (no SSE event name). */
+function sseStatus(
+  data: string,
+  model: string,
+): { progress?: number; terminal: boolean } | undefined {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!envelope || typeof envelope !== "object") return;
+  const event = envelope as Record<string, unknown>;
+  if (event.model !== model || event.event !== "model_status") return;
+  const payload = event.data;
+  if (!payload || typeof payload !== "object") return;
+  const status = payload as Record<string, unknown>;
+  if (status.status !== "loading")
+    return {
+      terminal: status.status === "loaded" || status.status === "unloaded",
+    };
+  const progress = status.progress;
+  if (!progress || typeof progress !== "object") return { terminal: false };
+  const value = progress as Record<string, unknown>;
+  if (typeof value.value !== "number" || !Number.isFinite(value.value))
+    return { terminal: false };
+  const fraction = Math.max(0, Math.min(1, value.value));
+  const stages = Array.isArray(value.stages) ? value.stages : [];
+  const index = stages.indexOf(value.current);
+  return {
+    progress: index >= 0 ? (index + fraction) / stages.length : fraction,
+    terminal: false,
+  };
+}
+
+/** Telemetry is deliberately fail-open; the caller continues polling /models. */
+async function listenSse(
+  root: URL,
+  model: string,
+  options: RouterOptions,
+  signal: AbortSignal,
+  onStatus: (status: { progress?: number; terminal: boolean }) => void,
+): Promise<void> {
+  const response = await options.fetch(new URL("models/sse", root), {
+    headers: new Headers({
+      ...Object.fromEntries(options.headers),
+      Accept: "text/event-stream",
+    }),
+    signal,
+  });
+  if (
+    !response.ok ||
+    !response.body ||
+    !response.headers.get("content-type")?.includes("text/event-stream")
+  ) {
+    await response.body?.cancel().catch(() => {});
+    return;
+  }
+  const reader = response.body.getReader();
+  const cancel = () => void reader.cancel().catch(() => {});
+  signal.addEventListener("abort", cancel, { once: true });
+  if (signal.aborted) cancel();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fields: string[] = [];
+  const dispatch = () => {
+    if (fields.length) {
+      const status = sseStatus(fields.join("\n"), model);
+      if (status) onStatus(status);
+      fields = [];
+    }
+  };
+  try {
+    while (!signal.aborted) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      if (buffer.length > 1024 * 1024) {
+        buffer = "";
+        fields = [];
+        continue;
+      }
+      let end: number;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end).replace(/\r$/, "");
+        buffer = buffer.slice(end + 1);
+        if (!line) dispatch();
+        else if (line.startsWith("data:"))
+          fields.push(line.slice(5).trimStart());
+      }
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
 
 /** Only the root and a final /v1 have a known Router management root. */
 export function routerBaseUrl(baseUrl: string): URL | undefined {
@@ -187,53 +284,129 @@ async function runShared(
   capabilities.set(capabilityKey, true);
   let models = first.models;
   let loadRequested = false;
-  for (;;) {
-    signal.throwIfAborted();
-    const entry = models.find((candidate) => candidate.id === model);
-    if (!entry)
-      throw new Error(
-        `Configured model is not available in llama.cpp Router: ${model}. Check the provider model ID and Router inventory.`,
-      );
-    const status = entry.status;
-    const value = status.value as string;
-    const exitCode =
-      typeof status.exit_code === "number" ? status.exit_code : undefined;
-    notify(shared, {
-      state: value === "loaded" ? "ready" : (value as ModelPreflightState),
-      progress: progressOf(status),
-      exitCode,
+  let latestPolled: Snapshot | undefined;
+  let liveProgress: number | undefined;
+  const sseController = new AbortController();
+  let sseTask: Promise<void> | undefined;
+  let wakePoll: (() => void) | undefined;
+  let terminalObserved = false;
+  const waitForPoll = () =>
+    new Promise<void>((resolve, reject) => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        wakePoll = undefined;
+        resolve();
+      };
+      const abort = () => {
+        clearTimeout(timer);
+        wakePoll = undefined;
+        reject(signal.reason ?? new Error("Request aborted"));
+      };
+      const timer = setTimeout(finish, options.pollIntervalMs ?? 1500);
+      wakePoll = finish;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
     });
-    // Router keeps a sleeping child routable; its next inference wakes it.
-    // POST /models/load only starts an unloaded instance.
-    if (value === "loaded" || value === "sleeping") return true;
-    if (status.failed === true)
-      throw new Error(
-        `Model failed to load: ${model}${exitCode === undefined ? "" : ` (llama.cpp exit code: ${exitCode})`}`,
-      );
-    if (value === "unloaded" && !loadRequested) {
-      const response = await options.fetch(new URL("models/load", root), {
-        method: "POST",
-        headers: new Headers({
-          ...Object.fromEntries(options.headers),
-          "Content-Type": "application/json",
-        }),
-        body: JSON.stringify({ model }),
-        signal,
-      });
-      if (!response.ok)
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const entry = models.find((candidate) => candidate.id === model);
+      if (!entry)
         throw new Error(
-          `llama.cpp Router could not load ${model}: HTTP ${response.status}`,
+          `Configured model is not available in llama.cpp Router: ${model}. Check the provider model ID and Router inventory.`,
         );
-      loadRequested = true;
-      notify(shared, "load_requested");
+      const status = entry.status;
+      const value = status.value as string;
+      const exitCode =
+        typeof status.exit_code === "number" ? status.exit_code : undefined;
+      if (value === "loaded" || value === "sleeping" || status.failed === true)
+        liveProgress = undefined;
+      latestPolled = {
+        state: value === "loaded" ? "ready" : (value as ModelPreflightState),
+        progress: progressOf(status),
+        exitCode,
+      };
+      notify(shared, {
+        ...latestPolled,
+        progress:
+          value === "loading" || value === "unloaded"
+            ? (liveProgress ?? latestPolled.progress)
+            : latestPolled.progress,
+      });
+      // Router keeps a sleeping child routable; its next inference wakes it.
+      // POST /models/load only starts an unloaded instance.
+      if (value === "loaded" || value === "sleeping") return true;
+      if (status.failed === true)
+        throw new Error(
+          `Model failed to load: ${model}${exitCode === undefined ? "" : ` (llama.cpp exit code: ${exitCode})`}`,
+        );
+      if (!sseTask) {
+        // GET /models has established Router capability and the model is not ready.
+        sseTask = listenSse(
+          root,
+          model,
+          options,
+          sseController.signal,
+          (event) => {
+            if (signal.aborted) return;
+            if (event.terminal) {
+              terminalObserved = true;
+              wakePoll?.();
+            }
+            if (
+              event.progress === undefined ||
+              (latestPolled?.state !== "loading" &&
+                latestPolled?.state !== "unloaded")
+            )
+              return;
+            liveProgress = event.progress;
+            if (shared.latest?.progress !== event.progress)
+              notify(shared, { ...latestPolled, progress: event.progress });
+          },
+        )
+          .catch(() => {})
+          .finally(() => {
+            if (sseController.signal.aborted) return;
+            liveProgress = undefined;
+            if (
+              (latestPolled?.state === "loading" ||
+                latestPolled?.state === "unloaded") &&
+              shared.latest?.progress !== latestPolled.progress
+            )
+              notify(shared, latestPolled);
+          });
+      }
+      if (value === "unloaded" && !loadRequested) {
+        const response = await options.fetch(new URL("models/load", root), {
+          method: "POST",
+          headers: new Headers({
+            ...Object.fromEntries(options.headers),
+            "Content-Type": "application/json",
+          }),
+          body: JSON.stringify({ model }),
+          signal,
+        });
+        if (!response.ok)
+          throw new Error(
+            `llama.cpp Router could not load ${model}: HTTP ${response.status}`,
+          );
+        loadRequested = true;
+        notify(shared, "load_requested");
+      }
+      if (!terminalObserved) await waitForPoll();
+      terminalObserved = false;
+      const next = await catalog(root, options, signal);
+      if (!next.supported)
+        throw new Error(
+          `llama.cpp Router /models stopped returning model status for ${model}`,
+        );
+      models = next.models;
     }
-    await delay(options.pollIntervalMs ?? 1500, undefined, { signal });
-    const next = await catalog(root, options, signal);
-    if (!next.supported)
-      throw new Error(
-        `llama.cpp Router /models stopped returning model status for ${model}`,
-      );
-    models = next.models;
+  } finally {
+    sseController.abort();
+    // The listener owns its reader. Aborting the fetch also cancels the reader.
+    void sseTask?.catch(() => {});
   }
 }
 
@@ -289,6 +462,7 @@ export async function ensureRouterModelReady(
     });
   let lastStatus: string | undefined;
   let lastProgress: number | undefined;
+  let loggedProgress: number | undefined;
   let lastSnapshot: Snapshot | undefined;
   const listener: Listener = (change) => {
     if (change === "load_requested") {
@@ -305,6 +479,15 @@ export async function ensureRouterModelReady(
       lastStatus = change.state;
     }
     if (statusChanged || change.progress !== lastProgress) update(change);
+    if (
+      (change.state === "loading" || change.state === "unloaded") &&
+      change.progress !== undefined &&
+      (loggedProgress === undefined ||
+        Math.abs(change.progress - loggedProgress) >= 0.05)
+    ) {
+      emit({ type: "model_preflight_progress", progress: change.progress });
+      loggedProgress = change.progress;
+    }
     lastProgress = change.progress;
   };
   emit({ type: "model_preflight_start" });

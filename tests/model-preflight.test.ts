@@ -47,6 +47,58 @@ type Router = {
   calls: string[];
   loadCount: () => number;
 };
+type SseRouter = Router & {
+  send: (event: unknown) => void;
+  sendRaw: (chunk: string) => void;
+  close: () => void;
+  connections: () => number;
+  closed: () => number;
+};
+function withSse(server: Router, initial: unknown[] = []): SseRouter {
+  let connections = 0;
+  let closed = 0;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const encoder = new TextEncoder();
+  const sendRaw = (chunk: string) => controller?.enqueue(encoder.encode(chunk));
+  const send = (event: unknown) => {
+    sendRaw(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  const fetchMock = async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new URL(String(input)).pathname !== "/models/sse")
+      return server.fetch(input, init);
+    connections++;
+    const body = new ReadableStream<Uint8Array>({
+      start(stream) {
+        controller = stream;
+        for (const event of initial) send(event);
+      },
+      cancel() {
+        closed++;
+        controller = undefined;
+      },
+    });
+    return new Response(body, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  };
+  return {
+    ...server,
+    fetch: fetchMock as typeof fetch,
+    send,
+    sendRaw,
+    close: () => controller?.close(),
+    connections: () => connections,
+    closed: () => closed,
+  };
+}
+const loading = (model: string, value: unknown, status = "loading") => ({
+  model,
+  event: "model_status",
+  data: {
+    status,
+    progress: { stages: ["text_model"], current: "text_model", value },
+  },
+});
 function router(
   sequences: Record<string, Status[]>,
   unsupported = false,
@@ -119,6 +171,7 @@ async function ready(
     signal?: AbortSignal;
     events?: ModelPreflightEvent[];
     updates?: ModelPreflightUpdate[];
+    pollIntervalMs?: number;
   } = {},
 ) {
   const baseUrl = options.baseUrl ?? base();
@@ -128,12 +181,308 @@ async function ready(
     { fetch: server.fetch },
     {
       signal: options.signal,
-      pollIntervalMs: 1,
+      pollIntervalMs: options.pollIntervalMs ?? 1,
       onEvent: (event) => options.events?.push(event),
       onUpdate: (update) => options.updates?.push(update),
     },
   );
 }
+
+async function waitUntil(condition: () => boolean) {
+  for (let i = 0; i < 100; i++) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail("Timed out waiting for preflight activity");
+}
+
+test("SSE loading progress updates 21%, 45%, and 83% and closes at ready", async () => {
+  const server = withSse(
+    router({
+      a: [{ value: "loading" }, { value: "loading" }, { value: "loaded" }],
+    }),
+    [loading("a", 0.21), loading("a", 0.45), loading("a", 0.83)],
+  );
+  const updates: ModelPreflightUpdate[] = [];
+  await ready("a", server, { updates });
+  assert.deepEqual(
+    updates
+      .filter(
+        (item) =>
+          item.kind === "model_preflight" && item.progress !== undefined,
+      )
+      .map((item) => Math.round((item as { progress: number }).progress * 100)),
+    [21, 45, 83],
+  );
+  assert.equal(server.connections(), 1);
+  await waitUntil(() => server.closed() === 1);
+  assert.equal(updates.at(-1)?.kind, "model_preflight_end");
+});
+
+test("SSE ignores other models and normalizes ordered stages", async () => {
+  const server = withSse(
+    router({ b: [{ value: "loading" }, { value: "loaded" }] }),
+    [
+      loading("a", 0.3),
+      {
+        model: "b",
+        event: "model_status",
+        data: {
+          status: "loading",
+          progress: {
+            stages: ["text_model", "mmproj_model"],
+            current: "mmproj_model",
+            value: 0.4,
+          },
+        },
+      },
+    ],
+  );
+  const updates: ModelPreflightUpdate[] = [];
+  await ready("b", server, { updates });
+  assert.deepEqual(
+    updates
+      .filter(
+        (item) =>
+          item.kind === "model_preflight" && item.progress !== undefined,
+      )
+      .map((item) => Math.round((item as { progress: number }).progress * 100)),
+    [70],
+  );
+});
+
+test("SSE malformed progress is ignored and finite values are clamped", async () => {
+  const server = withSse(
+    router({ a: [{ value: "loading" }, { value: "loaded" }] }),
+    [
+      loading("a", "foo"),
+      loading("a", null),
+      { model: "a", event: "model_status", data: { status: "loading" } },
+      loading("a", -1),
+      loading("a", 1.5),
+    ],
+  );
+  const updates: ModelPreflightUpdate[] = [];
+  await ready("a", server, { updates });
+  assert.deepEqual(
+    updates
+      .filter(
+        (item) =>
+          item.kind === "model_preflight" && item.progress !== undefined,
+      )
+      .map((item) => (item as { progress: number }).progress),
+    [0, 1],
+  );
+});
+
+test("malformed and split SSE frames do not interrupt readiness", async () => {
+  const server = withSse(
+    router({
+      a: [{ value: "loading" }, { value: "loading" }, { value: "loaded" }],
+    }),
+  );
+  const updates: ModelPreflightUpdate[] = [];
+  const task = ready("a", server, { updates, pollIntervalMs: 15 });
+  await waitUntil(() => server.connections() === 1);
+  server.sendRaw("data: {bad json}\n\n");
+  server.sendRaw(
+    'data: {"model":"a","event":"model_status","data":{"status":"loading","progress":',
+  );
+  server.sendRaw(
+    '{"stages":["text_model"],"current":"text_model","value":0.45}}}\r\n\r\n',
+  );
+  await task;
+  assert.ok(
+    updates.some(
+      (item) => item.kind === "model_preflight" && item.progress === 0.45,
+    ),
+  );
+});
+
+test("SSE 404 is optional and polling still reaches inference readiness", async () => {
+  const regular = router({ a: [{ value: "loading" }, { value: "loaded" }] });
+  let attempts = 0;
+  const server: Router = {
+    ...regular,
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname === "/models/sse") {
+        attempts++;
+        return new Response(null, { status: 404 });
+      }
+      return regular.fetch(input, init);
+    }) as typeof fetch,
+  };
+  await ready("a", server);
+  assert.equal(attempts, 1);
+});
+
+test("SSE disconnect clears progress and polling still completes", async () => {
+  const server = withSse(
+    router({
+      a: [{ value: "loading" }, { value: "loading" }, { value: "loaded" }],
+    }),
+    [loading("a", 0.2), loading("a", 0.45)],
+  );
+  const updates: ModelPreflightUpdate[] = [];
+  const task = ready("a", server, { updates, pollIntervalMs: 5 });
+  await waitUntil(() =>
+    updates.some(
+      (item) => item.kind === "model_preflight" && item.progress === 0.45,
+    ),
+  );
+  server.close();
+  await task;
+  assert.ok(
+    updates.some(
+      (item) =>
+        item.kind === "model_preflight" &&
+        item.state === "loading" &&
+        item.progress === undefined,
+    ),
+  );
+  assert.equal(updates.at(-1)?.kind, "model_preflight_end");
+});
+
+test("last caller abort cancels SSE and polling", async () => {
+  const server = withSse(router({ a: [{ value: "loading" }] }));
+  const controller = new AbortController();
+  const task = ready("a", server, {
+    signal: controller.signal,
+    pollIntervalMs: 50,
+  });
+  await waitUntil(() => server.connections() === 1);
+  controller.abort();
+  await assert.rejects(task);
+  await waitUntil(() => server.closed() === 1);
+  const calls = server.calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 55));
+  assert.equal(server.calls.length, calls);
+});
+
+test("same-model callers share SSE and one abort leaves the listener for the other", async () => {
+  const url = base();
+  const server = withSse(
+    router({
+      a: [
+        { value: "unloaded" },
+        { value: "loading" },
+        { value: "loading" },
+        { value: "loaded" },
+      ],
+    }),
+  );
+  const controller = new AbortController();
+  const first = ready("a", server, {
+    baseUrl: url,
+    signal: controller.signal,
+    pollIntervalMs: 15,
+  });
+  const second = ready("a", server, { baseUrl: url, pollIntervalMs: 15 });
+  await waitUntil(() => server.connections() === 1);
+  controller.abort();
+  await assert.rejects(first);
+  assert.equal(server.closed(), 0);
+  await second;
+  assert.equal(server.loadCount(), 1);
+  assert.equal(server.connections(), 1);
+  await waitUntil(() => server.closed() === 1);
+});
+
+test("different models keep independent SSE progress", async () => {
+  const url = base();
+  const server = withSse(
+    router({
+      a: [
+        { value: "loading" },
+        { value: "loading" },
+        { value: "loading" },
+        { value: "loaded" },
+      ],
+      b: [
+        { value: "loading" },
+        { value: "loading" },
+        { value: "loading" },
+        { value: "loaded" },
+      ],
+    }),
+    [loading("a", 0.3), loading("b", 0.74)],
+  );
+  const a: ModelPreflightUpdate[] = [];
+  const b: ModelPreflightUpdate[] = [];
+  await Promise.all([
+    ready("a", server, { baseUrl: url, updates: a }),
+    ready("b", server, { baseUrl: url, updates: b }),
+  ]);
+  assert.equal(server.connections(), 2);
+  assert.deepEqual(
+    a
+      .filter(
+        (item) =>
+          item.kind === "model_preflight" && item.progress !== undefined,
+      )
+      .map((item) => (item as { progress: number }).progress),
+    [0.3],
+  );
+  assert.deepEqual(
+    b
+      .filter(
+        (item) =>
+          item.kind === "model_preflight" && item.progress !== undefined,
+      )
+      .map((item) => (item as { progress: number }).progress),
+    [0.74],
+  );
+});
+
+test("SSE progress JSONL events are bounded while status logs remain transitions", async () => {
+  const server = withSse(
+    router({
+      a: [{ value: "loading" }, { value: "loading" }, { value: "loaded" }],
+    }),
+    Array.from({ length: 31 }, (_, i) => loading("a", (40 + i) / 100)),
+  );
+  const events: ModelPreflightEvent[] = [];
+  await ready("a", server, { events });
+  const dir = await mkdtemp(join(tmpdir(), "pi-team-preflight-sse-"));
+  try {
+    const path = join(dir, "attempt.jsonl");
+    await writeFile(path, "");
+    const logger = new AttemptLogger(path);
+    for (const event of events) logger.append(event);
+    await logger.flush();
+    const lines = (await readFile(path, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const progress = lines.filter(
+      (line) => line.type === "model_preflight_progress",
+    );
+    assert.ok(progress.length > 0 && progress.length <= 7);
+    assert.equal(progress[0].model, "a");
+    assert.equal(progress[0].progress, 0.4);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  assert.deepEqual(
+    events
+      .filter((event) => event.type === "model_status")
+      .map((event) => event.status),
+    ["loading", "loaded"],
+  );
+});
+
+test("SSE connection closes when authoritative polling sees a failed load", async () => {
+  const server = withSse(
+    router({
+      a: [
+        { value: "loading" },
+        { value: "unloaded", failed: true, exit_code: 2 },
+      ],
+    }),
+  );
+  await assert.rejects(ready("a", server), /Model failed to load/);
+  await waitUntil(() => server.closed() === 1);
+});
 
 test("Router base URL removes only a final /v1", () => {
   assert.equal(routerBaseUrl("http://mini:8080/v1")?.href, "http://mini:8080/");
@@ -588,9 +937,9 @@ test("TUI changes from model loading progress to provider and tool activity", ()
     model: "a",
     state: "loading",
     startedAt: 1000,
-    progress: 0.44,
+    progress: 0.45,
   });
-  assert.match(renderProgress(state, ui).join("\n"), /↳ loading model · 44%/);
+  assert.match(renderProgress(state, ui).join("\n"), /↳ loading model · 45%/);
   send({ kind: "model_preflight_end" });
   ui.event({
     type: "providerProgress",
@@ -608,6 +957,7 @@ test("TUI changes from model loading progress to provider and tool activity", ()
     renderProgress(state, ui).join("\n"),
     /↳ waiting for model response/,
   );
+  assert.doesNotMatch(renderProgress(state, ui).join("\n"), /loading model/);
   ui.event({
     type: "providerProgress",
     role: "solver1",
