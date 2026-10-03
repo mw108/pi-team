@@ -324,6 +324,7 @@ test("future Reporter prompt drift uses new prompt without replaying work", asyn
   const s = await engine.start("task", noCommit());
   s.phase = "REPORT";
   s.results.implementor = output("implementor");
+  s.results.securityReviewer = output("securityReviewer");
   await engine.store.save(s);
   await writeFile(
     join(teamRoot(cwd), "agents", "reporter.md"),

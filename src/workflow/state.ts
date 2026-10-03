@@ -8,8 +8,16 @@ import {
 } from "../config/schema.ts";
 import { assertRelative } from "../agents/permissions.ts";
 import { detectedCommandId } from "../agents/discovery.ts";
-import { similarCommandRuleSchema } from "../agents/runtime-commands.ts";
+import {
+  normalizedRuntimeCommand,
+  similarCommandRuleSchema,
+} from "../agents/runtime-commands.ts";
 import { posix } from "node:path";
+import {
+  redactVisibleText,
+  redactStructured,
+  redactStructuredInPlace,
+} from "../agents/redaction.ts";
 const exactPath = z.string().superRefine((path, ctx) => {
   try {
     assertRelative(path);
@@ -36,6 +44,7 @@ export const approvalSchema = z.object({
     "configDrift",
     "manualRetry",
     "runtimeCommand",
+    "sensitivePaths",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -164,6 +173,9 @@ export const stateSchema = z.object({
   discoveredCommands: z.array(discoveredCommandSchema).default([]),
   approvedCommands: z.array(commandSchema).default([]),
   runtimeApprovedCommandIds: z.array(z.string()).default([]),
+  runtimeCommandApprovals: z
+    .array(z.object({ role: z.enum(roles), command: commandSchema }))
+    .default([]),
   similarCommandRules: z.array(similarCommandRuleSchema).default([]),
   pendingRuntimeCommands: z
     .array(
@@ -181,6 +193,8 @@ export const stateSchema = z.object({
     .default([]),
   commandApprovalComplete: z.boolean().default(false),
   approvedDirtyPaths: z.array(exactPath).default([]),
+  approvedSensitivePaths: z.array(z.string()).default([]),
+  sensitiveApprovalContractHash: z.string().optional(),
   pendingApproval: approvalSchema.optional(),
   inFlight: z
     .object({ phase: z.enum(phases), roles: z.array(z.enum(roles)) })
@@ -231,6 +245,34 @@ function migrateState(value: unknown): unknown {
       };
   }
   if (!value || typeof value !== "object") return value;
+  // Earlier runtime grants had category scope, and old similarity rules allowed
+  // arbitrary suffixes. Their requesting role cannot be recovered safely.
+  const legacy = value as Record<string, any>;
+  const revokedIds = new Set<string>(legacy.runtimeApprovedCommandIds ?? []);
+  const revokedRules = (legacy.similarCommandRules ?? []).filter(
+    (rule: any) => rule.allowRemainingArgs || !rule.role,
+  );
+  if (revokedIds.size || revokedRules.length) {
+    value = {
+      ...legacy,
+      approvedCommands: (legacy.approvedCommands ?? []).filter(
+        (command: any) => !revokedIds.has(command.id),
+      ),
+      runtimeApprovedCommandIds: [],
+      similarCommandRules: (legacy.similarCommandRules ?? []).filter(
+        (rule: any) => !rule.allowRemainingArgs && rule.role,
+      ),
+      history: [
+        ...(legacy.history ?? []),
+        {
+          at: new Date().toISOString(),
+          phase: legacy.phase,
+          event: "legacy_runtime_approvals_revoked",
+          detail: `${revokedIds.size} exact and ${revokedRules.length} similar grants require reapproval`,
+        },
+      ],
+    };
+  }
   if ((value as any).version === 2) return { ...(value as object), version: 3 };
   if ((value as any).version !== 1) return value;
   const old = value as Record<string, unknown>;
@@ -313,6 +355,30 @@ export function validateState(value: unknown): WorkflowState {
       throw new Error(
         "Runtime command approval has no matching deterministic command",
       );
+  for (const approval of state.runtimeCommandApprovals) {
+    const command = approval.command;
+    const expected = normalizedRuntimeCommand(
+      {
+        executable: command.executable,
+        args: command.args,
+        purpose: "Persisted runtime approval",
+        category: command.purpose,
+      },
+      approval.role,
+    ).command;
+    if (command.id !== expected.id)
+      throw new Error("Runtime role approval identity mismatch");
+  }
+  for (const rule of state.similarCommandRules)
+    normalizedRuntimeCommand(
+      {
+        executable: rule.executable,
+        args: rule.argsPrefix,
+        purpose: "Persisted similar approval",
+        category: rule.category,
+      },
+      rule.role,
+    );
   for (const pending of state.pendingRuntimeCommands)
     if (
       pending.workflowId !== state.id ||
@@ -354,9 +420,11 @@ export function newState(
     discoveredCommands: [],
     approvedCommands: [],
     runtimeApprovedCommandIds: [],
+    runtimeCommandApprovals: [],
     similarCommandRules: [],
     pendingRuntimeCommands: [],
     approvedDirtyPaths: [],
+    approvedSensitivePaths: [],
     commandApprovalComplete: false,
   };
 }
@@ -370,12 +438,39 @@ export function record(
     at: new Date().toISOString(),
     phase: state.phase,
     event,
-    detail,
-    ...(meta ? { meta } : {}),
+    detail: redactVisibleText(detail),
+    ...(meta ? { meta: redactStructured(meta) } : {}),
   });
 }
 export function block(state: WorkflowState, reason: string) {
   record(state, "blocked", reason);
   state.phase = "BLOCKED";
-  state.blocker = reason;
+  state.blocker = redactVisibleText(reason);
+}
+
+/** Sanitize free text before each new state write; operational argv stays intact. */
+export function sanitizeWorkflowStateText(state: WorkflowState): void {
+  state.task = redactVisibleText(state.task);
+  state.requirements = state.requirements.map(redactVisibleText);
+  redactStructuredInPlace(state.results);
+  redactStructuredInPlace(state.answers);
+  redactStructuredInPlace(state.history);
+  if (state.blocker) state.blocker = redactVisibleText(state.blocker);
+  if (state.reportFailure)
+    state.reportFailure = redactVisibleText(state.reportFailure);
+  if (state.reportInput)
+    state.reportInput = redactStructured(state.reportInput);
+  if (state.pendingQuestion)
+    state.pendingQuestion = redactStructured(state.pendingQuestion);
+  if (state.pendingResearchQuestions)
+    state.pendingResearchQuestions =
+      state.pendingResearchQuestions.map(redactVisibleText);
+  if (state.pendingApproval)
+    state.pendingApproval = redactStructured(state.pendingApproval);
+  state.pendingRuntimeCommands = state.pendingRuntimeCommands.map((entry) => ({
+    ...entry,
+    purpose: redactVisibleText(entry.purpose),
+  }));
+  state.baseline.diff = "";
+  state.baseline.cachedDiff = "";
 }

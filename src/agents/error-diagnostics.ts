@@ -16,16 +16,12 @@ export interface ErrorDiagnostics {
 }
 
 function safeText(value: string, max = 300): string {
-  return value
-    .split(/[\r\n]/, 1)[0]
-    .slice(0, max)
-    .replace(/https?:\/\/[^\s)]+/gi, "[URL REDACTED]")
-    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/\b(?:sk-[\w-]{8,}|[A-Za-z0-9_-]{40,})\b/g, "[REDACTED]")
-    .replace(
-      /\b(?:authorization|cookie|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+/gi,
-      "[REDACTED]",
-    );
+  return redactVisibleText(
+    value
+      .split(/[\r\n]/, 1)[0]
+      .slice(0, max)
+      .replace(/https?:\/\/[^\s)]+/gi, "[URL REDACTED]"),
+  );
 }
 
 function get(value: object, key: string): unknown {
@@ -118,3 +114,4 @@ export function firstErrorCode(error: ErrorDiagnostics): string | undefined {
     ? firstErrorCode(error.cause)
     : error.errors?.map(firstErrorCode).find(Boolean);
 }
+import { redactVisibleText } from "./redaction.ts";

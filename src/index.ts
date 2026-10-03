@@ -27,6 +27,7 @@ import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
 import { getAgentDisplayName } from "./ui/agent-name.ts";
 import { inactiveSolverError } from "./config/solvers.ts";
 import { formatErrorForPiNotification } from "./agents/error-message.ts";
+import { redactVisibleText } from "./agents/redaction.ts";
 import {
   buildCompletionReportInput,
   fallbackReport,
@@ -213,6 +214,10 @@ export default function teamExtension(pi: ExtensionAPI) {
       let ownedRuntime: ProgressRuntime | undefined;
       try {
         const role = target(args, "team-retry");
+        if (continuationPending)
+          throw new Error("Workflow continuation is in progress.");
+        if (active && !active.state)
+          throw new Error("Team workflow startup is still in progress.");
         const root = await projectRoot(ctx.cwd);
         if (active?.state && active.state.cwd !== root)
           throw new Error("Another repository has an active team workflow.");
@@ -351,6 +356,13 @@ export default function teamExtension(pi: ExtensionAPI) {
     description: "Show the latest persisted team workflow",
     handler: async (args, ctx) => {
       try {
+        if (!args.trim() && active && !active.state) {
+          ctx.ui.notify(
+            "Team workflow is starting; no workflow state has been created yet.",
+            "info",
+          );
+          return;
+        }
         const root = await projectRoot(ctx.cwd),
           store = new StateStore(root),
           live = active?.state?.cwd === root ? active : undefined,
@@ -370,7 +382,9 @@ export default function teamExtension(pi: ExtensionAPI) {
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
-            `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
+            redactVisibleText(
+              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
+            ),
             "info",
           );
         } else ctx.ui.notify("No team workflow in this repository.", "info");
@@ -470,7 +484,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         ctx.ui.notify(result.lines.join("\n"), result.ok ? "info" : "error");
         return;
       }
-      if (active) {
+      if (active || continuationPending) {
         ctx.ui.notify("A team workflow is already active.", "warning");
         return;
       }
@@ -481,16 +495,21 @@ export default function teamExtension(pi: ExtensionAPI) {
         );
         return;
       }
-      await ctx.waitForIdle();
       const controller = new AbortController();
       const runtime = new ProgressRuntime(() => {
         if (runtime.state) progress(ctx, runtime.state, runtime);
       });
-      active = { controller, runtime };
+      // Reserve ownership synchronously, before waitForIdle can yield to a
+      // second /team invocation. The background task releases this same entry.
+      const entry: ActiveWorkflow = { controller, runtime };
+      active = entry;
       controller.signal.addEventListener("abort", () => runtime.cancel(), {
         once: true,
       });
       try {
+        await ctx.waitForIdle();
+        if (controller.signal.aborted)
+          throw new Error("Team startup was stopped before workflow creation.");
         const engine = new WorkflowEngine(ctx.cwd, new PiRunner(), {
           progress: (s) => runtime.bind(s),
           ask: (q) => askUser(pi, ctx, q),
@@ -500,7 +519,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           agentEvent: (event) => runtime.event(event),
         });
         runtime.bindSessions(engine.sessions);
-        active.engine = engine;
+        entry.engine = engine;
         const [verb, id] = args.trim().split(/\s+/);
         let state;
         if (verb === "resume") {
@@ -517,17 +536,17 @@ export default function teamExtension(pi: ExtensionAPI) {
             definition,
           );
         }
-        active.state = state;
+        entry.state = state;
         runtime.configure(
           state.config.ui.progress.refreshMs,
           state.config.ui.progress.enabled,
         );
         runtime.bind(state);
-        launch(active, () => engine.run(state, controller.signal), ctx, true);
+        launch(entry, () => engine.run(state, controller.signal), ctx, true);
       } catch (e) {
         ctx.ui.notify(formatErrorForPiNotification(e), "error");
         runtime.dispose();
-        if (active?.runtime === runtime) active = undefined;
+        if (active === entry) active = undefined;
       }
     },
   });

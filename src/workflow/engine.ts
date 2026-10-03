@@ -17,9 +17,11 @@ import {
 } from "../agents/schemas.ts";
 import {
   assertRelative,
+  contractIdentity,
   contractPaths,
   validateContractPaths,
 } from "../agents/permissions.ts";
+import { classifyPath, policyPath } from "../agents/path-policy.ts";
 import {
   discoverCommands,
   commandKey,
@@ -30,6 +32,7 @@ import {
   normalizedRuntimeCommand,
   proposeSimilarRule,
   ruleMatches,
+  similarRuleDescription,
   type RuntimeCommandRequest,
 } from "../agents/runtime-commands.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
@@ -72,6 +75,7 @@ import {
   formatCommandLine,
 } from "../agents/command-observability.ts";
 import { approvedCommandsForRole } from "../agents/commands.ts";
+import { allowedCommandCategories } from "../agents/command-policy.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -134,6 +138,7 @@ export class WorkflowEngine {
   private pendingRewind?: { workflowId: string; role: Role; phase: Phase };
   private running = false;
   private runningWorkflowId?: string;
+  private ownedState?: WorkflowState;
   private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
   private commandApprovalQueue = Promise.resolve();
@@ -143,23 +148,10 @@ export class WorkflowEngine {
     command: Command,
     purpose: string,
   ): ApprovalRequest {
-    const rule = proposeSimilarRule(command);
+    const rule = proposeSimilarRule(command, role);
     const line = formatCommandLine(command);
     const label = getAgentDisplayName(s.config, role);
-    const ruleLine = rule
-      ? [rule.executable, ...rule.argsPrefix, "*"].join(" ")
-      : "";
-    const examples = rule
-      ? [
-          [rule.executable, ...rule.argsPrefix].join(" "),
-          [rule.executable, ...rule.argsPrefix, "--filter=OtherTest"].join(" "),
-          [
-            rule.executable,
-            ...rule.argsPrefix,
-            "tests/Feature/AuthTest.php",
-          ].join(" "),
-        ].join("\n")
-      : "";
+    const ruleLine = rule ? similarRuleDescription(rule) : "";
     const discovered = s.discoveredCommands.find(
       (item) => commandKey(item.command) === commandKey(command),
     );
@@ -169,7 +161,7 @@ export class WorkflowEngine {
     return {
       kind: "runtimeCommand",
       title: `${label} requests command approval`,
-      prompt: `${label} wants to run:\n${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}${rule ? `\n\nAllow similar rule: ${ruleLine}\nThis would also allow:\n${examples}\nIt would NOT allow:\nphp artisan migrate:fresh` : ""}`,
+      prompt: `Agent: ${label} (${role})\nCategory: ${command.purpose}\n\nCommand: ${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}\n\nThis command may modify project files, generated artifacts, or local development state.\n\nScope: exact command for ${label} in this workflow.${rule ? `\n\nAllow similar for ${label}: ${ruleLine}` : ""}`,
       options: [
         {
           value: "allow_once",
@@ -178,15 +170,15 @@ export class WorkflowEngine {
         },
         {
           value: "allow_workflow",
-          label: "Allow for workflow",
-          description: "Approve this exact argv for this workflow",
+          label: `Allow exact for ${label} in this workflow`,
+          description: "Approve this exact argv for this role and workflow",
         },
         ...(rule
           ? [
               {
                 value: "allow_similar",
                 label: "Allow similar",
-                description: `Approve the displayed prefix rule: ${ruleLine}`,
+                description: `Approve the displayed constrained rule for ${label}`,
               },
             ]
           : []),
@@ -200,20 +192,23 @@ export class WorkflowEngine {
   }
   private saveRuntimeApproval(
     s: WorkflowState,
+    role: Role,
     command: Command,
     choice: string,
   ) {
     if (choice === "allow_workflow" || choice === "allow_similar") {
       if (
-        !s.approvedCommands.some(
-          (item) => commandKey(item) === commandKey(command),
+        !s.runtimeCommandApprovals.some(
+          (item) =>
+            item.role === role &&
+            commandKey(item.command) === commandKey(command),
         )
       )
-        s.approvedCommands.push(command);
-      if (!s.runtimeApprovedCommandIds.includes(command.id))
-        s.runtimeApprovedCommandIds.push(command.id);
+        s.runtimeCommandApprovals.push({ role, command });
       const rule =
-        choice === "allow_similar" ? proposeSimilarRule(command) : undefined;
+        choice === "allow_similar"
+          ? proposeSimilarRule(command, role)
+          : undefined;
       if (
         rule &&
         !s.similarCommandRules.some(
@@ -241,11 +236,15 @@ export class WorkflowEngine {
       !signal?.aborted;
     if (!current()) return "pending";
     const approved = () =>
-      approvedCommandsForRole(role, effectiveConfig(s)).some(
+      approvedCommandsForRole(role, effectiveConfig(s, role)).some(
         (item) => commandKey(item) === commandKey(command),
-      ) || s.similarCommandRules.some((rule) => ruleMatches(rule, command));
+      ) ||
+      s.similarCommandRules.some((rule) => ruleMatches(rule, command, role));
     if (approved()) {
       agentState.approvedCommands = structuredClone(s.approvedCommands);
+      agentState.runtimeCommandApprovals = structuredClone(
+        s.runtimeCommandApprovals,
+      );
       agentState.similarCommandRules = structuredClone(s.similarCommandRules);
       this.emitAgentEvent({
         type: "commandApproved",
@@ -267,6 +266,9 @@ export class WorkflowEngine {
     log({
       type: "command_approval_requested",
       agent: role,
+      requestingRole: role,
+      category: command.purpose,
+      approvalScope: "role-and-workflow",
       run: control.attempt,
       requestId: pending.requestId,
       ...safe,
@@ -287,6 +289,9 @@ export class WorkflowEngine {
         );
         await this.store.save(s);
         agentState.approvedCommands = structuredClone(s.approvedCommands);
+        agentState.runtimeCommandApprovals = structuredClone(
+          s.runtimeCommandApprovals,
+        );
         agentState.similarCommandRules = structuredClone(s.similarCommandRules);
         this.emitAgentEvent({
           type: "commandApproved",
@@ -329,11 +334,14 @@ export class WorkflowEngine {
         !["allow_once", "allow_workflow", "allow_similar", "deny"].includes(
           choice,
         ) ||
-        (choice === "allow_similar" && !proposeSimilarRule(command))
+        (choice === "allow_similar" && !proposeSimilarRule(command, role))
       )
         return "pending";
-      this.saveRuntimeApproval(s, command, choice);
+      this.saveRuntimeApproval(s, role, command, choice);
       agentState.approvedCommands = structuredClone(s.approvedCommands);
+      agentState.runtimeCommandApprovals = structuredClone(
+        s.runtimeCommandApprovals,
+      );
       agentState.similarCommandRules = structuredClone(s.similarCommandRules);
       s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
         (item) => item.requestId !== pending.requestId,
@@ -341,11 +349,20 @@ export class WorkflowEngine {
       log({
         type: "command_approval_decided",
         agent: role,
+        requestingRole: role,
+        category: command.purpose,
+        approvalScope:
+          choice === "allow_once"
+            ? "once"
+            : choice === "deny"
+              ? "none"
+              : "role-and-workflow",
+        commandId: command.id,
         run: control.attempt,
         requestId: pending.requestId,
         decision: choice,
         ...(choice === "allow_similar"
-          ? { rule: proposeSimilarRule(command) }
+          ? { rule: proposeSimilarRule(command, role) }
           : {}),
       });
       await this.persistAttempt(
@@ -495,6 +512,31 @@ export class WorkflowEngine {
     return `${getAgentDisplayName(state.config, role)} (${role}) already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.map((id) => getAgentDisplayName(state.config, id)).join(", ")}` : ""}. Continue?`;
   }
   async retryAgent(state: WorkflowState, role: Role, confirmed = false) {
+    // An active run already owns the workflow lock. Detached retries take it
+    // here and refresh state so a second process cannot replay a stale retry.
+    if (this.running) return this.retryAgentLocked(state, role, confirmed);
+    const unlock = await this.store.lock();
+    try {
+      if (state !== this.ownedState) {
+        const latest = await this.store.latest();
+        if (!latest || latest.id !== state.id)
+          throw new Error(
+            "Workflow mismatch for agent retry; reload the latest state.",
+          );
+        for (const key of Object.keys(state))
+          delete (state as Record<string, unknown>)[key];
+        Object.assign(state, latest);
+      }
+      return await this.retryAgentLocked(state, role, confirmed);
+    } finally {
+      await unlock();
+    }
+  }
+  private async retryAgentLocked(
+    state: WorkflowState,
+    role: Role,
+    confirmed: boolean,
+  ) {
     this.assertActiveAgent(state, role);
     const label = getAgentDisplayName(state.config, role);
     if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
@@ -521,7 +563,7 @@ export class WorkflowEngine {
     }
     if (this.retryRequests.has(role))
       throw new Error(`Agent ${label} (${role}) is already restarting.`);
-    if (state.manualRetry && state.manualRetry.agent !== role)
+    if (state.manualRetry)
       throw new Error(
         `Agent ${getAgentDisplayName(state.config, state.manualRetry.agent)} (${state.manualRetry.agent}) already has a pending manual retry.`,
       );
@@ -732,6 +774,20 @@ export class WorkflowEngine {
     );
   }
   async start(task: string, config: TeamConfig, definition?: TeamDefinition) {
+    const unlock = await this.store.lock();
+    try {
+      const state = await this.startLocked(task, config, definition);
+      this.ownedState = state;
+      return state;
+    } finally {
+      await unlock();
+    }
+  }
+  private async startLocked(
+    task: string,
+    config: TeamConfig,
+    definition?: TeamDefinition,
+  ) {
     const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
     if (root !== this.cwd)
       throw new Error("Run /team from the repository root");
@@ -937,9 +993,10 @@ export class WorkflowEngine {
                     ? inputSummary.command
                     : undefined;
                 let approved = commandId
-                  ? approvedCommandsForRole(role, effectiveConfig(s)).find(
-                      (item) => item.id === commandId,
-                    )
+                  ? approvedCommandsForRole(
+                      role,
+                      effectiveConfig(s, role),
+                    ).find((item) => item.id === commandId)
                   : undefined;
                 if (!commandId && rawName === "team_command") {
                   try {
@@ -949,7 +1006,7 @@ export class WorkflowEngine {
                     ).command;
                     approved = approvedCommandsForRole(
                       role,
-                      effectiveConfig(s),
+                      effectiveConfig(s, role),
                     ).find(
                       (item) => commandKey(item) === commandKey(requested),
                     );
@@ -1489,6 +1546,22 @@ export class WorkflowEngine {
     }
   }
   async resumeReadonly(s: WorkflowState) {
+    // Resume may be invoked before run(); acquire the same lock used by run.
+    if (this.running) return this.resumeReadonlyLocked(s);
+    const unlock = await this.store.lock();
+    try {
+      if (s !== this.ownedState) {
+        const latest = await this.store.load(s.id);
+        for (const key of Object.keys(s))
+          delete (s as Record<string, unknown>)[key];
+        Object.assign(s, latest);
+      }
+      await this.resumeReadonlyLocked(s);
+    } finally {
+      await unlock();
+    }
+  }
+  private async resumeReadonlyLocked(s: WorkflowState) {
     if (s.teamConfigHash && s.agentPromptHashes && s.teamConfigPath) {
       const current = await loadConfig(this.cwd);
       const drift = analyzeConfigDrift(s, current);
@@ -1576,6 +1649,12 @@ export class WorkflowEngine {
     this.running = true;
     this.runningWorkflowId = s.id;
     try {
+      if (!existingUnlock && s !== this.ownedState) {
+        const latest = await this.store.load(s.id);
+        for (const key of Object.keys(s))
+          delete (s as Record<string, unknown>)[key];
+        Object.assign(s, latest);
+      }
       // A process restart loses the suspended agent session. Re-present saved
       // requests without ever replaying the command or consuming an allow-once grant.
       if (s.pendingRuntimeCommands.length && this.activeAttempts.size === 0) {
@@ -1599,7 +1678,7 @@ export class WorkflowEngine {
             !request.options.some((option) => option.value === choice)
           )
             break;
-          this.saveRuntimeApproval(s, pending.command, choice);
+          this.saveRuntimeApproval(s, pending.agentId, pending.command, choice);
           s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(
             (item) => item.requestId !== pending.requestId,
           );
@@ -1610,11 +1689,15 @@ export class WorkflowEngine {
             log.append({
               type: "command_approval_decided",
               agent: pending.agentId,
+              requestingRole: pending.agentId,
+              category: pending.command.purpose,
+              approvalScope: choice === "deny" ? "none" : "role-and-workflow",
+              commandId: pending.command.id,
               run: pending.run,
               requestId: pending.requestId,
               decision: choice,
               ...(choice === "allow_similar"
-                ? { rule: proposeSimilarRule(pending.command) }
+                ? { rule: proposeSimilarRule(pending.command, pending.agentId) }
                 : {}),
             });
             await log.flush();
@@ -1633,6 +1716,31 @@ export class WorkflowEngine {
         }
       }
       await this.recover(s);
+      if (
+        (["TEST", "COMMIT", "REPORT"] as Phase[]).includes(s.phase) &&
+        !s.results.securityReviewer
+      ) {
+        if (s.commit) {
+          block(
+            s,
+            "Legacy workflow reached commit without Security Review; inspect the commit manually",
+          );
+        } else {
+          record(
+            s,
+            "security_review_migration",
+            "Security Review required before downstream gates",
+          );
+          for (const role of ["tester", "commitAgent", "reporter"]) {
+            if (s.results[role])
+              s.results[`previous_${role}`] = s.results[role];
+            delete s.results[role];
+          }
+          delete s.reportInput;
+          s.phase = "SECURITY_REVIEW";
+        }
+        await this.store.save(s);
+      }
       if (s.pendingApproval?.kind === "commands") {
         s.phase = s.resumePhase ?? "RESEARCH";
         delete s.pendingApproval;
@@ -1801,7 +1909,7 @@ export class WorkflowEngine {
               s.commandApprovalComplete = true;
               if (
                 !effectiveConfig(s).commands.some((c) =>
-                  ["test", "static"].includes(c.purpose),
+                  allowedCommandCategories("tester").includes(c.purpose),
                 ) &&
                 s.config.qualityGates.testing.enabled
               )
@@ -1830,6 +1938,29 @@ export class WorkflowEngine {
                   s,
                   "Contract touches pre-existing user changes: dirty file approval denied",
                 );
+            } else if (request.kind === "sensitivePaths") {
+              const contract = contractSchema.parse(s.results.reviewer);
+              const identity = contractIdentity(contract);
+              const required = [
+                ...new Set(
+                  contractPaths(contract)
+                    .filter(
+                      (path) => classifyPath(path) === "requires_user_approval",
+                    )
+                    .map(policyPath),
+                ),
+              ];
+              if (
+                s.sensitiveApprovalContractHash !== identity ||
+                selected.length !== 1 ||
+                selected[0] !== "allow" ||
+                !required.length
+              )
+                block(s, "Sensitive path approval denied or contract changed");
+              else {
+                s.approvedSensitivePaths = required;
+                record(s, "sensitive_paths_approved", JSON.stringify(required));
+              }
             } else if (request.kind === "configDrift") {
               if (selected.length !== 1 || selected[0] !== "resume") {
                 block(
@@ -1961,7 +2092,9 @@ export class WorkflowEngine {
             ![
               ...effectiveConfig(s).commands,
               ...s.discoveredCommands.map((item) => item.command),
-            ].some((command) => ["test", "static"].includes(command.purpose))
+            ].some((command) =>
+              allowedCommandCategories("tester").includes(command.purpose),
+            )
           ) {
             block(
               s,
@@ -1974,6 +2107,43 @@ export class WorkflowEngine {
           const contract = contractSchema.parse(s.results.reviewer);
           const paths = contractPaths(contract);
           await validateContractPaths(this.cwd, contract);
+          const identity = contractIdentity(contract);
+          if (s.sensitiveApprovalContractHash !== identity) {
+            s.approvedSensitivePaths = [];
+            s.sensitiveApprovalContractHash = identity;
+          }
+          const sensitive = [
+            ...new Set(
+              paths.filter(
+                (path) => classifyPath(path) === "requires_user_approval",
+              ),
+            ),
+          ];
+          if (
+            sensitive.some(
+              (path) => !s.approvedSensitivePaths.includes(policyPath(path)),
+            )
+          ) {
+            await this.requestApproval(s, {
+              kind: "sensitivePaths",
+              title: "Allow sensitive file changes?",
+              prompt: `Sensitive files requested for modification:\n\n${sensitive.map((path) => `- ${path}`).join("\n")}\n\nReason:\n${contract.goal}\n\nApproval applies to these exact paths in this workflow and this contract only.`,
+              options: [
+                {
+                  value: "allow",
+                  label: "Allow for this workflow",
+                  description:
+                    "Approve the displayed exact paths for this contract",
+                },
+                {
+                  value: "deny",
+                  label: "Deny",
+                  description: "Block implementation",
+                },
+              ],
+            });
+            continue;
+          }
           const overlap = paths.filter(
             (path) =>
               s.baseline.dirtyPaths.includes(path) &&

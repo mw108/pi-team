@@ -7,6 +7,7 @@ import { getActiveSolverIds } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
 import { formatCommandLine } from "../agents/command-observability.ts";
 import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
+import { redactVisibleText } from "../agents/redaction.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -187,10 +188,7 @@ function visibleRoles(state: WorkflowState) {
       !getActiveSolverIds(state.config).includes(role as any)
     )
       return false;
-    if (
-      (role === "pentester" || role === "securityReviewer") &&
-      !state.config.qualityGates.pentest.enabled
-    )
+    if (role === "pentester" && !state.config.qualityGates.pentest.enabled)
       return false;
     if (
       role === "codeReviewer" &&
@@ -417,7 +415,7 @@ export function renderProgress(
     state.config.logging.agentLogs.level !== "off"
   )
     lines.push(`Logs: .pi/team/state/${state.id}.logs/ · /team-log`);
-  return lines;
+  return lines.map(redactVisibleText);
 }
 // The widget has a bounded history; /team-status uses renderProgress above.
 export function renderLiveProgress(
@@ -550,7 +548,8 @@ export function progress(
   ctx.ui.setWidget(
     "pi-team",
     state.config.ui.progress.enabled
-      ? renderLiveProgress(state, runtime).map((line) => {
+      ? renderLiveProgress(state, runtime).map((rawLine) => {
+          const line = redactVisibleText(rawLine);
           const theme = ctx.ui.theme;
           if (!theme?.fg) return line;
           if (line.startsWith("✓ ")) return theme.fg("dim", line);

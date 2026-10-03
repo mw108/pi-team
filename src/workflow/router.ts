@@ -23,7 +23,7 @@ export function getPhaseRoles(
   return phase === "SOLVE" ? getActiveSolverIds(s.config) : phaseRoles[phase];
 }
 export function afterCodeReview(s: WorkflowState): Phase {
-  return s.config.qualityGates.pentest.enabled ? "PENTEST" : afterSecurity(s);
+  return s.config.qualityGates.pentest.enabled ? "PENTEST" : "SECURITY_REVIEW";
 }
 export function afterSecurity(s: WorkflowState): Phase {
   return s.config.qualityGates.testing.enabled ? "TEST" : afterTests(s);
@@ -160,9 +160,15 @@ export function transition(s: WorkflowState) {
     case "SECURITY_REVIEW": {
       const review = s.results.securityReviewer as any,
         pentest = s.results.pentester as any;
-      const expected = pentest.findings.map((f: any) => f.id).sort();
+      if (s.config.qualityGates.pentest.enabled && !pentest) {
+        block(s, "Security review requires the enabled Pentest result");
+        break;
+      }
+      const expected = s.config.qualityGates.pentest.enabled
+        ? pentest?.findings?.map((f: any) => f.id).sort()
+        : undefined;
       const actual = review.findings.map((f: any) => f.id).sort();
-      if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+      if (expected && JSON.stringify(expected) !== JSON.stringify(actual)) {
         block(
           s,
           "Security review must classify every pentest finding exactly once",

@@ -1,7 +1,9 @@
 import type { Role } from "./schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
-import { actualDiff } from "../workflow/git.ts";
+import { providerDiff } from "../workflow/git.ts";
+import { redactStructured } from "./redaction.ts";
 import { effectiveConfig } from "./discovery.ts";
+import { allowedCommandCategories } from "./command-policy.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 export async function contextFor(
@@ -9,9 +11,9 @@ export async function contextFor(
   s: WorkflowState,
 ): Promise<Record<string, any>> {
   if (role === "reporter")
-    return (
+    return sanitizeContextForProvider(
       (s.reportInput as Record<string, any> | undefined) ??
-      (await buildCompletionReportInput(s))
+        (await buildCompletionReportInput(s)),
     );
   const context: Record<string, unknown> = {
     task: s.task,
@@ -22,7 +24,7 @@ export async function contextFor(
       phase: s.phase,
       uncommittedChangesExpected: !["commitAgent"].includes(role),
       laterGates:
-        "Code review → optional penetration/security review → Tester → Commit Agent. A commit is forbidden until all earlier enabled gates pass.",
+        "Code review → optional Pentest → Security Review → Tester → Commit Agent. A commit is forbidden until all earlier enabled gates pass.",
     },
   };
   const copy = (...keys: string[]) => {
@@ -72,8 +74,7 @@ export async function contextFor(
   if (role === "implementor" && s.approvedDirtyPaths.length)
     context.preExistingChanges = {
       approvedExactPaths: s.approvedDirtyPaths,
-      baselineDiff: s.baseline.diff,
-      baselineCachedDiff: s.baseline.cachedDiff,
+      // Existing user edits are identified by path, without exposing their content.
       instruction:
         "Preserve all existing working-tree content and user edits as the implementation base. Do not restore/reset or overwrite unrelated hunks. Read before editing. Automatic commit is prohibited for these files.",
     };
@@ -87,10 +88,11 @@ export async function contextFor(
     ].includes(role)
   ) {
     copy("reviewer", "implementor");
-    context.actualDiff = await actualDiff(s.cwd);
+    context.actualDiff = await providerDiff(s);
     context.baselineDirtyPaths = s.baseline.dirtyPaths;
   }
-  if (role === "securityReviewer") copy("pentester");
+  if (role === "securityReviewer" && s.config.qualityGates.pentest.enabled)
+    copy("pentester");
   if (role === "pentester")
     context.localHttpPolicy = {
       ...s.config.pentest.localHttp,
@@ -100,8 +102,8 @@ export async function contextFor(
       ],
     };
   if (role === "tester")
-    context.approvedCommands = effectiveConfig(s).commands.filter((c) =>
-      ["test", "static"].includes(c.purpose),
+    context.approvedCommands = effectiveConfig(s, role).commands.filter((c) =>
+      allowedCommandCategories(role).includes(c.purpose),
     );
   if (role === "commitAgent")
     copy("codeReviewer", "securityReviewer", "tester");
@@ -109,5 +111,9 @@ export async function contextFor(
     .filter((e) => e.event.startsWith("FIX_"))
     .slice(-5)
     .map((e) => e.event);
-  return context;
+  return sanitizeContextForProvider(context);
+}
+
+export function sanitizeContextForProvider<T>(context: T): T {
+  return redactStructured(context);
 }

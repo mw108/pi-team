@@ -9,6 +9,7 @@ import {
 } from "../config/schema.ts";
 import { assertWithin } from "./permissions.ts";
 import type { WorkflowState } from "../workflow/state.ts";
+import type { Role } from "./schemas.ts";
 export function commandKey(c: Pick<Command, "executable" | "args">) {
   return JSON.stringify([c.executable, c.args]);
 }
@@ -18,10 +19,20 @@ export function detectedCommandId(c: Pick<Command, "executable" | "args">) {
     createHash("sha256").update(commandKey(c)).digest("hex").slice(0, 12)
   );
 }
-export function effectiveConfig(s: WorkflowState) {
+export function effectiveConfig(s: WorkflowState, role?: Role) {
   const config = {
     ...s.config,
-    commands: [...s.config.commands, ...(s.approvedCommands ?? [])].filter(
+    commands: [
+      ...s.config.commands,
+      ...(s.approvedCommands ?? []).filter(
+        (c) => !s.runtimeApprovedCommandIds.includes(c.id),
+      ),
+      ...(role
+        ? s.runtimeCommandApprovals
+            .filter((approval) => approval.role === role)
+            .map((approval) => approval.command)
+        : []),
+    ].filter(
       (c, i, all) =>
         all.findIndex((other) => commandKey(other) === commandKey(c)) === i,
     ),

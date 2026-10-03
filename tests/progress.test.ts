@@ -87,7 +87,8 @@ test("disabled gates are explicit; only enabled gates show counters and agents",
   assert.match(text, /Design cycle 1\/3/);
   assert.doesNotMatch(text, /Local fixes/);
   assert.match(text, /Pentest disabled/);
-  assert.doesNotMatch(text, /Pentest cycle|Pen Tester|Security Reviewer/);
+  assert.doesNotMatch(text, /Pentest cycle|Pen Tester/);
+  assert.match(text, /Security Reviewer/);
   s.config.qualityGates.pentest.enabled = true;
   s.pentestCycle = 1;
   text = lines(s);

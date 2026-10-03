@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { roles, solverIds } from "../agents/schemas.ts";
 import { httpMethods, localUrl } from "./http.ts";
+import {
+  commandCategories,
+  hasUnsafeArgvToken,
+  isForbiddenExecutable,
+} from "../agents/command-policy.ts";
 export const logicalRoles = [
   "orchestrator",
   "researcher",
@@ -84,36 +89,17 @@ export const commandSchema = z
     id: z.string().regex(/^[\w-]+$/),
     executable: z.string().min(1),
     args: z.array(z.string()),
-    purpose: z.enum(["development", "test", "static", "pentest"]),
+    purpose: z.enum(commandCategories),
     timeoutMs: z.number().int().positive().max(600000).default(120000),
   })
   .strict()
   .superRefine((command, ctx) => {
-    const name = command.executable.split(/[\\/]/).at(-1)?.toLowerCase();
-    if (
-      [
-        "git",
-        "git.exe",
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "pwsh",
-        "powershell",
-        "cmd",
-        "cmd.exe",
-        "eval",
-      ].includes(name ?? "")
-    )
+    if (isForbiddenExecutable(command.executable))
       ctx.addIssue({
         code: "custom",
         message: "Direct Git and shell-wrapper commands are not allowed",
       });
-    if (
-      [command.executable, ...command.args].some(
-        (v) => /[\0\r\n]/.test(v) || /^(?:&&|\|\||;|\||&)$/u.test(v),
-      )
-    )
+    if (hasUnsafeArgvToken(command.executable, command.args))
       ctx.addIssue({
         code: "custom",
         message: "Command chaining and control characters are not allowed",
@@ -311,24 +297,7 @@ export const configSchema = z
         });
     }
     for (const command of v.commands) {
-      const executable = command.executable
-        .split(/[\\/]/)
-        .at(-1)
-        ?.toLowerCase();
-      if (
-        [
-          "git",
-          "git.exe",
-          "sh",
-          "bash",
-          "zsh",
-          "fish",
-          "pwsh",
-          "powershell",
-          "cmd",
-          "cmd.exe",
-        ].includes(executable ?? "")
-      )
+      if (isForbiddenExecutable(command.executable))
         ctx.addIssue({
           code: "custom",
           message: `Direct Git and shell-wrapper commands are not allowed: ${command.id}. Git mutations belong only to deterministic commit control.`,

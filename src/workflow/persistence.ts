@@ -10,7 +10,11 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { projectRootSync } from "../config/project.ts";
-import { validateState, type WorkflowState } from "./state.ts";
+import {
+  sanitizeWorkflowStateText,
+  validateState,
+  type WorkflowState,
+} from "./state.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 export class StateStore {
   readonly dir: string;
@@ -31,6 +35,7 @@ export class StateStore {
     await pending;
   }
   private async write(state: WorkflowState) {
+    sanitizeWorkflowStateText(state);
     validateState(state);
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const path = this.path(state.id),
@@ -46,7 +51,11 @@ export class StateStore {
   }
   async load(id: string) {
     try {
-      return validateState(JSON.parse(await readFile(this.path(id), "utf8")));
+      const state = validateState(
+        JSON.parse(await readFile(this.path(id), "utf8")),
+      );
+      sanitizeWorkflowStateText(state);
+      return state;
     } catch (e) {
       if (
         (e as NodeJS.ErrnoException).code === "ENOENT" &&

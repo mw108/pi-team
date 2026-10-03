@@ -7,10 +7,18 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   assertRelative,
+  contractIdentity,
   assertWithin,
   contractPaths,
 } from "../agents/permissions.ts";
 import { contractSchema } from "../agents/schemas.ts";
+import {
+  classifyPath,
+  isSensitiveReadPath,
+  policyPath,
+} from "../agents/path-policy.ts";
+import { scanCommitSecrets } from "../security/secret-scan.ts";
+import { redactVisibleText } from "../agents/redaction.ts";
 import type { WorkflowState } from "./state.ts";
 const exec = promisify(execFile);
 export async function git(cwd: string, args: string[]) {
@@ -56,9 +64,50 @@ export async function baseline(cwd: string) {
     head: await head(cwd),
     dirtyPaths: await dirtyPaths(cwd),
     status: await git(cwd, ["status", "--short"]),
-    diff: await git(cwd, ["diff", "--no-ext-diff"]),
-    cachedDiff: await git(cwd, ["diff", "--cached", "--no-ext-diff"]),
+    // Dirty-path metadata is enough for attribution. Raw pre-existing user
+    // diffs must not be persisted or sent to a provider.
+    diff: "",
+    cachedDiff: "",
   };
+}
+export async function providerDiff(s: WorkflowState): Promise<string> {
+  const contract = s.results.reviewer
+    ? contractSchema.safeParse(s.results.reviewer)
+    : undefined;
+  const paths = [
+    ...new Set([
+      ...(contract?.success ? contractPaths(contract.data) : []),
+      ...s.approvedDirtyPaths,
+    ]),
+  ].filter((path) => !isSensitiveReadPath(path));
+  if (!paths.length) return "";
+  for (const path of paths) {
+    assertRelative(path);
+    if (isSensitiveReadPath(await assertWithin(s.cwd, path)))
+      throw new Error("Provider diff contains a sensitive path alias");
+  }
+  let diff = await git(s.cwd, [
+    "diff",
+    "--no-ext-diff",
+    "HEAD",
+    "--",
+    ...paths,
+  ]);
+  const untracked = new Set(
+    (await git(s.cwd, ["ls-files", "--others", "--exclude-standard", "-z"]))
+      .split("\0")
+      .filter(Boolean),
+  );
+  for (const path of paths) {
+    if (!untracked.has(path)) continue;
+    const stat = await lstat(join(s.cwd, path));
+    if (!stat.isFile() || stat.size > 200000)
+      throw new Error("Untracked review file requires manual inspection");
+    diff += `\nNEW FILE ${path}\n${await readFile(join(s.cwd, path), "utf8")}`;
+  }
+  if (diff.length > 300000)
+    throw new Error("Diff too large for automatic review");
+  return redactVisibleText(diff);
 }
 export async function actualDiff(cwd: string) {
   let diff = await git(cwd, [
@@ -111,7 +160,7 @@ export async function hashes(cwd: string, paths: string[]) {
   }
   return result;
 }
-export function gitInspectTool(cwd: string): ToolDefinition {
+export function gitInspectTool(s: WorkflowState): ToolDefinition {
   return {
     name: "team_git_inspect",
     label: "Inspect Git",
@@ -119,9 +168,8 @@ export function gitInspectTool(cwd: string): ToolDefinition {
     parameters: Type.Object({}),
     async execute() {
       const info = {
-        status: await git(cwd, ["status", "--short"]),
-        diff: await actualDiff(cwd),
-        staged: await git(cwd, ["diff", "--cached", "--no-ext-diff"]),
+        status: redactVisibleText(await git(s.cwd, ["status", "--short"])),
+        diff: await providerDiff(s),
       };
       return {
         content: [{ type: "text", text: JSON.stringify(info) }],
@@ -146,13 +194,12 @@ export async function prepareCommit(
   )
     throw new Error("Testing has not passed");
   if (
-    s.config.qualityGates.pentest.enabled &&
-    (!s.results.securityReviewer ||
-      (s.results.securityReviewer as any).findings.some(
-        (f: any) =>
-          f.classification === "CONFIRMED" ||
-          f.classification === "ACCEPTED_RISK",
-      ))
+    !s.results.securityReviewer ||
+    (s.results.securityReviewer as any).findings.some(
+      (f: any) =>
+        f.classification === "CONFIRMED" ||
+        f.classification === "ACCEPTED_RISK",
+    )
   )
     throw new Error("Security gate has not passed");
   if ((await head(s.cwd)) !== s.baseline.head)
@@ -160,6 +207,21 @@ export async function prepareCommit(
   const contract = contractSchema.parse(s.results.reviewer),
     allowed = contractPaths(contract),
     dirty = await dirtyPaths(s.cwd);
+  if (
+    s.sensitiveApprovalContractHash !== contractIdentity(contract) &&
+    allowed.some((path) => classifyPath(path) === "requires_user_approval")
+  )
+    throw new Error("Sensitive path approval does not match current contract");
+  for (const path of allowed) {
+    assertRelative(path);
+    if (policyPath(await assertWithin(s.cwd, path)) !== policyPath(path))
+      throw new Error(`Commit path aliases another repository path: ${path}`);
+    if (
+      classifyPath(path) === "requires_user_approval" &&
+      !s.approvedSensitivePaths.includes(policyPath(path))
+    )
+      throw new Error(`Sensitive path approval missing: ${path}`);
+  }
   if (
     s.gateHashes &&
     JSON.stringify(await hashes(s.cwd, dirty)) !== JSON.stringify(s.gateHashes)
@@ -188,17 +250,13 @@ export async function prepareCommit(
   for (const path of files) {
     if (/(^|\/)(\.env(?:\..*)?|auth\.json|.*\.(pem|key)|id_rsa)$/.test(path))
       throw new Error("Credential-like file denied");
-    try {
-      const content = await readFile(join(s.cwd, path), "utf8");
-      if (
-        /-----BEGIN .*PRIVATE KEY-----|(?:sk-proj-|ctx7sk-)[A-Za-z0-9_-]{10,}|(?:api[_-]?key|password|secret)\s*[:=]\s*["'][^"']{12,}["']/i.test(
-          content,
-        )
-      )
-        throw new Error(`Potential secret in ${path}`);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    }
+  }
+  const scan = await scanCommitSecrets(s.cwd, files);
+  if (scan.findings.length) {
+    const finding = scan.findings[0];
+    throw new Error(
+      `Commit blocked: possible ${finding.kind} in ${redactVisibleText(finding.path)}${finding.line ? `:${finding.line}` : ""} (${scan.scanner})`,
+    );
   }
   return {
     head: s.baseline.head,

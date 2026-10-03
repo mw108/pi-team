@@ -88,6 +88,16 @@ test("fixture integrates command discovery, implementation, POST pentest, securi
     assert.notEqual(await head(cwd), before);
     assert.deepEqual(s.commit?.files, ["math.js"]);
     assert.ok(runner.calls.includes("securityReviewer"));
+    assert.ok(
+      runner.calls.indexOf("codeReviewer") < runner.calls.indexOf("pentester"),
+    );
+    assert.ok(
+      runner.calls.indexOf("pentester") <
+        runner.calls.indexOf("securityReviewer"),
+    );
+    assert.ok(
+      runner.calls.indexOf("securityReviewer") < runner.calls.indexOf("tester"),
+    );
     assert.equal((await git(cwd, ["status", "--short"])).trim(), "");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

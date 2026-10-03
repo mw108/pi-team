@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { newState } from "../src/workflow/state.ts";
 import { transition } from "../src/workflow/router.ts";
 import { config, finding } from "./helpers.ts";
+import { repository, FixtureRunner } from "./helpers.ts";
+import { WorkflowEngine } from "../src/workflow/engine.ts";
+import { baseline, prepareCommit } from "../src/workflow/git.ts";
 function state() {
   return newState("/tmp/test", "task", config(), {
     head: null,
@@ -17,11 +20,22 @@ test("APPROVED advances through configured quality gates", () => {
   s.phase = "CODE_REVIEW";
   s.results.codeReviewer = { status: "APPROVED", findings: [] };
   transition(s);
+  assert.equal(s.phase, "SECURITY_REVIEW");
+  s.results.securityReviewer = { findings: [], summary: "No findings" };
+  transition(s);
   assert.equal(s.phase, "TEST");
   s.config.qualityGates.pentest.enabled = true;
   s.phase = "CODE_REVIEW";
   transition(s);
   assert.equal(s.phase, "PENTEST");
+  s.results.pentester = {
+    status: "PASS",
+    findings: [],
+    coverage: [],
+    limitations: [],
+  };
+  transition(s);
+  assert.equal(s.phase, "SECURITY_REVIEW");
 });
 test("FIX_LOCAL returns only to implementation and invalidates approval", () => {
   const s = state();
@@ -71,12 +85,14 @@ for (const route of ["FIX_LOCAL", "FIX_DESIGN"] as const)
   });
 test("security reviewer cannot omit findings or accept risks autonomously", () => {
   const s = state();
+  s.config.qualityGates.pentest.enabled = true;
   s.phase = "SECURITY_REVIEW";
   s.results.pentester = { findings: [{ id: "F1" }] };
   s.results.securityReviewer = { findings: [] };
   transition(s);
   assert.equal(s.phase, "BLOCKED");
   const t = state();
+  t.config.qualityGates.pentest.enabled = true;
   t.phase = "SECURITY_REVIEW";
   t.results.pentester = { findings: [{ id: "F1" }] };
   t.results.securityReviewer = {
@@ -111,4 +127,65 @@ test("full cycle and local fix limits are hard global counters", () => {
     transition(s);
     assert.equal(s.phase, "BLOCKED");
   }
+});
+
+test("disabled Pentest still runs Security Reviewer before Tester", async () => {
+  const cwd = await repository();
+  const runner = new FixtureRunner();
+  const cfg = config();
+  cfg.qualityGates.pentest.enabled = false;
+  cfg.qualityGates.commit.enabled = false;
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const result = await engine.start("Fix addition", cfg);
+  await engine.run(result);
+  assert.equal(result.phase, "DONE", result.blocker);
+  const roles = runner.calls;
+  assert.equal(roles.includes("pentester"), false);
+  assert.ok(roles.indexOf("codeReviewer") < roles.indexOf("securityReviewer"));
+  assert.ok(roles.indexOf("securityReviewer") < roles.indexOf("tester"));
+});
+
+test("commit security gate is independent of Pentest configuration", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.qualityGates.pentest.enabled = false;
+  cfg.qualityGates.codeReview.enabled = false;
+  cfg.qualityGates.testing.enabled = false;
+  const s = newState(cwd, "Task", cfg, await baseline(cwd));
+  await assert.rejects(() => prepareCommit(s, [], "test"), /Security gate/);
+  s.results.securityReviewer = { findings: [], summary: "No findings" };
+  s.results.reviewer = {
+    goal: "Task",
+    filesToModify: [],
+    filesToCreate: [],
+    filesToDelete: [],
+    requiredChanges: [],
+    technicalDecisions: [],
+    constraints: [],
+    requiredTests: [],
+    acceptanceCriteria: [],
+    knownRisks: [],
+  };
+  await assert.rejects(() => prepareCommit(s, [], "test"), /Commit files/);
+});
+
+test("in-progress legacy workflow past review returns to Security Review", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.qualityGates.commit.enabled = false;
+  const runner = new FixtureRunner();
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const s = await engine.start("Legacy task", cfg);
+  s.phase = "REPORT";
+  await engine.run(s);
+  assert.equal(runner.calls[0], "securityReviewer");
+  assert.ok(
+    s.history.some((event) => event.event === "security_review_migration"),
+  );
 });

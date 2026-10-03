@@ -3,6 +3,10 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TeamConfig, Command } from "../config/schema.ts";
 import type { Role } from "./schemas.ts";
+import {
+  allowedCommandCategories,
+  commandCategories,
+} from "./command-policy.ts";
 import { commandKey } from "./discovery.ts";
 import {
   normalizedRuntimeCommand,
@@ -110,12 +114,9 @@ export function commandTool(
         args: Type.Array(Type.String()),
         purpose: Type.String(),
         category: Type.Optional(
-          Type.Union([
-            Type.Literal("development"),
-            Type.Literal("test"),
-            Type.Literal("static"),
-            Type.Literal("pentest"),
-          ]),
+          Type.Union(
+            commandCategories.map((category) => Type.Literal(category)),
+          ),
         ),
       }),
     ]),
@@ -169,16 +170,9 @@ export function commandTool(
 
 /** Same role allowlist used by execution and observational logging. */
 export function approvedCommandsForRole(role: Role, config: TeamConfig) {
-  const purposes =
-    role === "implementor"
-      ? ["development", "test", "static"]
-      : role === "tester"
-        ? ["test", "static"]
-        : role === "codeReviewer"
-          ? ["static"]
-          : role === "pentester"
-            ? ["pentest"]
-            : [];
-  return config.commands.filter((c) => purposes.includes(c.purpose));
+  const categories = allowedCommandCategories(role);
+  return config.commands.filter((command) =>
+    categories.includes(command.purpose),
+  );
 }
 export { localHttpTool } from "./http.ts";

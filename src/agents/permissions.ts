@@ -1,28 +1,23 @@
-import { realpath, lstat } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { realpath, lstat, stat } from "node:fs/promises";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  join,
+} from "node:path";
+import {
+  classifyPath,
+  isSensitiveReadPath,
+  policyPath,
+} from "./path-policy.ts";
+import { createHash } from "node:crypto";
 import type { Role, Contract } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
-export const serenaRead = [
-  "serena_status",
-  "serena_list_tools",
-  "serena_get_symbols_overview",
-  "serena_find_symbol",
-  "serena_find_referencing_symbols",
-  "serena_find_declaration",
-  "serena_find_implementations",
-  "serena_search_for_pattern",
-  "serena_get_current_config",
-  "serena_get_diagnostics_for_file",
-];
-export const serenaWrite = [
-  "serena_replace_symbol_body",
-  "serena_insert_before_symbol",
-  "serena_insert_after_symbol",
-  "serena_rename_symbol",
-  "serena_safe_delete_symbol",
-  "serena_replace_content",
-];
+import { serenaCapability, serenaRead, serenaWrite } from "./serena-policy.ts";
+export { serenaRead, serenaWrite } from "./serena-policy.ts";
 const docsRoles: Role[] = [
   "researcher",
   "reviewer",
@@ -75,39 +70,52 @@ export function contractPaths(contract?: Contract) {
       ]
     : [];
 }
+export function contractIdentity(contract: Contract): string {
+  return createHash("sha256").update(JSON.stringify(contract)).digest("hex");
+}
 export function assertRelative(path: string) {
-  if (
-    !path ||
-    isAbsolute(path) ||
-    path.split(/[\\/]/).some((s) => s === ".." || s === ".git") ||
-    /^[.](pi|serena)([\\/]|$)/.test(path)
-  )
+  if (classifyPath(path) === "forbidden")
     throw new Error(`Path outside approved source boundary: ${path}`);
 }
 export async function assertWithin(cwd: string, path: string) {
+  policyPath(path);
   const root = await realpath(cwd);
   let target = resolve(root, path);
+  const missing: string[] = [];
   const lexical = relative(root, target);
   if (lexical.startsWith("..") || isAbsolute(lexical))
     throw new Error("Path escapes repository");
   while (true) {
     try {
       const actual = await realpath(target);
-      const r = relative(root, actual);
+      const r = relative(root, resolve(actual, ...missing));
       if (r.startsWith("..") || isAbsolute(r))
         throw new Error("Symlink escapes repository");
-      break;
+      return r;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      try {
+        if ((await lstat(target)).isSymbolicLink())
+          throw new Error("Unresolved repository symlink denied");
+      } catch (linkError) {
+        if ((linkError as NodeJS.ErrnoException).code !== "ENOENT")
+          throw linkError;
+      }
       const parent = dirname(target);
       if (parent === target) throw e;
+      missing.unshift(basename(target));
       target = parent;
     }
   }
 }
 export async function validateContractPaths(cwd: string, contract: Contract) {
+  for (const path of contractPaths(contract)) {
+    assertRelative(path);
+    const actual = await assertWithin(cwd, path);
+    if (policyPath(actual) !== policyPath(path))
+      throw new Error(`Contract path aliases another repository path: ${path}`);
+  }
   for (const path of [
-    ...contractPaths(contract),
     ...contract.requiredTests.flatMap((test) => (test.file ? [test.file] : [])),
   ]) {
     assertRelative(path);
@@ -121,8 +129,19 @@ export async function checkTool(
   cwd: string,
   config: TeamConfig,
   contract?: Contract,
-  dirtyPolicy?: { dirtyPaths: string[]; approvedDirtyPaths: string[] },
+  dirtyPolicy?: {
+    dirtyPaths: string[];
+    approvedDirtyPaths: string[];
+    approvedSensitivePaths?: string[];
+  },
 ) {
+  const serenaScope = name.startsWith("serena_")
+    ? serenaCapability(name)
+    : undefined;
+  if (serenaScope === "unknown")
+    throw new Error(
+      "Access denied: Serena operation may expose sensitive repository content.",
+    );
   if (!allowedTools(role, config).includes(name))
     throw new Error(`Tool ${name} denied for ${role}`);
   if (
@@ -131,11 +150,48 @@ export async function checkTool(
     resolve(String(input.project)) !== resolve(cwd)
   )
     throw new Error("Serena project override denied");
-  const path = input.path ?? input.relative_path;
+  if (serenaScope === "mutation")
+    throw new Error("Access denied: Serena mutation is not permitted.");
+  if (
+    serenaScope === "cross-file-results" ||
+    serenaScope === "unbounded-content"
+  )
+    throw new Error(
+      "Access denied: Serena operation may expose sensitive repository content.",
+    );
+  if (
+    serenaScope === "file-read" &&
+    (typeof input.relative_path !== "string" || !input.relative_path)
+  )
+    throw new Error(
+      "Access denied: Serena requires a specific non-sensitive file.",
+    );
+  if (name === "grep" && typeof input.path !== "string")
+    throw new Error(
+      "Access denied: grep requires a specific non-sensitive file.",
+    );
+  const path = serenaScope ? input.relative_path : input.path;
+  let actualPath: string | undefined;
   if (typeof path === "string") {
-    await assertWithin(cwd, path);
-    if (path.split(/[\\/]/).includes(".git"))
-      throw new Error("Git internals are private");
+    actualPath = await assertWithin(cwd, path);
+    if (
+      (["read", "grep"].includes(name) || serenaScope === "file-read") &&
+      (isSensitiveReadPath(path) || isSensitiveReadPath(actualPath))
+    )
+      throw new Error("Access denied: path is classified as sensitive.");
+    if (name === "grep" && (await stat(join(cwd, actualPath))).isDirectory())
+      throw new Error(
+        "Access denied: grep requires a specific non-sensitive file.",
+      );
+    if (
+      serenaScope === "file-read" &&
+      !(await stat(join(cwd, actualPath))).isFile()
+    )
+      throw new Error(
+        "Access denied: Serena requires a specific non-sensitive file.",
+      );
+    if (classifyPath(path) === "forbidden")
+      throw new Error("Protected repository path is private");
   }
   const mutation = ["write", "edit", "team_delete", ...serenaWrite].includes(
     name,
@@ -144,6 +200,13 @@ export async function checkTool(
     if (typeof path !== "string")
       throw new Error("Mutation requires an explicit repository path");
     assertRelative(path);
+    if (policyPath(actualPath!) !== policyPath(path))
+      throw new Error("Mutation through repository path alias denied");
+    if (
+      classifyPath(path) === "requires_user_approval" &&
+      !dirtyPolicy?.approvedSensitivePaths?.includes(policyPath(path))
+    )
+      throw new Error("Sensitive path requires explicit user approval");
     if (
       dirtyPolicy?.dirtyPaths.includes(path) &&
       !dirtyPolicy.approvedDirtyPaths.includes(path)

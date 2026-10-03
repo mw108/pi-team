@@ -24,6 +24,7 @@ import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { formatToolActivity } from "../src/ui/activity.ts";
 import { getWorkflowRecoveryPlan } from "../src/workflow/recovery.ts";
 import type { Role } from "../src/agents/schemas.ts";
+import { validateState } from "../src/workflow/state.ts";
 
 async function fixture(answers: (string[] | undefined)[] = []) {
   const cwd = await repository();
@@ -127,7 +128,7 @@ test("allow once executes exactly once per prompt and keeps workflow approvals e
         signal,
         (event: any) => f.events.push(event),
       ),
-    () => effectiveConfig(f.state).commands,
+    () => effectiveConfig(f.state, "implementor").commands,
   );
   for (let i = 0; i < 2; i++) {
     const result = await tool.execute(
@@ -175,6 +176,33 @@ test("discovered command metadata appears when runtime approval is requested", a
   assert.equal(f.state.approvedCommands.length, 0);
 });
 
+test("generic runtime approval uses neutral wording and exact scope", async () => {
+  const f = await fixture([["deny"]]);
+  const role = "implementor";
+  assert.equal(
+    await f.approve(role, f.control(role), {
+      executable: process.execPath,
+      args: ["--version"],
+      purpose: "Check the local runtime",
+      category: "development",
+    }),
+    "deny",
+  );
+  const request = f.requests[0];
+  assert.match(request.prompt, /Agent: .*implementor/);
+  assert.match(request.prompt, /Category: development/);
+  assert.match(request.prompt, /Purpose: Check the local runtime/);
+  assert.match(request.prompt, /Scope: exact command/);
+  assert.doesNotMatch(
+    request.prompt,
+    /artisan|phpunit|tests\/Feature|migrate:fresh/i,
+  );
+  assert.deepEqual(
+    request.options.map((option: { value: string }) => option.value),
+    ["allow_once", "allow_workflow", "deny"],
+  );
+});
+
 test("workflow exact approval is reused and survives state reload; configured commands stay immediate", async () => {
   const f = await fixture([["allow_workflow"]]);
   const run = f.control("implementor");
@@ -218,9 +246,12 @@ test("workflow exact approval is reused and survives state reload; configured co
     {} as any,
   );
   assert.equal(f.requests.length, 1);
-  assert.equal(f.state.approvedCommands.length, 1);
+  assert.equal(f.state.runtimeCommandApprovals.length, 1);
   const loaded = await f.engine.store.load(f.state.id);
-  assert.deepEqual(loaded.approvedCommands, f.state.approvedCommands);
+  assert.deepEqual(
+    loaded.runtimeCommandApprovals,
+    f.state.runtimeCommandApprovals,
+  );
   assert.deepEqual(
     loaded.runtimeApprovedCommandIds,
     f.state.runtimeApprovedCommandIds,
@@ -255,8 +286,8 @@ test("similar approval persists an explicit test prefix and excludes destructive
     {
       executable: "php",
       argsPrefix: ["artisan", "test"],
-      allowRemainingArgs: true,
       category: "test",
+      role: "implementor",
     },
   ]);
   assert.equal(
@@ -272,7 +303,6 @@ test("similar approval persists an explicit test prefix and excludes destructive
   for (const args of [
     ["artisan", "test"],
     ["artisan", "test", "--filter=Bar"],
-    ["artisan", "test", "tests/Feature/AuthTest.php"],
   ])
     assert.equal(
       ruleMatches(
@@ -299,9 +329,30 @@ test("similar approval persists an explicit test prefix and excludes destructive
   );
   assert.equal(await f.approve("implementor", run, dangerous), "deny");
   assert.equal(f.requests.length, 2);
-  assert.deepEqual(
-    (await f.engine.store.load(f.state.id)).similarCommandRules,
-    f.state.similarCommandRules,
+  const reloadedRules = (await f.engine.store.load(f.state.id))
+    .similarCommandRules;
+  assert.deepEqual(reloadedRules, f.state.similarCommandRules);
+  assert.equal(
+    ruleMatches(
+      reloadedRules[0],
+      normalizedRuntimeCommand(
+        { ...input, args: ["artisan", "test", "--filter=Again"] },
+        "implementor",
+      ).command,
+      "implementor",
+    ),
+    true,
+  );
+  assert.equal(
+    ruleMatches(
+      reloadedRules[0],
+      normalizedRuntimeCommand(
+        { ...input, args: ["artisan", "test", "--filter=Again"] },
+        "tester",
+      ).command,
+      "tester",
+    ),
+    false,
   );
 });
 
@@ -394,8 +445,8 @@ test("parallel requests retain agent identities; stale and aborted answers canno
     ]),
     ["allow", "deny"],
   );
-  assert.match(f.requests[0].prompt, /Implementor wants to run/);
-  assert.match(f.requests[1].prompt, /Tester wants to run/);
+  assert.match(f.requests[0].prompt, /Agent: Implementor/);
+  assert.match(f.requests[1].prompt, /Agent: Tester/);
   assert.notEqual(f.events[0].requestId, f.events[1].requestId);
 
   let answer!: (value: string[]) => void;
@@ -467,7 +518,7 @@ test("pending approval survives restart and is re-presented without executing", 
   const result = await f.engine.run(loaded);
   assert.equal(f.requests.length, 1);
   assert.doesNotMatch(f.requests[0].prompt, /SECRET/);
-  assert.equal(result.approvedCommands.length, 1);
+  assert.equal(result.runtimeCommandApprovals.length, 1);
   assert.equal(result.pendingRuntimeCommands.length, 0);
   assert.equal(result.phase, "BLOCKED");
 });
@@ -509,7 +560,7 @@ test("engine JSONL and team-log redact dynamic requests and preserve original ex
         assert.equal(await runtimeApproval(command, request), "allow");
         const tool = commandTool(
           role,
-          effectiveConfig(state),
+          effectiveConfig(state, role),
           cwd,
           [],
           async () => "allow",
@@ -666,10 +717,169 @@ test("cancelled approval pauses routing without counting an agent failure", asyn
   (engine.ui as any).approve = async () => ["allow_workflow"];
   await engine.run(result);
   assert.equal(result.pendingRuntimeCommands.length, 0);
-  assert.equal(result.approvedCommands.length, 1);
+  assert.equal(result.runtimeCommandApprovals.length, 1);
   assert.equal(
     (await getWorkflowRecoveryPlan(result, cwd)).kind,
     "retry-agent",
   );
   assert.equal(await engine.retryAgent(result, "implementor"), "prepared");
+});
+
+test("exact runtime grants persist for one role and prompt exposes scope", async () => {
+  const f = await fixture([["allow_workflow"], ["deny"], ["deny"]]);
+  const input = {
+    executable: "php",
+    args: ["artisan", "route:list"],
+    purpose: "Inspect routes",
+    category: "static",
+  };
+  assert.equal(
+    await f.approve("implementor", f.control("implementor"), input),
+    "allow",
+  );
+  assert.match(f.requests[0].prompt, /Agent: Implementor.*implementor/);
+  assert.match(f.requests[0].prompt, /Category: static/);
+  assert.match(f.requests[0].prompt, /Command: php artisan route:list/);
+  assert.match(f.requests[0].prompt, /Purpose: Inspect routes/);
+  assert.match(f.requests[0].prompt, /Scope: exact command for Implementor/);
+  const loaded = await f.engine.store.load(f.state.id);
+  assert.deepEqual(
+    loaded.runtimeCommandApprovals,
+    f.state.runtimeCommandApprovals,
+  );
+  const approvedId = loaded.runtimeCommandApprovals[0].command.id;
+  assert.ok(
+    effectiveConfig(loaded, "implementor").commands.some(
+      (command) => command.id === approvedId,
+    ),
+  );
+  assert.ok(
+    !effectiveConfig(loaded, "tester").commands.some(
+      (command) => command.id === approvedId,
+    ),
+  );
+  assert.ok(
+    !effectiveConfig(loaded, "codeReviewer").commands.some(
+      (command) => command.id === approvedId,
+    ),
+  );
+  assert.equal(f.events[0].category, "static");
+  assert.equal(f.events[0].approvalScope, "role-and-workflow");
+  assert.equal(
+    await f.approve("implementor", f.control("implementor", 2), input),
+    "allow",
+  );
+  assert.equal(await f.approve("tester", f.control("tester"), input), "deny");
+  assert.equal(
+    await f.approve("codeReviewer", f.control("codeReviewer"), input),
+    "deny",
+  );
+  assert.equal(f.requests.length, 3);
+});
+
+test("similar rules accept named safe test options and reject unsafe arguments across roles", async () => {
+  const f = await fixture([["allow_similar"], ["deny"]]);
+  const input = {
+    executable: "vendor/bin/phpunit",
+    args: ["--filter", "Foo"],
+    purpose: "Focused test",
+    category: "test",
+  };
+  assert.equal(
+    await f.approve("implementor", f.control("implementor"), input),
+    "allow",
+  );
+  assert.match(f.requests[0].prompt, /Allowed options: --filter/);
+  const rule = f.state.similarCommandRules[0];
+  const command = (executable: string, args: string[]) =>
+    normalizedRuntimeCommand(
+      { executable, args, purpose: "test", category: "test" },
+      "implementor",
+    ).command;
+  for (const args of [
+    ["--filter", "Bar"],
+    ["--testsuite", "Unit"],
+    ["--testdox"],
+  ])
+    assert.equal(
+      ruleMatches(rule, command("vendor/bin/phpunit", args), "implementor"),
+      true,
+    );
+  for (const args of [
+    ["--bootstrap", "/tmp/evil.php"],
+    ["--prepend", "evil.php"],
+    ["--configuration", "../../outside.xml"],
+    ["--unknown"],
+    ["../../outside.php"],
+    ["tests/Feature/AuthTest.php"],
+    ["--filter", "--bootstrap"],
+  ])
+    assert.equal(
+      ruleMatches(rule, command("vendor/bin/phpunit", args), "implementor"),
+      false,
+    );
+  assert.equal(
+    ruleMatches(
+      rule,
+      command("vendor/bin/phpunit", ["--testsuite", "Unit"]),
+      "tester",
+    ),
+    false,
+  );
+  assert.equal(
+    ruleMatches(
+      rule,
+      command("php", ["artisan", "migrate:fresh"]),
+      "implementor",
+    ),
+    false,
+  );
+  assert.equal(
+    ruleMatches(
+      rule,
+      command("npm", ["run", "arbitrary-script"]),
+      "implementor",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    (await f.engine.store.load(f.state.id)).similarCommandRules,
+    f.state.similarCommandRules,
+  );
+  assert.equal(await f.approve("tester", f.control("tester"), input), "deny");
+});
+
+test("legacy category-wide exact grants and unrestricted similar rules are revoked", async () => {
+  const f = await fixture();
+  const command = normalizedRuntimeCommand(
+    {
+      executable: "vendor/bin/phpunit",
+      args: [],
+      purpose: "Tests",
+      category: "test",
+    },
+    "implementor",
+  ).command;
+  const legacy: any = {
+    ...f.state,
+    approvedCommands: [command],
+    runtimeApprovedCommandIds: [command.id],
+    similarCommandRules: [
+      {
+        executable: "vendor/bin/phpunit",
+        argsPrefix: [],
+        allowRemainingArgs: true,
+        category: "test",
+      },
+    ],
+  };
+  const loaded = validateState(legacy);
+  assert.deepEqual(loaded.approvedCommands, []);
+  assert.deepEqual(loaded.similarCommandRules, []);
+  assert.deepEqual(loaded.runtimeCommandApprovals, []);
+  assert.ok(
+    loaded.history.some(
+      (event) => event.event === "legacy_runtime_approvals_revoked",
+    ),
+  );
 });

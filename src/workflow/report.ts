@@ -3,6 +3,7 @@ import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { dirtyPaths } from "./git.ts";
 import type { WorkflowState } from "./state.ts";
 import { recoveryAction, type WorkflowRecoveryPlan } from "./recovery.ts";
+import { redactVisibleText } from "../agents/redaction.ts";
 
 export type CompletionReport = ReturnType<typeof completionReportSchema.parse>;
 export interface ValidationCommandResult {
@@ -309,7 +310,7 @@ export function renderReport(report: CompletionReport, failure?: string) {
   );
   if (report.notes.length) section("Notes", report.notes);
   section("Open issues", report.unresolvedIssues);
-  return lines.join("\n");
+  return redactVisibleText(lines.join("\n"));
 }
 
 export function renderBlocked(
@@ -367,42 +368,44 @@ export function renderBlocked(
             `Agent execution failed: ${getAgentDisplayName(s.config, role)} (${role}):`,
           )
       : (s.blocker ?? "Unknown blocker");
-  return [
-    "Team BLOCKED",
-    "",
-    "Stopped at",
-    `${stopped}${role ? ` · ${getAgentDisplayName(s.config, role)} (${role})` : ""}`,
-    "",
-    "Reason",
-    reason,
-    "",
-    "Completed",
-    ...(completed.length
-      ? unique(completed).map((item) => `✓ ${item}`)
-      : ["None recorded."]),
-    "",
-    "Repository changes",
-    s.commit
-      ? `Commit ${s.commit.hash}`
-      : s.results.implementor
-        ? "Implementation may have changed files; inspect the working tree."
-        : "No implementation recorded.",
-    "",
-    "Diagnostics",
-    `- Agent failures: ${s.agentFailures}/${s.config.workflow.maxAgentFailures}`,
-    ...(diagnostics?.timeoutMs
-      ? [`- Agent timeout: ${(diagnostics.timeoutMs / 1000).toFixed(1)}s`]
-      : []),
-    ...(diagnostics?.finalError?.requestDurationMs
-      ? [
-          `- Provider request: ${(diagnostics.finalError.requestDurationMs / 1000).toFixed(1)}s`,
-        ]
-      : []),
-    ...(diagnostics?.finalError?.code
-      ? [`- Provider code: ${diagnostics.finalError.code}`]
-      : []),
-    "",
-    "Next action",
-    next,
-  ].join("\n");
+  return redactVisibleText(
+    [
+      "Team BLOCKED",
+      "",
+      "Stopped at",
+      `${stopped}${role ? ` · ${getAgentDisplayName(s.config, role)} (${role})` : ""}`,
+      "",
+      "Reason",
+      reason,
+      "",
+      "Completed",
+      ...(completed.length
+        ? unique(completed).map((item) => `✓ ${item}`)
+        : ["None recorded."]),
+      "",
+      "Repository changes",
+      s.commit
+        ? `Commit ${s.commit.hash}`
+        : s.results.implementor
+          ? "Implementation may have changed files; inspect the working tree."
+          : "No implementation recorded.",
+      "",
+      "Diagnostics",
+      `- Agent failures: ${s.agentFailures}/${s.config.workflow.maxAgentFailures}`,
+      ...(diagnostics?.timeoutMs
+        ? [`- Agent timeout: ${(diagnostics.timeoutMs / 1000).toFixed(1)}s`]
+        : []),
+      ...(diagnostics?.finalError?.requestDurationMs
+        ? [
+            `- Provider request: ${(diagnostics.finalError.requestDurationMs / 1000).toFixed(1)}s`,
+          ]
+        : []),
+      ...(diagnostics?.finalError?.code
+        ? [`- Provider code: ${diagnostics.finalError.code}`]
+        : []),
+      "",
+      "Next action",
+      next,
+    ].join("\n"),
+  );
 }

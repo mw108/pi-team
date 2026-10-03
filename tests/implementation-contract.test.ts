@@ -5,7 +5,15 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { contractSchema, parseResult } from "../src/agents/schemas.ts";
 import { checkTool, validateContractPaths } from "../src/agents/permissions.ts";
-import { config, contract, repository } from "./helpers.ts";
+import { classifyPath, policyPath } from "../src/agents/path-policy.ts";
+import {
+  config,
+  contract,
+  repository,
+  FixtureRunner,
+  output,
+} from "./helpers.ts";
+import { WorkflowEngine } from "../src/workflow/engine.ts";
 
 const requirement = (action: string, file?: string, extra = {}) => ({
   description: "Failure is covered",
@@ -142,4 +150,169 @@ test("Reviewer parse accepts a structured test contract and rejects inconsistent
     () => parseResult("reviewer", { ...valid, filesToModify: ["math.js"] }),
     /filesToModify/,
   );
+});
+
+test("policy identity is case-insensitive, Unicode-normalized and rejects traversal", () => {
+  for (const path of [
+    ".git/config",
+    ".Git/config",
+    ".GIT/config",
+    ".git\\config",
+    ".pi/team/x",
+    ".PI/team/x",
+    ".SeReNa/x",
+  ])
+    assert.equal(classifyPath(path), "forbidden");
+  for (const path of [
+    "foo/../.git/config",
+    "../package.json",
+    "/tmp/a",
+    "C:\\outside",
+  ])
+    assert.throws(() => policyPath(path));
+  assert.equal(policyPath("src/e\u0301.ts"), policyPath("src/\u00e9.ts"));
+  assert.equal(classifyPath("./PACKAGE.JSON"), "requires_user_approval");
+  for (const path of [
+    ".GITHUB/WORKFLOWS/test.yml",
+    ".HUSKY/pre-commit",
+    ".VSCODE/TASKS.JSON",
+    ".ENV.LOCAL",
+    "packages/app/Package-Lock.JSON",
+    "src/Makefile",
+  ])
+    assert.equal(classifyPath(path), "requires_user_approval");
+  assert.equal(classifyPath("src/index.ts"), "normal");
+});
+
+test("forbidden contracts fail before implementation; sensitive edits need exact approval", async () => {
+  const cwd = await repository();
+  for (const path of [".Git/config", ".PI/team/team.yaml", ".SeReNa/state"])
+    assert.throws(() => parse([], [path]), /repository-relative/);
+  const sensitive = parse([], ["package.json", ".github/workflows/test.yml"]);
+  await validateContractPaths(cwd, sensitive);
+  await assert.rejects(
+    () =>
+      checkTool(
+        "implementor",
+        "edit",
+        { path: "package.json" },
+        cwd,
+        config(),
+        sensitive,
+      ),
+    /Sensitive path/,
+  );
+  await checkTool(
+    "implementor",
+    "edit",
+    { path: "package.json" },
+    cwd,
+    config(),
+    sensitive,
+    {
+      dirtyPaths: [],
+      approvedDirtyPaths: [],
+      approvedSensitivePaths: [policyPath("package.json")],
+    },
+  );
+  await assert.rejects(
+    () =>
+      checkTool(
+        "implementor",
+        "write",
+        { path: ".github/workflows/test.yml" },
+        cwd,
+        config(),
+        sensitive,
+        {
+          dirtyPaths: [],
+          approvedDirtyPaths: [],
+          approvedSensitivePaths: [policyPath("package.json")],
+        },
+      ),
+    /Sensitive path/,
+  );
+  await checkTool(
+    "implementor",
+    "edit",
+    { path: "math.js" },
+    cwd,
+    config(),
+    contract,
+  );
+});
+
+test("contract cannot disguise a protected file through an in-repository symlink", async () => {
+  const cwd = await repository();
+  await symlink("package.json", join(cwd, "alias.json"));
+  await assert.rejects(
+    () => validateContractPaths(cwd, parse([], ["alias.json"])),
+    /aliases another repository path/,
+  );
+  await assert.rejects(
+    () =>
+      checkTool(
+        "implementor",
+        "edit",
+        { path: "alias.json" },
+        cwd,
+        config(),
+        parse([], ["alias.json"]),
+      ),
+    /alias denied/,
+  );
+  await symlink(".pi/team/missing.json", join(cwd, "missing-alias.json"));
+  await assert.rejects(
+    () => validateContractPaths(cwd, parse([], ["missing-alias.json"])),
+    /Unresolved repository symlink denied/,
+  );
+});
+
+test("sensitive contract pauses before Implementor and records exact approval", async () => {
+  const cwd = await repository();
+  let implementations = 0;
+  const runner = new FixtureRunner(async (role) => {
+    if (role === "reviewer")
+      return { ...contract, filesToModify: ["package.json"] };
+    if (role === "implementor") implementations++;
+    return output(role);
+  });
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+    approve: async () => undefined,
+  });
+  const state = await engine.start("Change package metadata", config());
+  await engine.run(state);
+  assert.equal(state.phase, "WAITING_USER");
+  assert.equal(state.pendingApproval?.kind, "sensitivePaths");
+  assert.match(state.pendingApproval.prompt, /package\.json/);
+  assert.equal(implementations, 0);
+  (engine.ui as any).approve = async () => ["allow"];
+  await engine.run(state);
+  assert.deepEqual(state.approvedSensitivePaths, ["package.json"]);
+  assert.equal(implementations, 1);
+  assert.ok(
+    state.history.some((event) => event.event === "sensitive_paths_approved"),
+  );
+});
+
+test("denying a sensitive contract blocks before Implementor", async () => {
+  const cwd = await repository();
+  const runner = new FixtureRunner(async (role) =>
+    role === "reviewer"
+      ? { ...contract, filesToModify: ["package.json"] }
+      : undefined,
+  );
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+    approve: async (request) =>
+      request.kind === "sensitivePaths" ? ["deny"] : undefined,
+  });
+  const state = await engine.start("Change package metadata", config());
+  await engine.run(state);
+  assert.equal(state.phase, "BLOCKED");
+  assert.match(state.blocker ?? "", /Sensitive path approval denied/);
+  assert.equal(runner.counts.implementor, undefined);
 });

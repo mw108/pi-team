@@ -209,7 +209,7 @@ test("manual abort stops one attempt without hard retry or failure accounting", 
   );
 });
 
-test("retry racing with natural completion creates one replacement attempt", async () => {
+test("retry racing with natural completion prepares one manual transition", async () => {
   const cwd = await repository();
   const runner = new PendingRunner();
   const engine = new WorkflowEngine(cwd, runner, ui);
@@ -218,13 +218,18 @@ test("retry racing with natural completion creates one replacement attempt", asy
   const pending = engine.invoke("solver1", state);
   await until(() => runner.calls.length === 1);
   runner.calls[0].resolve(output("solver1"));
-  await engine.retryAgent(state, "solver1");
-  await until(() => runner.calls.length === 2);
-  runner.calls[1].resolve(output("solver1"));
+  await engine.retryAgent(state, "solver1", true);
   await pending;
   assert.deepEqual(
     runner.calls.map((call) => call.attempt),
-    [1, 2],
+    [1],
+  );
+  assert.deepEqual(state.manualRetry, { agent: "solver1", phase: "SOLVE" });
+  assert.equal(
+    state.history.filter(
+      (event) => event.event === "agent_retry_requested_by_user",
+    ).length,
+    1,
   );
   assert.equal(
     state.history.filter(
