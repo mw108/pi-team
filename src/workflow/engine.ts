@@ -8,6 +8,7 @@ import {
   type TeamDefinition,
 } from "../config/loader.ts";
 import type { AgentRunner } from "../agents/runner.ts";
+import { resolveRequestTimeout } from "../agents/request-timeout.ts";
 import {
   parseResult,
   contractSchema,
@@ -1378,7 +1379,12 @@ export class WorkflowEngine {
               s.config.workflow.networkRetry.maxRetries,
             waiting: false,
           },
-          providerTimeouts: failedRequest?.providerTimeouts,
+          providerTimeouts: {
+            ...failedRequest?.providerTimeouts,
+            requestTimeoutMs:
+              failedRequest?.providerTimeouts?.requestTimeoutMs ??
+              resolveRequestTimeout(s.config, role),
+          },
           ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
         });
         await logged?.logger.flush();

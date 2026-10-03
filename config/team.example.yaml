@@ -8,6 +8,7 @@ workflow:
   maxQuestions: 5
   maxResearchClarifications: 5
   agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout
+  requestTimeoutMs: 300000 # each provider request; 0 uses Pi's unlimited mode
   maxToolCalls: 80
   doomLoop:
     enabled: true

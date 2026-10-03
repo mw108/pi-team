@@ -73,11 +73,42 @@ test("semantic fingerprint ignores runtime and presentation fields", () => {
   current.workflow.maxAgentFailures = 3;
   current.workflow.maxToolCalls = 0;
   current.workflow.maxResearchClarifications = 10;
+  current.workflow.requestTimeoutMs = 0;
+  current.agents.implementor.requestTimeoutMs = 900000;
   current.agents.solver1.name = "Architecture Expert";
   current.ui.progress.refreshMs = 3000;
   assert.equal(semanticConfigHash(previous), semanticConfigHash(current));
   current.agents.reviewer.model = "different-model";
   assert.notEqual(semanticConfigHash(previous), semanticConfigHash(current));
+});
+
+test("request timeout changes remain non-blocking runtime drift", async () => {
+  const { cwd, state, engine } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  state.blocker = "Provider request timed out";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.workflow.requestTimeoutMs = 600000;
+    value.agents.implementor.requestTimeoutMs = 0;
+  });
+  let drift = analyzeConfigDrift(state, await loadConfig(cwd));
+  assert.equal(drift.blocking, false);
+  assert.deepEqual(drift.runtimeChanges, [
+    "agents.implementor.requestTimeoutMs",
+    "workflow.requestTimeoutMs",
+  ]);
+  await engine.resumeReadonly(state);
+  assert.equal(state.config.workflow.requestTimeoutMs, 600000);
+  assert.equal(state.config.agents.implementor.requestTimeoutMs, 0);
+  await editConfig(cwd, (value) => {
+    value.workflow.requestTimeoutMs = 0;
+  });
+  drift = analyzeConfigDrift(state, await loadConfig(cwd));
+  assert.equal(drift.blocking, false);
+  assert.deepEqual(drift.runtimeChanges, ["workflow.requestTimeoutMs"]);
 });
 
 test("stale local fix limit 5→10 permits /team-continue and retains the counter", async () => {

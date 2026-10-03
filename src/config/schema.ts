@@ -52,6 +52,7 @@ const agent = z
     timeoutMs: z
       .union([z.literal(0), z.number().int().min(1000).max(86400000)])
       .optional(),
+    requestTimeoutMs: z.number().int().min(0).optional(),
     maxToolCalls: z.number().int().min(0).optional(),
     doomLoop: z
       .object({
@@ -146,6 +147,7 @@ export const configSchema = z
         agentTimeoutMs: z
           .union([z.literal(0), z.number().int().min(1000).max(86400000)])
           .default(300000),
+        requestTimeoutMs: z.number().int().min(0).optional(),
         networkRetry: z
           .object({
             maxRetries: z.number().int().min(0).default(10),

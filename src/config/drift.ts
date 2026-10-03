@@ -23,12 +23,14 @@ const runtimeWorkflow = new Set([
   "maxResearchClarifications",
   "maxToolCalls",
   "agentTimeoutMs",
+  "requestTimeoutMs",
   "networkRetry",
   "doomLoop",
 ]);
 const runtimeAgent = new Set([
   "temperature",
   "timeoutMs",
+  "requestTimeoutMs",
   "networkRetry",
   "doomLoop",
   "maxToolCalls",

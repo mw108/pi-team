@@ -305,6 +305,23 @@ export class AgentLogStore {
       if (label) lines.push(`${time} ${label}`);
       if (event.type === "provider_request_failure") {
         lines.push(...errorLines(event.error));
+        const configuredTimeout = (
+          event.providerTimeouts as
+            | {
+                requestTimeoutMs?:
+                  number | { value: number; source: string; mode?: string };
+              }
+            | undefined
+        )?.requestTimeoutMs;
+        const requestTimeout =
+          typeof configuredTimeout === "number"
+            ? { value: configuredTimeout, source: "pi" }
+            : (configuredTimeout as
+                { value: number; source: string; mode?: string } | undefined);
+        if (requestTimeout)
+          lines.push(
+            `  provider request timeout: ${requestTimeout.mode === "unlimited" ? "unlimited" : seconds(requestTimeout.value)} (${requestTimeout.source})`,
+          );
         if (event.agentTimeoutMs !== undefined)
           lines.push(
             `  agent timeout: ${event.agentTimeoutMs === null ? "unlimited" : seconds(event.agentTimeoutMs)}`,

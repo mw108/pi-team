@@ -39,6 +39,7 @@ import {
 import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { effectiveConfig } from "./discovery.ts";
+import { resolveRequestTimeout } from "./request-timeout.ts";
 import {
   AgentDoomLoopError,
   AgentTimeoutError,
@@ -176,6 +177,7 @@ export class PiRunner implements AgentRunner {
         }),
       providerEvent,
       providerProgress,
+      resolveRequestTimeout(config, role),
     );
     const paths: string[] = [],
       factories: any[] = [];

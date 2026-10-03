@@ -51,6 +51,45 @@ test("unlimited tool budget is explicit in provider failure diagnostics", async 
   assert.equal(failure?.toolBudgetExhausted, false);
 });
 
+test("unlimited request timeout is explicit in failure diagnostics", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.requestTimeoutMs = 0;
+  const runner: AgentRunner = {
+    async run() {
+      throw new Error("fixture provider failure");
+    },
+  };
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("diagnostic fixture", cfg);
+  await assert.rejects(() => engine.invoke("researcher", state));
+  const logs = new AgentLogStore(cwd);
+  const events = await logs.read(state.id, "researcher", 1);
+  assert.deepEqual(
+    (
+      events.find((event) => event.type === "provider_error")
+        ?.providerTimeouts as any
+    )?.requestTimeoutMs,
+    { value: 0, source: "workflow", mode: "unlimited" },
+  );
+  const { attempt, logger } = await logs.create(state.id, "reviewer");
+  logger.append({
+    type: "provider_request_failure",
+    providerRequest: 1,
+    requestDurationMs: 1200,
+    providerTimeouts: {
+      requestTimeoutMs: { value: 0, source: "workflow", mode: "unlimited" },
+    },
+  });
+  await logger.flush();
+  const timeline = await logs.timeline(state.id, "reviewer", attempt);
+  assert.match(timeline, /provider request timeout: unlimited \(workflow\)/);
+  assert.doesNotMatch(timeline, /provider request timeout: 0\.0s/);
+});
+
 const model = {
   api: "openai-completions",
   provider: "local",
@@ -316,7 +355,7 @@ test("summary attempt log and status retain provider cause, timing and guard con
         toolBudgetExhausted: false,
         networkRetryState: { currentRetry: 0, maxRetries: 10, waiting: false },
         providerTimeouts: {
-          requestTimeoutMs: 300000,
+          requestTimeoutMs: { value: 300000, source: "default" as const },
           maxRetries: 0,
           httpIdleTimeoutMs: { value: 300000, source: "pi-default" },
         },
@@ -364,12 +403,17 @@ test("summary attempt log and status retain provider cause, timing and guard con
   assert.equal(failure?.toolCalls, 35);
   assert.equal(failure?.abortSignalAborted, false);
   assert.equal(failure?.agentTimeoutMs, 3600000);
+  assert.deepEqual((failure?.providerTimeouts as any)?.requestTimeoutMs, {
+    value: 300000,
+    source: "default",
+  });
   assert.equal(
     events.find((event) => event.type === "terminated_diagnostic")?.causeCode,
     "UND_ERR_SOCKET",
   );
   const timeline = await logs.timeline(state.id, "researcher", 1);
   assert.match(timeline, /provider request 4 failed after 300.0s/);
+  assert.match(timeline, /provider request timeout: 300.0s \(default\)/);
   assert.match(timeline, /cause: Error: other side closed/);
   assert.match(timeline, /code: UND_ERR_SOCKET/);
   state.phase = "BLOCKED";

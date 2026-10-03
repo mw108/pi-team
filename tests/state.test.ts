@@ -46,6 +46,7 @@ test("version 2 state loads without inventing semantic drift metadata", () => {
   assert.equal(loaded.version, 3);
   assert.equal(loaded.semanticConfigHash, undefined);
   assert.equal(loaded.driftConfigSnapshot, undefined);
+  assert.equal(loaded.config.workflow.requestTimeoutMs, undefined);
 });
 test("older version 3 states default the dedicated Researcher count to zero", () => {
   const raw: any = newState("/tmp", "task", config(), {

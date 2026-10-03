@@ -5,6 +5,10 @@ import type { AssistantMessageEvent, Api, Model } from "@earendil-works/pi-ai";
 import type { Role } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
 import {
+  piRequestTimeoutMs,
+  type ResolvedRequestTimeout,
+} from "./request-timeout.ts";
+import {
   serializeErrorDiagnostics,
   type ErrorDiagnostics,
 } from "./error-diagnostics.ts";
@@ -71,7 +75,7 @@ export type ProviderRequestEvent = {
   classification?: "network" | "provider" | "rate_limit" | "other";
   matchedRule?: string | null;
   providerTimeouts?: {
-    requestTimeoutMs?: number;
+    requestTimeoutMs?: ResolvedRequestTimeout | number;
     maxRetries?: number;
     httpIdleTimeoutMs?: { value: number; source: string };
   };
@@ -231,6 +235,7 @@ export function configureNetworkRetry(
   ) => Promise<void>,
   observePreflight?: (event: ModelPreflightEvent) => void,
   observePreflightProgress?: (update: ModelPreflightUpdate) => void,
+  requestTimeout?: ResolvedRequestTimeout,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -320,9 +325,11 @@ export function configureNetworkRetry(
           // A telemetry timer failure must not prevent the request.
         }
         const providerTimeouts = {
-          ...(typeof options?.timeoutMs === "number"
-            ? { requestTimeoutMs: options.timeoutMs }
-            : {}),
+          ...(requestTimeout
+            ? { requestTimeoutMs: requestTimeout }
+            : typeof options?.timeoutMs === "number"
+              ? { requestTimeoutMs: options.timeoutMs }
+              : {}),
           maxRetries: 0,
         };
         observeRequest?.({
@@ -335,6 +342,9 @@ export function configureNetworkRetry(
         let lastActivityAt: number | undefined;
         const requestOptions = {
           ...options,
+          ...(requestTimeout
+            ? { timeoutMs: piRequestTimeoutMs(requestTimeout) }
+            : {}),
           signal,
           maxRetries: 0,
           onProviderStreamEvent: async (
