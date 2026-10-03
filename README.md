@@ -426,13 +426,15 @@ flowchart TD
   G --> D[Done]
 ```
 
-Testing failures classified as `FIX_DESIGN` return to Researcher. Every fix invalidates later quality approvals. Files are hashed at quality gates and checked again before commit; changes after review block the commit. Tester edits, when enabled, require another reviewed cycle rather than bypassing an earlier review.
+Testing failures classified as `FIX_DESIGN` return to Researcher. Every fix invalidates later quality approvals. Contract files and pre-existing dirty files are hashed at quality gates and checked again before commit; unrelated test output does not invalidate review. Tester edits, when enabled, require another code/security review and a fresh test run before PASS can advance.
 
 ### Test responsibility
 
 The Reviewer specifies automated coverage in the Implementation Contract. Each `requiredTests` entry has a `description`, an `action`, and optional `file`, `scope` (`unit`, `integration`, `e2e`, or `other`) and `acceptanceCriteria`. `existing` means current coverage must keep passing; its file may be omitted if unknown. `modify` means the Implementor updates the named existing test file, which must be in `filesToModify`. `create` means the Implementor adds the named new test file, which must be in `filesToCreate`. Contract validation rejects mismatched lists and conflicting create/modify actions for the same path. Test paths receive the same repository boundary checks as other contract paths.
 
-The Implementor writes the required production and test code before Code Review. The Code Reviewer checks the actual diff and test assertions against the contract and returns `FIX_LOCAL` for ordinary missing coverage. The Tester then executes approved validation commands. `tester.mayModifyTests` remains `false` by default; enabling it is an exceptional repair capability, not the normal owner of contract tests.
+The Implementor writes the required production and test code before Code Review. The Code Reviewer checks the actual diff and test assertions against the contract and returns `FIX_LOCAL` for ordinary missing coverage. The Tester then executes approved validation commands. `tester.mayModifyTests` remains `false` by default. When enabled, Tester may edit only files listed in the contract under configured `tester.testPaths`. Any such edit invalidates the current validation and sends the workflow through review and another test execution. Production edits by Tester block the workflow.
+
+If `FIX_DESIGN` narrows the contract after partial implementation, Pi Team lists old implementation paths outside the new contract and asks whether to keep them, discard safe changes, or abort. Discard eligibility requires a successful observed Implementor `edit`, `write`, or `team_delete` tool call for that exact path and attempt; the agent's `changedFiles` claim and command side effects are not ownership evidence. Ambiguous paths are preserved and require manual reconciliation. Baseline-dirty, staged, or subsequently changed paths cannot be automatically discarded. A user edit interleaved with a successful Implementor tool call during the same attempt cannot be distinguished reliably and may require manual review.
 
 For example, a login contract can keep its success test and require a new failure case in the same file:
 
@@ -584,7 +586,9 @@ LLM-controlled `read` denies `.env` files, private keys, credential files and in
 
 Commit preparation scans only commit-intended regular files. It uses `gitleaks` automatically when available on PATH, with a private temporary scan directory containing only those files; otherwise a built-in scanner checks common token prefixes, JWTs, private-key markers and credential assignments. Findings block commit without printing full values. The fallback is conservative and cannot recognize every secret; review generated files and approved command behavior before committing.
 
-Commit Agent has read-only Git inspection and produces a message/file plan. Host code checks quality gates, exact intended file lists, baseline attribution, staged changes, HEAD, file hashes and common credential patterns before staging and committing. Commit hooks are disabled by default. See the explicit trust option below; required validation should normally be approved commands. Secret scanning is heuristic, not comprehensive. Changes to the same originally clean file made concurrently by the user cannot be perfectly attributed; avoid concurrent editing during a task. Git push is never performed and no push/reset/clean/rebase/force command tool is exposed.
+Commit Agent has read-only Git inspection and produces a message/file plan. Host code checks quality gates, exact intended file lists, baseline attribution, staged changes, HEAD, file hashes and common credential patterns before staging and committing. Commit hooks are disabled by default. See the explicit trust option below; required validation should normally be approved commands. Secret scanning is heuristic, not comprehensive. Changes to the same originally clean file made concurrently by the user cannot be perfectly attributed; avoid concurrent editing during a task. Git push is never performed and no push/reset/clean/rebase/force command tool is exposed to agents. An explicit orphan discard uses a scoped Git restore in host code.
+
+Workflow discovery skips corrupt state files and loads the newest valid workflow. An explicit workflow ID still reports an error if its state is corrupt. Lock files now publish complete owner metadata atomically; existing valid PID-only locks remain readable, while incomplete or unknown locks require inspection.
 
 ## Git hooks and dirty-file approvals
 

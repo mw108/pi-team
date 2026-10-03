@@ -2,7 +2,12 @@ import { loadConfig } from "../config/loader.ts";
 import { analyzeConfigDrift, driftSummary } from "../config/drift.ts";
 import { contractSchema, type Role } from "../agents/schemas.ts";
 import { contractPaths } from "../agents/permissions.ts";
-import { dirtyPaths, hashes, head } from "./git.ts";
+import {
+  dirtyPaths,
+  gateSnapshot,
+  unexpectedWorkflowPaths,
+  head,
+} from "./git.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
 import {
   getRequiredSuccessfulSolverCount,
@@ -290,7 +295,11 @@ export async function getWorkflowRecoveryPlan(
     state.gateHashes
   ) {
     try {
-      const snapshot = await hashes(cwd, await dirtyPaths(cwd));
+      if ((await unexpectedWorkflowPaths(state)).length)
+        return unsafe(
+          "Repository changed outside the Implementation Contract; inspect changes before continuing.",
+        );
+      const snapshot = await gateSnapshot(state);
       if (JSON.stringify(snapshot) !== JSON.stringify(state.gateHashes))
         return unsafe(
           "Repository changed after a quality gate; inspect changes before continuing.",

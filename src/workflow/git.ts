@@ -160,6 +160,97 @@ export async function hashes(cwd: string, paths: string[]) {
   }
   return result;
 }
+/** Gate contents are the contract, pre-existing dirty files, and files already reviewed. */
+export async function gateSnapshot(s: WorkflowState) {
+  const contract = s.results.reviewer
+    ? contractSchema.safeParse(s.results.reviewer)
+    : undefined;
+  const paths = [
+    ...new Set([
+      ...Object.keys(s.gateHashes ?? {}),
+      ...s.baseline.dirtyPaths,
+      ...(contract?.success ? contractPaths(contract.data) : []),
+    ]),
+  ];
+  return hashes(s.cwd, paths.sort());
+}
+
+/** Only a narrow set of known, untracked command outputs is excluded. */
+export async function runtimeArtifacts(cwd: string): Promise<Set<string>> {
+  const untracked = (
+    await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+  )
+    .split("\0")
+    .filter(Boolean);
+  return new Set(untracked.filter((path) => path === ".phpunit.result.cache"));
+}
+export async function unexpectedWorkflowPaths(
+  s: WorkflowState,
+): Promise<string[]> {
+  const contract = s.results.reviewer
+    ? contractSchema.safeParse(s.results.reviewer)
+    : undefined;
+  const allowed = new Set([
+    ...s.baseline.dirtyPaths,
+    ...(contract?.success ? contractPaths(contract.data) : []),
+  ]);
+  const artifacts = await runtimeArtifacts(s.cwd);
+  return (await dirtyPaths(s.cwd)).filter(
+    (path) =>
+      !path.startsWith(".pi/team/") &&
+      !allowed.has(path) &&
+      !artifacts.has(path),
+  );
+}
+export async function classifyOrphanedImplementation(s: WorkflowState) {
+  const prior = s.priorImplementation;
+  if (!prior) return { discardable: [] as string[], ambiguous: [] as string[] };
+  const contract = contractSchema.parse(s.results.reviewer);
+  const allowed = new Set(contractPaths(contract).map(policyPath));
+  const baseline = new Set(s.baseline.dirtyPaths.map(policyPath));
+  const artifacts = await runtimeArtifacts(s.cwd);
+  const dirty = await dirtyPaths(s.cwd);
+  const candidates = dirty.filter(
+    (path) =>
+      !path.startsWith(".pi/team/") &&
+      (!baseline.has(policyPath(path)) || Object.hasOwn(prior.hashes, path)) &&
+      !allowed.has(policyPath(path)) &&
+      !artifacts.has(path),
+  );
+  const current = await hashes(s.cwd, candidates);
+  const staged = new Set(
+    (await git(s.cwd, ["diff", "--cached", "--name-only", "-z"]))
+      .split("\0")
+      .filter(Boolean)
+      .map(policyPath),
+  );
+  const untracked = new Set(
+    (await git(s.cwd, ["ls-files", "--others", "--exclude-standard", "-z"]))
+      .split("\0")
+      .filter(Boolean),
+  );
+  const headUnchanged = (await head(s.cwd)) === s.baseline.head;
+  const observed = new Set(
+    s.observedImplementorMutations
+      .filter((mutation) => mutation.attempt === prior.attempt)
+      .map((mutation) => mutation.identity),
+  );
+  const discardable = candidates.filter(
+    (path) =>
+      headUnchanged &&
+      !baseline.has(policyPath(path)) &&
+      prior.discardablePaths.includes(path) &&
+      observed.has(policyPath(path)) &&
+      prior.hashes[path] === current[path] &&
+      !staged.has(policyPath(path)) &&
+      prior.createdPaths.includes(path) === untracked.has(path),
+  );
+  const safe = new Set(discardable);
+  return {
+    discardable,
+    ambiguous: candidates.filter((path) => !safe.has(path)),
+  };
+}
 export function gitInspectTool(s: WorkflowState): ToolDefinition {
   return {
     name: "team_git_inspect",
@@ -224,7 +315,7 @@ export async function prepareCommit(
   }
   if (
     s.gateHashes &&
-    JSON.stringify(await hashes(s.cwd, dirty)) !== JSON.stringify(s.gateHashes)
+    JSON.stringify(await gateSnapshot(s)) !== JSON.stringify(s.gateHashes)
   )
     throw new Error("Reviewed files changed before commit");
   if (!files.length || new Set(files).size !== files.length)
@@ -238,8 +329,12 @@ export async function prepareCommit(
     )
       throw new Error(`Cannot safely attribute commit path: ${path}`);
   }
+  const artifacts = await runtimeArtifacts(s.cwd);
   const produced = dirty.filter(
-    (p) => !s.baseline.dirtyPaths.includes(p) && !p.startsWith(".pi/team/"),
+    (p) =>
+      !s.baseline.dirtyPaths.includes(p) &&
+      !p.startsWith(".pi/team/") &&
+      !(artifacts.has(p) && !allowed.includes(p)),
   );
   if (produced.some((p) => !files.includes(p)))
     throw new Error(

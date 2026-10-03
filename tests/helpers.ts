@@ -10,6 +10,7 @@ import { git } from "../src/workflow/git.ts";
 import { execute } from "../src/agents/commands.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
 import type { AgentRunner } from "../src/agents/runner.ts";
+import type { MutationObserver } from "../src/agents/mutation-attribution.ts";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { effectiveConfig } from "../src/agents/discovery.ts";
 export function config() {
@@ -224,12 +225,14 @@ export class FixtureRunner implements AgentRunner {
       role: Role,
       s: WorkflowState,
       count: number,
+      mutationObserver?: MutationObserver,
     ) => Promise<any | undefined>,
   ) {}
-  async run(role: Role, s: WorkflowState) {
+  async run(role: Role, s: WorkflowState, ...extras: any[]) {
     this.calls.push(role);
     const count = (this.counts[role] = (this.counts[role] ?? 0) + 1);
-    const value = await this.custom?.(role, s, count);
+    const mutationObserver = extras.at(-1) as MutationObserver | undefined;
+    const value = await this.custom?.(role, s, count, mutationObserver);
     if (value !== undefined) return value;
     if (role === "implementor")
       await writeFile(

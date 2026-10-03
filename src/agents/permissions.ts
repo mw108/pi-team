@@ -11,6 +11,7 @@ import {
   classifyPath,
   isSensitiveReadPath,
   policyPath,
+  isWithinPath,
 } from "./path-policy.ts";
 import { createHash } from "node:crypto";
 import type { Role, Contract } from "./schemas.ts";
@@ -215,7 +216,10 @@ export async function checkTool(
     if (role === "tester") {
       if (
         !config.tester.mayModifyTests ||
-        !config.tester.testPaths.some((prefix) => path.startsWith(prefix))
+        !config.tester.testPaths.some((prefix) => isWithinPath(path, prefix)) ||
+        !contractPaths(contract).some(
+          (allowed) => policyPath(allowed) === policyPath(path),
+        )
       )
         throw new Error("Tester may only modify configured test paths");
     } else if (!contractPaths(contract).includes(path))

@@ -1,4 +1,6 @@
 import { appendFile, readFile } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { projectRootSync } from "../config/project.ts";
@@ -8,6 +10,7 @@ import {
   type TeamDefinition,
 } from "../config/loader.ts";
 import type { AgentRunner } from "../agents/runner.ts";
+import type { ObservedFileMutation } from "../agents/mutation-attribution.ts";
 import { resolveRequestTimeout } from "../agents/request-timeout.ts";
 import {
   parseResult,
@@ -21,7 +24,11 @@ import {
   contractPaths,
   validateContractPaths,
 } from "../agents/permissions.ts";
-import { classifyPath, policyPath } from "../agents/path-policy.ts";
+import {
+  classifyPath,
+  policyPath,
+  isWithinPath,
+} from "../agents/path-policy.ts";
 import {
   discoverCommands,
   commandKey,
@@ -43,6 +50,9 @@ import {
   head,
   hashes,
   dirtyPaths,
+  gateSnapshot,
+  unexpectedWorkflowPaths,
+  classifyOrphanedImplementation,
   prepareCommit,
   createCommit,
 } from "./git.ts";
@@ -117,6 +127,7 @@ type AttemptControl = {
   controller: AbortController;
   attempt: number;
   intention?: "abort" | "retry" | "superseded";
+  manualRetry?: boolean;
   settled?: boolean;
 };
 export interface EngineUI {
@@ -545,6 +556,8 @@ export class WorkflowEngine {
     if (control && control.workflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
     if (control && control.workflowId === state.id && !control.settled) {
+      if (control.manualRetry)
+        throw new Error(`Agent ${label} (${role}) is already restarting.`);
       if (control.intention)
         throw new Error(
           `Agent ${label} (${role}) is already ${control.intention === "retry" ? "restarting" : "aborting"}.`,
@@ -909,6 +922,7 @@ export class WorkflowEngine {
         workflowId: s.id,
         controller: new AbortController(),
         attempt: attemptNumber,
+        manualRetry: trigger === "manual_retry",
       };
       if (this.activeAttempts.has(role))
         throw new Error(`${role} already has an active attempt`);
@@ -1243,6 +1257,32 @@ export class WorkflowEngine {
                 attempt: attemptNumber,
                 ...recovery,
               }),
+            async (mutation: ObservedFileMutation) => {
+              if (role !== "implementor") return;
+              const recordItem = { attempt: attemptNumber, ...mutation };
+              if (
+                authoritative.observedImplementorMutations.some(
+                  (item) =>
+                    item.attempt === recordItem.attempt &&
+                    item.identity === recordItem.identity &&
+                    item.kind === recordItem.kind,
+                )
+              )
+                return;
+              authoritative.observedImplementorMutations.push(recordItem);
+              try {
+                await this.store.save(authoritative);
+              } catch (error) {
+                authoritative.observedImplementorMutations.pop();
+                throw error;
+              }
+              logged?.logger.append({
+                type: "implementor_file_mutation_recorded",
+                attempt: attemptNumber,
+                path: mutation.path,
+                kind: mutation.kind,
+              });
+            },
           ),
         );
         if (control.intention)
@@ -1961,6 +2001,56 @@ export class WorkflowEngine {
                 s.approvedSensitivePaths = required;
                 record(s, "sensitive_paths_approved", JSON.stringify(required));
               }
+            } else if (request.kind === "orphanedImplementation") {
+              const prior = s.priorImplementation;
+              const classification = await classifyOrphanedImplementation(s);
+              const orphaned = [
+                ...classification.discardable,
+                ...classification.ambiguous,
+              ];
+              if (
+                !prior ||
+                selected.length !== 1 ||
+                !["keep", "discard", "abort"].includes(selected[0])
+              )
+                block(s, "Orphaned implementation decision was invalid");
+              else if (selected[0] !== "discard")
+                block(
+                  s,
+                  selected[0] === "keep"
+                    ? `Orphaned implementation retained: ${orphaned.join(", ")}. Revise the contract to include these paths before continuing.`
+                    : "Workflow aborted with orphaned implementation preserved",
+                );
+              else {
+                for (const path of classification.discardable) {
+                  assertRelative(path);
+                  if (prior.createdPaths.includes(path))
+                    await unlink(join(this.cwd, path));
+                  else
+                    await git(this.cwd, [
+                      "restore",
+                      "--source=HEAD",
+                      "--worktree",
+                      "--",
+                      path,
+                    ]);
+                }
+                if (classification.discardable.length)
+                  record(
+                    s,
+                    "orphaned_implementation_discarded",
+                    classification.discardable.join(", "),
+                  );
+                delete s.gateHashes;
+                if (classification.ambiguous.length)
+                  block(
+                    s,
+                    `Ambiguous orphaned changes require manual reconciliation or a revised contract: ${classification.ambiguous.join(", ")}`,
+                  );
+                else {
+                  delete s.priorImplementation;
+                }
+              }
             } else if (request.kind === "configDrift") {
               if (selected.length !== 1 || selected[0] !== "resume") {
                 block(
@@ -2183,8 +2273,15 @@ export class WorkflowEngine {
             "COMMIT",
           ].includes(s.phase)
         ) {
-          const paths = await dirtyPaths(this.cwd),
-            snapshot = await hashes(this.cwd, paths);
+          const unexpected = await unexpectedWorkflowPaths(s);
+          if (unexpected.length) {
+            block(
+              s,
+              `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
+            );
+            break;
+          }
+          const snapshot = await gateSnapshot(s);
           if (
             s.gateHashes &&
             JSON.stringify(snapshot) !== JSON.stringify(s.gateHashes)
@@ -2240,6 +2337,13 @@ export class WorkflowEngine {
           (r) =>
             s.phase !== "SOLVE" || !s.results[r] || s.manualRetry?.agent === r,
         );
+        if (s.phase === "IMPLEMENT") {
+          const contract = contractSchema.parse(s.results.reviewer);
+          s.implementationStartHashes = await hashes(
+            this.cwd,
+            contractPaths(contract),
+          );
+        }
         const manualAtStart = new Set(this.manualReruns);
         this.manualReruns.clear();
         s.inFlight = { phase: s.phase, roles: runRoles };
@@ -2488,18 +2592,87 @@ export class WorkflowEngine {
             contractPaths(contract).length
           )
             throw new Error("Contract file lists overlap");
+          const classification = await classifyOrphanedImplementation(s);
+          const orphaned = [
+            ...classification.discardable,
+            ...classification.ambiguous,
+          ];
+          if (orphaned.length) {
+            record(s, "orphaned_implementation_detected", orphaned.join(", "));
+            if (classification.ambiguous.length)
+              record(
+                s,
+                "orphaned_change_ambiguous",
+                classification.ambiguous.join(", "),
+              );
+            await this.requestApproval(s, {
+              kind: "orphanedImplementation",
+              title: "Old implementation files outside the new contract",
+              prompt: `Safe to discard: ${classification.discardable.join(", ") || "none"}. Ambiguous ownership (never automatically discarded): ${classification.ambiguous.join(", ") || "none"}. Keep and revise the contract, discard only safe changes, or abort?`,
+              options: [
+                {
+                  value: "keep",
+                  label: "Keep",
+                  description: "Preserve files; revise contract",
+                },
+                {
+                  value: "discard",
+                  label: "Discard",
+                  description: "Restore only observed safe file mutations",
+                },
+                {
+                  value: "abort",
+                  label: "Abort",
+                  description: "Stop and preserve files",
+                },
+              ],
+            });
+            continue;
+          }
+          delete s.priorImplementation;
         }
         if (s.phase === "SOLVE")
           for (const role of getActiveSolverIds(s.config))
             if (s.results[role] && (s.results[role] as any)?.solverId !== role)
               throw new Error(`Solver identity mismatch: ${role}`);
-        if (
-          s.phase === "TEST" &&
-          s.gateHashes &&
-          JSON.stringify(await hashes(this.cwd, await dirtyPaths(this.cwd))) !==
-            JSON.stringify(s.gateHashes)
-        )
-          throw new Error("Validation changed reviewed files");
+        if (s.phase === "TEST" && s.gateHashes) {
+          const snapshot = await gateSnapshot(s);
+          const changed = Object.keys(snapshot).filter(
+            (path) => snapshot[path] !== s.gateHashes?.[path],
+          );
+          if (changed.length) {
+            const contract = contractSchema.parse(s.results.reviewer);
+            const allowed = new Set(contractPaths(contract).map(policyPath));
+            const permitted =
+              s.config.tester.mayModifyTests &&
+              changed.every(
+                (path) =>
+                  allowed.has(policyPath(path)) &&
+                  s.config.tester.testPaths.some((prefix) =>
+                    isWithinPath(path, prefix),
+                  ),
+              );
+            if (!permitted)
+              throw new Error("Validation changed reviewed files");
+            if (s.testMutationCycles >= 3)
+              throw new Error(
+                "Tester changed tests repeatedly; inspect before retrying",
+              );
+            s.testMutationCycles++;
+            for (const role of [
+              "codeReviewer",
+              "pentester",
+              "securityReviewer",
+              "tester",
+            ])
+              delete s.results[role];
+            delete s.gateHashes;
+            record(s, "test_source_changed", changed.join(", "));
+            s.phase = "CODE_REVIEW";
+            await this.store.save(s);
+            continue;
+          }
+        }
         if (s.phase === "COMMIT") {
           const result = s.results.commitAgent as any;
           try {
@@ -2534,6 +2707,77 @@ export class WorkflowEngine {
             throw error;
           }
         }
+        if (
+          s.phase === "IMPLEMENT" &&
+          (s.results.implementor as any)?.status === "IMPLEMENTATION_BLOCKED" &&
+          (s.results.implementor as any)?.suggestedRoute === "FIX_DESIGN"
+        ) {
+          const oldContract = contractSchema.parse(s.results.reviewer);
+          const dirty = await dirtyPaths(this.cwd);
+          const oldPaths = new Set(contractPaths(oldContract).map(policyPath));
+          const baselinePaths = new Set(s.baseline.dirtyPaths.map(policyPath));
+          const startHashes = new Map(
+            Object.entries(s.implementationStartHashes ?? {}).map(
+              ([path, hash]) => [policyPath(path), hash],
+            ),
+          );
+          const contractAfter = await hashes(
+            this.cwd,
+            contractPaths(oldContract),
+          );
+          const contractAfterByIdentity = new Map(
+            Object.entries(contractAfter).map(([path, hash]) => [
+              policyPath(path),
+              hash,
+            ]),
+          );
+          const candidates = dirty.filter(
+            (path) =>
+              !path.startsWith(".pi/team/") &&
+              (oldPaths.has(policyPath(path))
+                ? !baselinePaths.has(policyPath(path)) ||
+                  startHashes.get(policyPath(path)) !==
+                    contractAfterByIdentity.get(policyPath(path))
+                : !baselinePaths.has(policyPath(path))),
+          );
+          const after = await hashes(this.cwd, candidates);
+          const attempt = s.history.findLast(
+            (entry) =>
+              entry.event === "agent_attempt_started" &&
+              entry.meta?.agent === "implementor",
+          )?.meta?.attempt;
+          const owned = candidates.filter(
+            (path) =>
+              oldPaths.has(policyPath(path)) &&
+              !baselinePaths.has(policyPath(path)) &&
+              startHashes.get(policyPath(path)) !== after[path] &&
+              attempt !== undefined &&
+              s.observedImplementorMutations.some(
+                (mutation) =>
+                  mutation.attempt === attempt &&
+                  mutation.identity === policyPath(path),
+              ),
+          );
+          const untracked = new Set(
+            (
+              await git(this.cwd, [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+              ])
+            )
+              .split("\0")
+              .filter(Boolean),
+          );
+          s.priorImplementation = {
+            attempt,
+            hashes: after,
+            createdPaths: candidates.filter((path) => untracked.has(path)),
+            discardablePaths: owned,
+          };
+        }
+        if (s.phase === "IMPLEMENT") delete s.implementationStartHashes;
         transition(s);
         record(s, "phase_completed");
         await this.store.save(s);

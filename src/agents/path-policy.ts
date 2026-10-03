@@ -13,6 +13,12 @@ export function policyPath(path: string): string {
   return normalized.toLowerCase();
 }
 
+export function isWithinPath(path: string, directory: string): boolean {
+  const key = policyPath(path);
+  const root = policyPath(directory.replace(/\/+$/, ""));
+  return key.startsWith(`${root}/`);
+}
+
 export type PathPolicy = "normal" | "requires_user_approval" | "forbidden";
 /** LLM-facing content reads use the same normalized path identity as writes. */
 export function isSensitiveReadPath(path: string): boolean {

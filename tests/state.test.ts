@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { newState, validateState } from "../src/workflow/state.ts";
@@ -183,4 +183,123 @@ test("repository lock prevents a second live workflow", async () => {
   await (
     await store.lock()
   )();
+});
+test("latest skips corrupt newest and multiple corrupt candidates", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
+  const store = new StateStore(cwd);
+  const valid = newState(cwd, "valid", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  await store.save(valid);
+  let corruptId = "";
+  for (let i = 0; i < 2; i++) {
+    const corrupt = newState(cwd, `corrupt ${i}`, config(), valid.baseline);
+    corruptId = corrupt.id;
+    await writeFile(store.path(corrupt.id), "{broken");
+  }
+  assert.equal((await store.latest())?.id, valid.id);
+  await assert.rejects(() => store.load(corruptId), /original state preserved/);
+  await unlink(store.path(valid.id));
+  assert.equal(await store.latest(), undefined);
+});
+test("legacy valid candidate remains discoverable", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
+  const store = new StateStore(cwd);
+  const old: any = newState(cwd, "old", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  old.version = 2;
+  await mkdir(store.dir, { recursive: true });
+  await writeFile(store.path(old.id), JSON.stringify(old));
+  assert.equal((await store.latest())?.version, 3);
+});
+test("lock metadata is complete, exclusive, and protected by owner token", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-lock-"));
+  const store = new StateStore(cwd);
+  const [first, second] = await Promise.allSettled([
+    store.lock(),
+    store.lock(),
+  ]);
+  assert.equal(
+    [first, second].filter((r) => r.status === "fulfilled").length,
+    1,
+  );
+  const lockPath = join(store.dir, "active.lock");
+  const held = JSON.parse(await readFile(lockPath, "utf8"));
+  assert.equal(typeof held.token, "string");
+  const winner = first.status === "fulfilled" ? first : second;
+  if (winner.status !== "fulfilled") throw new Error("No lock winner");
+  const unlock = winner.value;
+  await unlink(lockPath);
+  await writeFile(
+    lockPath,
+    JSON.stringify({
+      pid: process.pid,
+      token: "replacement",
+      at: new Date().toISOString(),
+    }),
+  );
+  await unlock();
+  assert.equal(
+    JSON.parse(await readFile(lockPath, "utf8")).token,
+    "replacement",
+  );
+  await unlink(lockPath);
+});
+test("dead owner and reused PID locks can be recovered; active age alone is ignored", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-lock-"));
+  const store = new StateStore(cwd);
+  await mkdir(store.dir, { recursive: true });
+  const lockPath = join(store.dir, "active.lock");
+  await writeFile(
+    lockPath,
+    JSON.stringify({ pid: 99999999, at: "2000-01-01T00:00:00Z" }),
+  );
+  await (
+    await store.lock()
+  )();
+  await writeFile(
+    lockPath,
+    JSON.stringify({
+      pid: process.pid,
+      processIdentity: "another process",
+      at: "2000-01-01T00:00:00Z",
+    }),
+  );
+  await (
+    await store.lock()
+  )();
+  await writeFile(
+    lockPath,
+    JSON.stringify({ pid: process.pid, at: "2000-01-01T00:00:00Z" }),
+  );
+  await assert.rejects(() => store.lock(), /already running/);
+  await unlink(lockPath);
+  await writeFile(lockPath, "");
+  await assert.rejects(() => store.lock(), /incomplete or invalid metadata/);
+});
+test("concurrent stale-lock recovery leaves one complete owner", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-lock-"));
+  const store = new StateStore(cwd);
+  await mkdir(store.dir, { recursive: true });
+  const lockPath = join(store.dir, "active.lock");
+  await writeFile(
+    lockPath,
+    JSON.stringify({ pid: 99999999, at: "2000-01-01T00:00:00Z" }),
+  );
+  const outcomes = await Promise.allSettled([store.lock(), store.lock()]);
+  const winners = outcomes.filter((result) => result.status === "fulfilled");
+  assert.equal(winners.length, 1);
+  const owner = JSON.parse(await readFile(lockPath, "utf8"));
+  assert.equal(owner.pid, process.pid);
+  assert.equal(typeof owner.token, "string");
+  await winners[0].value();
 });

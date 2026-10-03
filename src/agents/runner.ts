@@ -27,6 +27,7 @@ import {
 import { allowedCommandCategories } from "./command-policy.ts";
 import { deleteTool } from "./files.ts";
 import { gitInspectTool } from "../workflow/git.ts";
+import { AgentLogStore, AttemptLogger } from "../workflow/agent-logs.ts";
 import { packagePath, context7Config } from "../integrations/resources.ts";
 import { rolePrompt, digest } from "./registry.ts";
 import { contextFor, sanitizeContextForProvider } from "./context.ts";
@@ -73,6 +74,10 @@ import {
   ActiveSessionRegistry,
   type ActiveAgentSession,
 } from "./active-sessions.ts";
+import {
+  FileMutationTracker,
+  type MutationObserver,
+} from "./mutation-attribution.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -83,6 +88,16 @@ export type ActivityObserver = (
 ) => void;
 export type OutputObserver = (text: string) => void;
 export type { GuardEvent } from "./doom-loop.ts";
+
+export function compactValidationEvidence(evidence: CommandEvidence[]) {
+  return evidence.map((command) => ({
+    id: command.id,
+    exitCode: command.exitCode,
+    output: command.output.slice(-2000),
+    timedOut: command.timedOut,
+    durationMs: command.durationMs,
+  }));
+}
 
 export interface AgentRunner {
   run(
@@ -104,6 +119,7 @@ export interface AgentRunner {
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
+    mutationObserver?: MutationObserver,
   ): Promise<any>;
 }
 export class PiRunner implements AgentRunner {
@@ -126,6 +142,7 @@ export class PiRunner implements AgentRunner {
       update: ProviderProgressUpdate | ModelPreflightUpdate,
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
+    mutationObserver?: MutationObserver,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
       selected = config.agents[role];
@@ -198,6 +215,10 @@ export class PiRunner implements AgentRunner {
     }
     if (allowedTools(role, config).includes("web_search"))
       paths.push(packagePath("pi-web-access", "dist/index.js"));
+    const mutations =
+      role === "implementor" && mutationObserver
+        ? new FileMutationTracker(s.cwd, mutationObserver)
+        : undefined;
     const guard = (pi: ExtensionAPI) => {
       pi.on("tool_call", async (event) => {
         const { tool, input } = toolInvocation(event.toolName, event.input);
@@ -242,6 +263,7 @@ export class PiRunner implements AgentRunner {
         }
       });
       pi.on("tool_execution_start", (event) => {
+        mutations?.start(event.toolCallId, event.toolName, event.args);
         const invocation = toolInvocation(event.toolName, event.args);
         activity?.(
           event.toolName,
@@ -251,8 +273,9 @@ export class PiRunner implements AgentRunner {
           invocation.input,
         );
       });
-      pi.on("tool_execution_end", (event) => {
+      pi.on("tool_execution_end", async (event) => {
         guardState?.guard.complete(event.toolCallId, !event.isError);
+        await mutations?.end(event.toolCallId, event.isError);
         activity?.(undefined, event.toolCallId, undefined, !event.isError);
       });
       pi.on("tool_result", sanitizeToolResult);
@@ -342,6 +365,7 @@ export class PiRunner implements AgentRunner {
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
+    mutationObserver?: MutationObserver,
   ) {
     const evidence: CommandEvidence[] = [];
     let executionSignal: AbortSignal | undefined;
@@ -425,6 +449,7 @@ export class PiRunner implements AgentRunner {
       },
       providerProgress,
       runtimeApproval,
+      mutationObserver,
     );
     entry.session = session;
     try {
@@ -461,17 +486,30 @@ export class PiRunner implements AgentRunner {
       if (signal?.aborted) throw new Error("Workflow interrupted");
       const input = await contextFor(role, state);
       if (role === "tester") {
+        const validationLog = new AttemptLogger(
+          new AgentLogStore(state.cwd).path(state.id, role, attempt),
+        );
         const required = effectiveConfig(state).commands.filter((c) =>
           allowedCommandCategories("tester").includes(c.purpose),
         );
         for (const command of required) {
           activity?.(`validation_${command.purpose}`);
           try {
-            evidence.push(await execute(command, state.cwd, executionSignal));
+            const result = await execute(command, state.cwd, executionSignal);
+            evidence.push(result);
+            validationLog.append({
+              type: "validation_command",
+              id: result.id,
+              exitCode: result.exitCode,
+              output: result.output,
+              timedOut: result.timedOut,
+              durationMs: result.durationMs,
+            });
           } finally {
             activity?.(undefined);
           }
         }
+        await validationLog.flush();
         input.verifiedCommandResults = evidence;
         // Commands are executed once by workflow control; the model analyzes their results.
         session.setActiveToolsByName(
@@ -533,7 +571,9 @@ export class PiRunner implements AgentRunner {
         if (!evidence.length)
           throw new Error("Tester produced no executed validation commands");
         // Exit codes and output come from execution, never from model assertions.
-        result.commands = evidence;
+        // Keep routing evidence compact in state; detailed execution output is
+        // available during the attempt and in the agent log.
+        result.commands = compactValidationEvidence(evidence);
         result.status = evidence.every((c) => c.exitCode === 0)
           ? "PASS"
           : "FAIL";

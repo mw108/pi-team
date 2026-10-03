@@ -73,16 +73,33 @@ test("tester source edits are disabled unless explicitly configured", async () =
     ),
   );
   cfg.tester.mayModifyTests = true;
+  const testContract = {
+    ...contract,
+    filesToModify: [...contract.filesToModify, "tests/math.test.mjs"],
+  };
   await checkTool(
     "tester",
     "edit",
     { path: "tests/math.test.mjs" },
     cwd,
     cfg,
-    contract,
+    testContract,
   );
   await assert.rejects(() =>
     checkTool("tester", "edit", { path: "math.js" }, cwd, cfg, contract),
+  );
+  await assert.rejects(() =>
+    checkTool(
+      "tester",
+      "edit",
+      { path: "tests-evil/math.test.mjs" },
+      cwd,
+      cfg,
+      {
+        ...contract,
+        filesToModify: [...contract.filesToModify, "tests-evil/math.test.mjs"],
+      },
+    ),
   );
 });
 test("configuration cannot grant direct Git mutation or raw shell wrappers to roles", () => {

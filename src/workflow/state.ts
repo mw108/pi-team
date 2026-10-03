@@ -7,6 +7,7 @@ import {
   type TeamConfig,
 } from "../config/schema.ts";
 import { assertRelative } from "../agents/permissions.ts";
+import { policyPath } from "../agents/path-policy.ts";
 import { detectedCommandId } from "../agents/discovery.ts";
 import {
   normalizedRuntimeCommand,
@@ -45,6 +46,7 @@ export const approvalSchema = z.object({
     "manualRetry",
     "runtimeCommand",
     "sensitivePaths",
+    "orphanedImplementation",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -204,6 +206,28 @@ export const stateSchema = z.object({
     .optional(),
   blocker: z.string().optional(),
   gateHashes: z.record(z.string()).optional(),
+  testMutationCycles: z.number().int().min(0).default(0),
+  priorImplementation: z
+    .object({
+      attempt: z.number().int().positive().optional(),
+      hashes: z.record(z.string()),
+      createdPaths: z.array(z.string()),
+      discardablePaths: z.array(exactPath).default([]),
+    })
+    .optional(),
+  observedImplementorMutations: z
+    .array(
+      z
+        .object({
+          attempt: z.number().int().positive(),
+          path: exactPath,
+          identity: z.string(),
+          kind: z.enum(["edit", "write", "delete"]),
+        })
+        .strict(),
+    )
+    .default([]),
+  implementationStartHashes: z.record(z.string()).optional(),
   commitIntent: z
     .object({
       head: z.string().nullable(),
@@ -295,6 +319,11 @@ function migrateState(value: unknown): unknown {
 }
 export function validateState(value: unknown): WorkflowState {
   const state = stateSchema.parse(migrateState(value));
+  for (const mutation of state.observedImplementorMutations)
+    if (policyPath(mutation.path) !== mutation.identity)
+      throw new Error(
+        "Observed Implementor mutation has invalid path identity",
+      );
   // Version 3 predates explicit Pentest completion. Legacy empty findings
   // cannot be promoted to PASS on reload.
   const oldPentest = state.results.pentester as Record<string, any> | undefined;
@@ -426,6 +455,8 @@ export function newState(
     approvedDirtyPaths: [],
     approvedSensitivePaths: [],
     commandApprovalComplete: false,
+    testMutationCycles: 0,
+    observedImplementorMutations: [],
   };
 }
 export function record(
@@ -438,14 +469,14 @@ export function record(
     at: new Date().toISOString(),
     phase: state.phase,
     event,
-    detail: redactVisibleText(detail),
+    detail: redactVisibleText(detail).slice(0, 4000),
     ...(meta ? { meta: redactStructured(meta) } : {}),
   });
 }
 export function block(state: WorkflowState, reason: string) {
   record(state, "blocked", reason);
   state.phase = "BLOCKED";
-  state.blocker = redactVisibleText(reason);
+  state.blocker = redactVisibleText(reason).slice(0, 4000);
 }
 
 /** Sanitize free text before each new state write; operational argv stays intact. */
