@@ -121,7 +121,7 @@ export interface AgentRunner {
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
     mutationObserver?: MutationObserver,
-  ): Promise<any>;
+  ): Promise<unknown>;
 }
 export class PiRunner implements AgentRunner {
   async createSession(
@@ -210,8 +210,19 @@ export class PiRunner implements AgentRunner {
     )
       paths.push(packagePath("@bacnh85/pi-serena", "extensions/index.ts"));
     if (allowedTools(role, config).includes("mcp")) {
-      const name = "pi-mcp-adapter";
-      const { createMcpAdapter } = await import(name);
+      let createMcpAdapter: typeof import("pi-mcp-adapter").createMcpAdapter;
+      try {
+        ({ createMcpAdapter } = await import("pi-mcp-adapter"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND")
+          throw new Error(
+            "MCP capability unavailable: install pi-mcp-adapter",
+            {
+              cause: error,
+            },
+          );
+        throw error;
+      }
       factories.push(createMcpAdapter({ config: await context7Config() }));
     }
     if (allowedTools(role, config).includes("web_search"))

@@ -7,6 +7,7 @@ import { contextFor } from "../src/agents/context.ts";
 import { checkTool } from "../src/agents/permissions.ts";
 import { git } from "../src/workflow/git.ts";
 import { FixtureRunner, config, repository } from "./helpers.ts";
+import { contractSchema } from "../src/agents/schemas.ts";
 
 const component = "src/login.js";
 const spec = "tests/login.test.mjs";
@@ -92,19 +93,20 @@ async function fixture(omitTest: boolean) {
     if (role === "reviewer") return contract;
     if (role === "implementor") {
       const input = await contextFor(role, s);
+      const reviewer = contractSchema.parse(input.reviewer);
       assert.deepEqual(
-        (input.reviewer as any).requiredTests[1].acceptanceCriteria,
+        reviewer.requiredTests[1].acceptanceCriteria,
         contract.requiredTests[1].acceptanceCriteria,
       );
-      assert.equal((input.reviewer as any).requiredTests[1].action, "modify");
-      assert.equal((input.reviewer as any).requiredTests[1].file, spec);
+      assert.equal(reviewer.requiredTests[1].action, "modify");
+      assert.equal(reviewer.requiredTests[1].file, spec);
       await checkTool(
         "implementor",
         "edit",
         { path: spec },
         cwd,
         cfg,
-        contract as any,
+        contractSchema.parse(contract),
       );
       implementorSawContract = true;
       await writeFile(
@@ -126,7 +128,10 @@ async function fixture(omitTest: boolean) {
     }
     if (role === "codeReviewer") {
       const input = await contextFor(role, s);
-      assert.equal((input.reviewer as any).requiredTests[1].action, "modify");
+      assert.equal(
+        contractSchema.parse(input.reviewer).requiredTests[1].action,
+        "modify",
+      );
       const actual = await readFile(join(cwd, spec), "utf8");
       if (!actual.includes("failed login shows backend error"))
         return {
@@ -168,15 +173,15 @@ test("login fixture implements required test before Code Review, then Tester pas
   assert.ok(
     runner.calls.indexOf("codeReviewer") < runner.calls.indexOf("tester"),
   );
-  assert.equal((state.results.tester as any).status, "PASS");
-  assert.equal((state.results.tester as any).commands[0].exitCode, 0);
+  assert.equal(state.results.tester?.status, "PASS");
+  assert.equal(state.results.tester?.commands[0].exitCode, 0);
 });
 test("missing required test produces Code Reviewer FIX_LOCAL before Tester", async () => {
   const { state, runner } = await fixture(true);
   assert.equal(state.phase, "BLOCKED");
-  assert.equal((state.results.codeReviewer as any).status, "FIX_LOCAL");
+  assert.equal(state.results.codeReviewer?.status, "FIX_LOCAL");
   assert.match(
-    (state.results.codeReviewer as any).findings[0].problem,
+    state.results.codeReviewer?.findings[0].problem,
     /Required failed-login test/,
   );
   assert.equal(runner.counts.tester, undefined);

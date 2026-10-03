@@ -304,7 +304,7 @@ export const normalizeSchema = z.object({
   requirements: strings.min(1),
   summary: text,
 });
-export const resultSchemas: Record<Role, z.ZodTypeAny> = {
+export const resultSchemas = {
   orchestrator: normalizeSchema,
   researcher: researchSchema,
   solver1: proposalSchema,
@@ -326,10 +326,32 @@ export const resultSchemas: Record<Role, z.ZodTypeAny> = {
   tester: testSchema,
   commitAgent: commitSchema,
   reporter: completionReportSchema,
-};
+} satisfies { [R in Role]: z.ZodType<ResultByRole[R]> };
+export type ResultByRole = {
+  orchestrator: z.infer<typeof normalizeSchema>;
+  researcher: z.infer<typeof researchSchema>;
+  critic: z.infer<typeof critiqueSchema>;
+  reviewer: z.infer<typeof contractSchema>;
+  implementor: z.infer<typeof implementationSchema>;
+  codeReviewer: z.infer<typeof reviewSchema>;
+  pentester: z.infer<typeof pentestSchema>;
+  securityReviewer: z.infer<typeof securitySchema>;
+  tester: z.infer<typeof testSchema>;
+  commitAgent: z.infer<typeof commitSchema>;
+  reporter: z.infer<typeof completionReportSchema>;
+} & Record<SolverAgentId, z.infer<typeof proposalSchema>>;
+/** Historical and future result keys remain readable at the persistence boundary. */
+export type WorkflowResults = Partial<ResultByRole> &
+  Partial<{ [K in Role as `previous_${K}`]: ResultByRole[K] }> &
+  Record<string, unknown>;
+export type AgentResult<R extends Role = Role> =
+  (ResultByRole[R] & { type?: never }) | Question;
 export type Contract = z.infer<typeof contractSchema>;
 export type Question = z.infer<typeof questionSchema>;
-export function parseResult(role: Role, value: unknown): any {
+export function parseResult<R extends Role>(
+  role: R,
+  value: unknown,
+): AgentResult<R> {
   if (
     typeof value === "object" &&
     value !== null &&
@@ -337,7 +359,8 @@ export function parseResult(role: Role, value: unknown): any {
     value.type === "QUESTION_REQUEST"
   )
     return questionSchema.parse(value);
-  return resultSchemas[role].parse(value);
+  // The keyed schema map is checked above; Zod's indexed parse loses the key.
+  return resultSchemas[role].parse(value) as ResultByRole[R];
 }
 export type OutputRecovery = {
   reason: "trailing_closing_delimiter";
@@ -369,11 +392,11 @@ function leadingJsonEnd(text: string): number | undefined {
   return undefined;
 }
 
-export function parseText(
-  role: Role,
+export function parseText<R extends Role>(
+  role: R,
   text: string,
   onRecovered?: (recovery: OutputRecovery) => void,
-): any {
+): AgentResult<R> {
   const trimmed = text
     .trim()
     .replace(/^```(?:json)?\s*/, "")

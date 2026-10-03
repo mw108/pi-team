@@ -141,7 +141,7 @@ test("configured names and legacy fallback render without changing agent IDs", (
 
 test("FIX_LOCAL invalidates historical success while Implementor attempt 2 runs or fails", () => {
   const s = state();
-  s.results.implementor = { status: "IMPLEMENTED" };
+  s.results.implementor = output("implementor");
   s.results.codeReviewer = { status: "FIX_LOCAL", findings: [] };
   record(s, "agent_attempt_completed", "implementor attempt 1 completed", {
     agent: "implementor",
@@ -226,10 +226,10 @@ test("run and retry labels distinguish remediation from technical recovery", () 
 test("FIX_DESIGN and FIX_REQUIREMENTS remove current success across rewinds", () => {
   for (const route of ["FIX_DESIGN", "FIX_REQUIREMENTS"] as const) {
     const s = state();
-    s.results.orchestrator = { requirements: ["x"] };
-    s.results.researcher = { unresolvedQuestions: [] };
-    s.results.solver1 = { solverId: "solver1" };
-    s.results.implementor = { status: "IMPLEMENTED" };
+    s.results.orchestrator = output("orchestrator");
+    s.results.researcher = output("researcher");
+    s.results.solver1 = output("solver1");
+    s.results.implementor = output("implementor");
     for (const role of [
       "orchestrator",
       "researcher",

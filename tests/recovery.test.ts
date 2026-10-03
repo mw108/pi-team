@@ -25,7 +25,7 @@ test("complete team pipeline executes real tests and creates intended commit", a
   assert.equal(s.phase, "DONE", s.blocker);
   assert.notEqual(await head(cwd), before);
   assert.deepEqual(s.commit?.files, ["math.js"]);
-  assert.match((s.results.tester as any).commands[0].output, /pass 1/);
+  assert.match(s.results.tester!.commands[0].output, /pass 1/);
   assert.ok(
     runner.calls.indexOf("tester") < runner.calls.indexOf("commitAgent"),
   );
@@ -311,6 +311,8 @@ for (const [source, trigger, returnedBy] of [
     });
     record(state, "FIX_LOCAL", source);
     const result = await engine.invoke("implementor", state);
+    if (result.result.type === "QUESTION_REQUEST")
+      throw new Error("Unexpected question");
     state.results.implementor = result.result;
     const starts = state.history.filter(
       (event) =>
@@ -358,7 +360,7 @@ test("failing real checks prevent commit even after claimed approval", async () 
   assert.equal(s.phase, "BLOCKED");
   assert.equal(await head(cwd), before);
   assert.equal(runner.counts.commitAgent, undefined);
-  assert.equal((s.results.tester as any).commands[0].exitCode, 1);
+  assert.equal(s.results.tester?.commands[0].exitCode, 1);
 });
 test("pre-existing user changes are preserved and never committed", async () => {
   const cwd = await repository();

@@ -119,7 +119,7 @@ test("answers rerun Researcher with mapped context and clarification trigger bef
         })),
       );
       assert.equal(
-        (state.results.previous_researcher as any).unresolvedQuestions.length,
+        state.results.previous_researcher?.unresolvedQuestions.length,
         2,
       );
       assert.equal(state.results.researcher, undefined);
@@ -131,10 +131,7 @@ test("answers rerun Researcher with mapped context and clarification trigger bef
       );
     }
     if (role.startsWith("solver")) {
-      assert.equal(
-        (state.results.researcher as any).unresolvedQuestions.length,
-        0,
-      );
+      assert.equal(state.results.researcher?.unresolvedQuestions.length, 0);
       assert.equal(runner.counts.researcher, 2);
     }
     return undefined;

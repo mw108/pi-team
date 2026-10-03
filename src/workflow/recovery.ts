@@ -86,7 +86,7 @@ export async function getWorkflowRecoveryPlan(
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
   if (
     state.blocker?.startsWith("Pentest blocked:") &&
-    (state.results.pentester as any)?.status === "BLOCKED"
+    state.results.pentester?.status === "BLOCKED"
   )
     return {
       kind: "retry-agent",
@@ -167,7 +167,7 @@ export async function getWorkflowRecoveryPlan(
     if (!complete) break;
     if (
       phase === "IMPLEMENT" &&
-      (state.results.implementor as any)?.status !== "IMPLEMENTED"
+      state.results.implementor?.status !== "IMPLEMENTED"
     )
       return unsafe(
         "Implementor did not complete successfully; inspect repository changes and retry the Implementor.",

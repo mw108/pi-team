@@ -89,9 +89,10 @@ test("version 1 string test requirements migrate without inventing paths", async
   await writeFile(store.path(raw.id), JSON.stringify(raw));
   const loaded = await store.load(raw.id);
   assert.equal(loaded.version, 3);
-  const migrated = ["reviewer", "previous_reviewer"].map(
-    (key) => (loaded.results[key] as any).requiredTests,
-  );
+  const migrated = [
+    loaded.results.reviewer?.requiredTests,
+    loaded.results.previous_reviewer?.requiredTests,
+  ];
   for (const tests of migrated)
     assert.deepEqual(tests, [
       { description: "successful login", action: "existing" },

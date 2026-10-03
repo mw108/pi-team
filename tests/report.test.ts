@@ -190,7 +190,19 @@ test("report input preserves review findings, limitations, cycles, and failed co
   );
   s.results.pentester = {
     status: "FINDINGS",
-    findings: [{ id: "P1", title: "Suspected issue", severity: "low" }],
+    findings: [
+      {
+        id: "P1",
+        title: "Suspected issue",
+        severity: "low",
+        category: "test",
+        affectedComponent: "math.js",
+        reproductionSteps: [],
+        evidence: "Fixture evidence",
+        impact: "None",
+        suggestedFix: "Review classification",
+      },
+    ],
     coverage: [],
     limitations: [],
   };
@@ -245,7 +257,7 @@ for (const [name, failure] of [
     assert.ok(s.results.reporter);
     assert.ok(s.reportFailure);
     assert.match(
-      renderReport(s.results.reporter as any, s.reportFailure),
+      renderReport(s.results.reporter, s.reportFailure),
       /Narrative report failed/,
     );
     assert.equal(engine.retryConfirmation(s, "reporter"), undefined);
@@ -346,7 +358,7 @@ test("Reporter provider failure after commit preserves the created commit", asyn
   await engine.run(s);
   assert.equal(s.phase, "DONE", s.blocker);
   assert.ok(s.commit?.hash);
-  assert.equal((s.results.reporter as any).commit.hash, s.commit.hash);
+  assert.equal(s.results.reporter?.commit.hash, s.commit.hash);
   assert.ok(s.reportFailure);
 });
 

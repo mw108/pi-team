@@ -104,8 +104,7 @@ export async function doctor(cwd: string) {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    const adapter = "pi-mcp-adapter";
-    await import(adapter);
+    await import("pi-mcp-adapter");
     return `adapter available; ${configured ? "configured" : "not configured"} (connectivity not probed)`;
   });
   await check("Configuration", async () => {

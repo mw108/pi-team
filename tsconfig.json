@@ -8,6 +8,9 @@
     "allowImportingTsExtensions": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "paths": {
+      "pi-mcp-adapter": ["./src/types/pi-mcp-adapter.d.ts"]
+    },
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]

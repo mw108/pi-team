@@ -11,10 +11,29 @@ async function fixture(host = "127.0.0.1") {
       return;
     }
     if (req.url?.startsWith("/redirect")) {
-      res.writeHead(302, {
-        location: req.url.endsWith("external") ? "https://example.com/" : "/",
-      });
+      const status = Number(
+        req.url.match(/\/redirect\/(301|302|303|307|308)/)?.[1] ?? 302,
+      );
+      res.writeHead(
+        status,
+        req.url.endsWith("missing")
+          ? {}
+          : {
+              location: req.url.endsWith("external")
+                ? "https://example.com/"
+                : "/",
+            },
+      );
       res.end();
+      return;
+    }
+    if (req.url === "/not-modified") {
+      res.writeHead(304);
+      res.end();
+      return;
+    }
+    if (req.url === "/unicode") {
+      res.end("Aä€😀漢Z");
       return;
     }
     if (req.url === "/large") {
@@ -128,6 +147,49 @@ test("HTTP enforces total timeout and response byte truncation", async () => {
     assert.equal(result.body, "x".repeat(12));
     assert.equal(result.truncated, true);
     assert.ok(result.durationMs >= 0);
+  } finally {
+    await f.close();
+  }
+});
+test("304 is a normal non-success response; actual redirects remain blocked", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.call({ url: f.origin + "/not-modified" });
+    assert.equal(response.status, 304);
+    assert.equal(response.body, "");
+    assert.equal(response.truncated, false);
+    for (const status of [301, 302, 303, 307, 308])
+      await assert.rejects(
+        () => f.call({ url: f.origin + `/redirect/${status}` }),
+        /Redirect responses are disabled/,
+      );
+    await assert.rejects(
+      () => f.call({ url: f.origin + "/redirect/302-missing" }),
+      /Redirect responses are disabled/,
+    );
+    await assert.rejects(
+      () => f.call({ url: f.origin + "/redirect-external" }),
+      /Redirect responses are disabled/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("response byte caps discard incomplete UTF-8 characters", async () => {
+  const f = await fixture();
+  try {
+    for (const [cap, expected] of [
+      [2, "A"],
+      [5, "Aä"],
+      [8, "Aä€"],
+      [12, "Aä€😀"],
+    ] as const) {
+      f.cfg.pentest.localHttp.maxResponseBodyBytes = cap;
+      const response = await f.call({ url: f.origin + "/unicode" });
+      assert.equal(response.body, expected);
+      assert.equal(response.truncated, true);
+      assert.doesNotMatch(response.body, /�/);
+    }
   } finally {
     await f.close();
   }

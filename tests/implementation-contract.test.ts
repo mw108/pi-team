@@ -142,10 +142,11 @@ test("Reviewer parse accepts a structured test contract and rejects inconsistent
     filesToModify: ["math.js", file],
     requiredTests: [requirement("modify", file)],
   };
-  assert.equal(
-    parseResult("reviewer", valid).requiredTests[0].action,
-    "modify",
-  );
+  const parsed = parseResult("reviewer", valid);
+  assert.notEqual(parsed.type, "QUESTION_REQUEST");
+  if (parsed.type === "QUESTION_REQUEST")
+    throw new Error("Unexpected question");
+  assert.equal(parsed.requiredTests[0].action, "modify");
   assert.throws(
     () => parseResult("reviewer", { ...valid, filesToModify: ["math.js"] }),
     /filesToModify/,

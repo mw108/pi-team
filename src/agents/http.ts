@@ -2,6 +2,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { lookup } from "node:dns";
 import { performance } from "node:perf_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { Type } from "typebox";
 import { z } from "zod";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -165,10 +166,7 @@ export function localHttpTool(config: TeamConfig): ToolDefinition {
         signal?.addEventListener("abort", abort, { once: true });
         request.on("error", (error) => finish(error));
         request.on("response", (response) => {
-          if (
-            (response.statusCode ?? 0) >= 300 &&
-            (response.statusCode ?? 0) < 400
-          ) {
+          if ([301, 302, 303, 307, 308].includes(response.statusCode ?? 0)) {
             response.destroy();
             request.destroy();
             finish(new Error("Redirect responses are disabled"));
@@ -177,6 +175,8 @@ export function localHttpTool(config: TeamConfig): ToolDefinition {
           const chunks: Buffer[] = [];
           let size = 0;
           const complete = (truncated: boolean) => {
+            const decoder = new StringDecoder("utf8");
+            const body = chunks.map((chunk) => decoder.write(chunk)).join("");
             const responseHeaders = Object.fromEntries(
               Object.entries(response.headers).map(([key, value]) => [
                 key,
@@ -187,7 +187,8 @@ export function localHttpTool(config: TeamConfig): ToolDefinition {
               status: response.statusCode ?? 0,
               statusText: response.statusMessage ?? "",
               headers: responseHeaders,
-              body: Buffer.concat(chunks).toString("utf8"),
+              // At the byte cap, discard an incomplete trailing code point.
+              body: truncated ? body : body + decoder.end(),
               truncated,
               durationMs: Math.round(performance.now() - started),
             });

@@ -73,7 +73,7 @@ export const contract = {
   knownRisks: [],
 };
 export const finding = {
-  severity: "medium",
+  severity: "medium" as const,
   file: "math.js",
   line: 1,
   problem: "Incorrect operation",

@@ -13,6 +13,17 @@ import {
   FileMutationTracker,
   type MutationObserver,
 } from "../src/agents/mutation-attribution.ts";
+const pentestFinding = {
+  id: "F1",
+  title: "Fixture finding",
+  severity: "low" as const,
+  category: "test",
+  affectedComponent: "math.js",
+  reproductionSteps: [],
+  evidence: "Fixture",
+  impact: "Fixture",
+  suggestedFix: "Fix",
+};
 async function successfulMutation(
   cwd: string,
   observer: MutationObserver | undefined,
@@ -70,7 +81,7 @@ test("FIX_DESIGN restarts research with previous findings", () => {
   const s = state();
   s.phase = "CODE_REVIEW";
   s.results.codeReviewer = { status: "FIX_DESIGN", findings: [finding] };
-  s.results.solver1 = { old: true };
+  s.results.solver1 = output("solver1");
   transition(s);
   assert.equal(s.phase, "RESEARCH");
   assert.equal(s.fullCycle, 2);
@@ -96,6 +107,7 @@ test("FIX_DESIGN leaves old implementation paths that fail a narrowed commit", a
   s.results.implementor = {
     status: "IMPLEMENTATION_BLOCKED",
     reason: "redesign",
+    evidence: [],
     suggestedRoute: "FIX_DESIGN",
   };
   transition(s);
@@ -302,9 +314,16 @@ for (const route of ["FIX_LOCAL", "FIX_DESIGN"] as const)
   test(`security ${route} routes correctly`, () => {
     const s = state();
     s.phase = "SECURITY_REVIEW";
-    s.results.pentester = { findings: [{ id: "F1" }] };
+    s.results.pentester = {
+      ...output("pentester"),
+      status: "FINDINGS",
+      findings: [{ ...pentestFinding, id: "F1" }],
+    };
     s.results.securityReviewer = {
-      findings: [{ id: "F1", classification: "CONFIRMED", route }],
+      findings: [
+        { id: "F1", classification: "CONFIRMED", route, evidence: "Fixture" },
+      ],
+      summary: "Fixture",
     };
     transition(s);
     assert.equal(s.phase, route === "FIX_LOCAL" ? "IMPLEMENT" : "RESEARCH");
@@ -313,16 +332,27 @@ test("security reviewer cannot omit findings or accept risks autonomously", () =
   const s = state();
   s.config.qualityGates.pentest.enabled = true;
   s.phase = "SECURITY_REVIEW";
-  s.results.pentester = { findings: [{ id: "F1" }] };
-  s.results.securityReviewer = { findings: [] };
+  s.results.pentester = {
+    ...output("pentester"),
+    status: "FINDINGS",
+    findings: [{ ...pentestFinding, id: "F1" }],
+  };
+  s.results.securityReviewer = { findings: [], summary: "Fixture" };
   transition(s);
   assert.equal(s.phase, "BLOCKED");
   const t = state();
   t.config.qualityGates.pentest.enabled = true;
   t.phase = "SECURITY_REVIEW";
-  t.results.pentester = { findings: [{ id: "F1" }] };
+  t.results.pentester = {
+    ...output("pentester"),
+    status: "FINDINGS",
+    findings: [{ ...pentestFinding, id: "F1" }],
+  };
   t.results.securityReviewer = {
-    findings: [{ id: "F1", classification: "ACCEPTED_RISK" }],
+    findings: [
+      { id: "F1", classification: "ACCEPTED_RISK", evidence: "Fixture" },
+    ],
+    summary: "Fixture",
   };
   transition(t);
   assert.equal(t.phase, "BLOCKED");
@@ -332,14 +362,19 @@ test("failed tests never route to commit", () => {
   s.phase = "TEST";
   s.results.tester = {
     status: "FAIL",
-    commands: [{ exitCode: 1 }],
+    commands: [{ id: "test", exitCode: 1, output: "failure" }],
+    failedAreas: [],
     classification: "FIX_LOCAL",
   };
   transition(s);
   assert.equal(s.phase, "IMPLEMENT");
   const t = state();
   t.phase = "TEST";
-  t.results.tester = { status: "PASS", commands: [{ exitCode: 1 }] };
+  t.results.tester = {
+    status: "PASS",
+    commands: [{ id: "test", exitCode: 1, output: "failure" }],
+    failedAreas: [],
+  };
   transition(t);
   assert.notEqual(t.phase, "COMMIT");
 });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { config } from "./helpers.ts";
+import { config, output } from "./helpers.ts";
 import { newState, record } from "../src/workflow/state.ts";
 import { ProgressRuntime } from "../src/ui/runtime.ts";
 import { renderLiveProgress, renderProgress } from "../src/ui/progress.ts";
@@ -19,7 +19,7 @@ function state() {
   return s;
 }
 function complete(s: ReturnType<typeof state>, role: Role, attempt = 1) {
-  s.results[role] = { completed: true };
+  (s.results as Record<string, unknown>)[role] = output(role);
   record(s, "agent_attempt_completed", role, { agent: role, attempt });
 }
 test("sequential live widget shows recent completions, current agent and next step", () => {

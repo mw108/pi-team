@@ -40,8 +40,8 @@ export async function buildCompletionReportInput(
   s: WorkflowState,
   historical = false,
 ): Promise<CompletionReportInput> {
-  const implementation = s.results.implementor as any;
-  const contract = s.results.reviewer as any;
+  const implementation = s.results.implementor;
+  const contract = s.results.reviewer;
   const current =
     s.commit || historical ? [] : await dirtyPaths(s.cwd).catch(() => []);
   const claimed = new Set(
@@ -75,14 +75,14 @@ export async function buildCompletionReportInput(
       ...(detail ? { detail } : {}),
     });
   };
-  const review = s.results.codeReviewer as any;
+  const review = s.results.codeReviewer;
   gate(
     "Code review",
     s.config.qualityGates.codeReview.enabled,
     review,
     review?.status === "APPROVED",
   );
-  const pentest = s.results.pentester as any;
+  const pentest = s.results.pentester;
   gate(
     "Pentest",
     s.config.qualityGates.pentest.enabled,
@@ -96,11 +96,11 @@ export async function buildCompletionReportInput(
           ? "PASS"
           : undefined,
   );
-  const security = s.results.securityReviewer as any;
+  const security = s.results.securityReviewer;
   if (
     s.config.qualityGates.pentest.enabled &&
     pentest?.status === "FINDINGS" &&
-    security?.findings.every((finding: any) =>
+    security?.findings.every((finding) =>
       ["FALSE_POSITIVE", "ENVIRONMENT_ARTIFACT"].includes(
         finding.classification,
       ),
@@ -116,12 +116,12 @@ export async function buildCompletionReportInput(
     security,
     !!security &&
       security.findings.every(
-        (f: any) =>
+        (f) =>
           f.classification !== "CONFIRMED" &&
           f.classification !== "ACCEPTED_RISK",
       ),
   );
-  const tester = s.results.tester as any;
+  const tester = s.results.tester;
   gate(
     "Testing",
     s.config.qualityGates.testing.enabled,
@@ -158,14 +158,14 @@ export async function buildCompletionReportInput(
     });
   }
   const unresolvedIssues = unique([
-    ...(review?.findings ?? []).map((f: any) => `${f.severity}: ${f.problem}`),
+    ...(review?.findings ?? []).map((f) => `${f.severity}: ${f.problem}`),
     ...(pentest?.findings ?? [])
       .filter(
-        (f: any) =>
-          security?.findings?.find((r: any) => r.id === f.id)
-            ?.classification === "ACCEPTED_RISK",
+        (f) =>
+          security?.findings?.find((r) => r.id === f.id)?.classification ===
+          "ACCEPTED_RISK",
       )
-      .map((f: any) => `${f.severity}: ${f.title}`),
+      .map((f) => `${f.severity}: ${f.title}`),
   ]);
   const warnings = unique([
     ...validation
@@ -179,7 +179,7 @@ export async function buildCompletionReportInput(
       .map((v) => `${v.label}: ${v.status}`),
     ...(s.reportFailure ? [`Narrative report failed: ${s.reportFailure}`] : []),
   ]);
-  const commitResult = s.results.commitAgent as any;
+  const commitResult = s.results.commitAgent;
   return {
     workflowId: s.id,
     task: s.task,
@@ -345,7 +345,7 @@ export function renderBlocked(
   )?.meta;
   const next = recovery
     ? recoveryAction(recovery)
-    : (s.results.pentester as any)?.status === "BLOCKED"
+    : s.results.pentester?.status === "BLOCKED"
       ? "/team-retry pentester"
       : s.pendingQuestion
         ? "Answer the pending question."

@@ -60,6 +60,8 @@ import {
   type Role,
   parseResult,
   questionSchema,
+  pentestSchema,
+  type WorkflowResults,
 } from "../agents/schemas.ts";
 export const phases = [
   "ORCHESTRATE",
@@ -113,7 +115,7 @@ export const stateSchema = z.object({
   agentFailures: z.number().int().min(0),
   questionCount: z.number().int().min(0),
   researchClarificationCount: z.number().int().min(0).default(0),
-  results: z.record(z.unknown()),
+  results: z.record(z.unknown()).transform((value): WorkflowResults => value),
   baseline: baselineSchema,
   history: z.array(
     z.object({
@@ -297,8 +299,9 @@ function migrateState(value: unknown): unknown {
       ],
     };
   }
-  if ((value as any).version === 2) return { ...(value as object), version: 3 };
-  if ((value as any).version !== 1) return value;
+  const versioned = value as Record<string, unknown>;
+  if (versioned.version === 2) return { ...versioned, version: 3 };
+  if (versioned.version !== 1) return value;
   const old = value as Record<string, unknown>;
   const results = { ...((old.results ?? {}) as Record<string, unknown>) };
   for (const key of ["reviewer", "previous_reviewer"]) {
@@ -326,12 +329,16 @@ export function validateState(value: unknown): WorkflowState {
       );
   // Version 3 predates explicit Pentest completion. Legacy empty findings
   // cannot be promoted to PASS on reload.
-  const oldPentest = state.results.pentester as Record<string, any> | undefined;
+  const oldPentest = state.results.pentester as
+    Record<string, unknown> | undefined;
   if (oldPentest && !oldPentest.status) {
     if (Array.isArray(oldPentest.findings) && oldPentest.findings.length) {
-      state.results.pentester = { ...oldPentest, status: "FINDINGS" };
+      state.results.pentester = pentestSchema.parse({
+        ...oldPentest,
+        status: "FINDINGS",
+      });
     } else {
-      state.results.pentester = {
+      state.results.pentester = pentestSchema.parse({
         ...oldPentest,
         status: "BLOCKED",
         blocker: {
@@ -340,7 +347,7 @@ export function validateState(value: unknown): WorkflowState {
             "Legacy Pentest result has no completion status; rerun required.",
           remediation: "Use /team-retry pentester.",
         },
-      };
+      });
       if (
         [
           "PENTEST",

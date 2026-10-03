@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { CommandOutputCollector } from "./command-output.ts";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TeamConfig, Command } from "../config/schema.ts";
@@ -59,21 +60,14 @@ export async function execute(
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let output = "",
-        stdout = "",
-        stderr = "",
-        timedOut = false;
-      const append = (data: Buffer) => {
-        output = (output + data.toString()).slice(-50000);
-      };
-      child.stdout.on("data", (data) => {
-        stdout = (stdout + data.toString()).slice(-50000);
-        append(data);
-      });
-      child.stderr.on("data", (data) => {
-        stderr = (stderr + data.toString()).slice(-50000);
-        append(data);
-      });
+      const collector = new CommandOutputCollector();
+      let timedOut = false;
+      child.stdout.on("data", (data: Buffer) =>
+        collector.write("stdout", data),
+      );
+      child.stderr.on("data", (data: Buffer) =>
+        collector.write("stderr", data),
+      );
       const kill = () => {
         try {
           if (child.pid && process.platform !== "win32")
@@ -82,7 +76,7 @@ export async function execute(
         } catch {}
       };
       const timer = setTimeout(() => {
-        output += "\nCommand timeout";
+        collector.timeout();
         timedOut = true;
         kill();
       }, command.timeoutMs);
@@ -99,6 +93,7 @@ export async function execute(
       child.on("close", (code) => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", kill);
+        const { output, stdout, stderr } = collector.finish();
         const setupFailure = sandboxSetupFailure(
           prepared.sandbox,
           code,

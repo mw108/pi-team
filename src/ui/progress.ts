@@ -138,7 +138,7 @@ export function deriveAgentProgressState(
   if (
     role === "pentester" &&
     state.phase === "BLOCKED" &&
-    (state.results.pentester as any)?.status === "BLOCKED"
+    state.results.pentester?.status === "BLOCKED"
   )
     return { status: "failed", attempt: latest?.meta?.attempt };
   if (currentResult)
@@ -442,7 +442,7 @@ export function renderLiveProgress(
     );
   const counters = formatCycleProgress(state);
   if (state.phase === "BLOCKED") {
-    const pentest = state.results.pentester as any;
+    const pentest = state.results.pentester;
     const pentestBlocked = pentest?.status === "BLOCKED";
     const blockedRole: Role | undefined = pentestBlocked
       ? "pentester"
@@ -468,9 +468,9 @@ export function renderLiveProgress(
       "",
       pentestBlocked ? "Pentest blocked:" : "Workflow blocked:",
       pentestBlocked
-        ? pentest.blocker.message
+        ? (pentest.blocker?.message ?? "Required testing incomplete")
         : (state.blocker ?? "Unknown blocker"),
-      ...(pentestBlocked && pentest.blocker.remediation
+      ...(pentestBlocked && pentest.blocker?.remediation
         ? [pentest.blocker.remediation]
         : []),
       ...(pentestBlocked ? ["Then: /team-retry pentester"] : []),

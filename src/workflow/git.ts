@@ -276,18 +276,18 @@ export async function prepareCommit(
 ) {
   if (
     s.config.qualityGates.codeReview.enabled &&
-    (s.results.codeReviewer as any)?.status !== "APPROVED"
+    s.results.codeReviewer?.status !== "APPROVED"
   )
     throw new Error("Code review has not passed");
   if (
     s.config.qualityGates.testing.enabled &&
-    (s.results.tester as any)?.status !== "PASS"
+    s.results.tester?.status !== "PASS"
   )
     throw new Error("Testing has not passed");
   if (
     !s.results.securityReviewer ||
-    (s.results.securityReviewer as any).findings.some(
-      (f: any) =>
+    s.results.securityReviewer.findings.some(
+      (f) =>
         f.classification === "CONFIRMED" ||
         f.classification === "ACCEPTED_RISK",
     )

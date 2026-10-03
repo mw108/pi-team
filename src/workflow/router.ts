@@ -92,13 +92,15 @@ export function fix(
 export function transition(s: WorkflowState) {
   switch (s.phase) {
     case "ORCHESTRATE":
-      s.requirements = (s.results.orchestrator as any).requirements;
+      if (!s.results.orchestrator)
+        throw new Error("Missing Orchestrator result");
+      s.requirements = s.results.orchestrator.requirements;
       s.phase = "RESEARCH";
       break;
     case "RESEARCH":
       if (
-        !(s.results.researcher as any) ||
-        (s.results.researcher as any).unresolvedQuestions?.length !== 0
+        !s.results.researcher ||
+        s.results.researcher.unresolvedQuestions.length !== 0
       )
         throw new Error(
           "Researcher has unresolved questions; Solvers cannot start",
@@ -130,7 +132,8 @@ export function transition(s: WorkflowState) {
       s.phase = "IMPLEMENT";
       break;
     case "IMPLEMENT": {
-      const r = s.results.implementor as any;
+      const r = s.results.implementor;
+      if (!r) throw new Error("Missing Implementor result");
       if (r.status === "IMPLEMENTATION_BLOCKED")
         fix(s, r.suggestedRoute, r.reason);
       else
@@ -140,7 +143,8 @@ export function transition(s: WorkflowState) {
       break;
     }
     case "CODE_REVIEW": {
-      const r = s.results.codeReviewer as any;
+      const r = s.results.codeReviewer;
+      if (!r) throw new Error("Missing Code Reviewer result");
       if (r.status === "APPROVED") s.phase = afterCodeReview(s);
       else fix(s, r.status, r.question);
       break;
@@ -158,16 +162,17 @@ export function transition(s: WorkflowState) {
       break;
     }
     case "SECURITY_REVIEW": {
-      const review = s.results.securityReviewer as any,
-        pentest = s.results.pentester as any;
+      const review = s.results.securityReviewer,
+        pentest = s.results.pentester;
+      if (!review) throw new Error("Missing Security Reviewer result");
       if (s.config.qualityGates.pentest.enabled && !pentest) {
         block(s, "Security review requires the enabled Pentest result");
         break;
       }
       const expected = s.config.qualityGates.pentest.enabled
-        ? pentest?.findings?.map((f: any) => f.id).sort()
+        ? pentest?.findings.map((f) => f.id).sort()
         : undefined;
-      const actual = review.findings.map((f: any) => f.id).sort();
+      const actual = review.findings.map((f) => f.id).sort();
       if (expected && JSON.stringify(expected) !== JSON.stringify(actual)) {
         block(
           s,
@@ -176,22 +181,20 @@ export function transition(s: WorkflowState) {
         break;
       }
       const confirmed = review.findings.filter(
-        (f: any) => f.classification === "CONFIRMED",
+        (f) => f.classification === "CONFIRMED",
       );
-      if (
-        review.findings.some((f: any) => f.classification === "ACCEPTED_RISK")
-      ) {
+      if (review.findings.some((f) => f.classification === "ACCEPTED_RISK")) {
         block(s, "Accepted security risks require explicit user review");
         break;
       }
-      if (confirmed.some((f: any) => !f.route)) {
+      if (confirmed.some((f) => !f.route)) {
         block(s, "Confirmed findings require a fix route");
         break;
       }
       if (confirmed.length)
         fix(
           s,
-          confirmed.some((f: any) => f.route === "FIX_DESIGN")
+          confirmed.some((f) => f.route === "FIX_DESIGN")
             ? "FIX_DESIGN"
             : "FIX_LOCAL",
         );
@@ -199,11 +202,12 @@ export function transition(s: WorkflowState) {
       break;
     }
     case "TEST": {
-      const r = s.results.tester as any;
+      const r = s.results.tester;
+      if (!r) throw new Error("Missing Tester result");
       if (
         r.status === "PASS" &&
         r.commands.length &&
-        r.commands.every((c: any) => c.exitCode === 0)
+        r.commands.every((c) => c.exitCode === 0)
       )
         s.phase = afterTests(s);
       else fix(s, r.classification ?? "FIX_LOCAL");

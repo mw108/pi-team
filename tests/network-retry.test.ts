@@ -956,6 +956,9 @@ test("manual retry cancels reconnect delay and starts a fresh Pi session", async
   const started = Date.now();
   await engine.retryAgent(state, "researcher");
   const result = await pending;
+  assert.notEqual(result.result.type, "QUESTION_REQUEST");
+  if (result.result.type === "QUESTION_REQUEST")
+    throw new Error("Unexpected question");
   assert.equal(
     result.result.architectureSummary,
     output("researcher").architectureSummary,

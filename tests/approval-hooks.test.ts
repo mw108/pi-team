@@ -54,7 +54,7 @@ test("quality gates are rechecked before hook-enabled commit", async () => {
   await chmod(join(cwd, ".git/hooks/pre-commit"), 0o700);
   s.gateHashes = await hashes(cwd, await dirtyPaths(cwd));
   s.commitIntent = await prepareCommit(s, ["math.js"], "fix: addition");
-  (s.results.tester as any).status = "FAIL";
+  s.results.tester!.status = "FAIL";
   await assert.rejects(() => createCommit(s), /Testing has not passed/);
   await assert.rejects(() => readFile(join(cwd, ".git/hook-ran")));
   assert.equal(
@@ -116,7 +116,7 @@ test("exact dirty-path approval allows edits after resume but requires manual co
     (await git(cwd, ["diff", "--cached", "--name-only"])).trim(),
     "",
   );
-  assert.equal((loaded.results.tester as any).status, "PASS");
+  assert.equal(loaded.results.tester?.status, "PASS");
   await assert.rejects(
     () => prepareCommit(loaded, ["math.js"], "fix"),
     /Cannot safely attribute/,

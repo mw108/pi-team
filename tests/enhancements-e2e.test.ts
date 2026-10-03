@@ -84,7 +84,7 @@ test("fixture integrates command discovery, implementation, POST pentest, securi
     assert.equal(requests, 1);
     assert.equal(s.approvedCommands.length, 0);
     assert.equal(s.discoveredCommands.length, 1);
-    assert.equal((s.results.tester as any).commands[0].exitCode, 0);
+    assert.equal(s.results.tester?.commands[0].exitCode, 0);
     assert.notEqual(await head(cwd), before);
     assert.deepEqual(s.commit?.files, ["math.js"]);
     assert.ok(runner.calls.includes("securityReviewer"));

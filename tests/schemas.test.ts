@@ -11,10 +11,14 @@ import { newState } from "../src/workflow/state.ts";
 import { config, contract, output, repository } from "./helpers.ts";
 import { baseline } from "../src/workflow/git.ts";
 test("structured results accept valid data and reject invalid routing", () => {
-  assert.equal(
-    parseResult("codeReviewer", { status: "APPROVED", findings: [] }).status,
-    "APPROVED",
-  );
+  const reviewed = parseResult("codeReviewer", {
+    status: "APPROVED",
+    findings: [],
+  });
+  assert.notEqual(reviewed.type, "QUESTION_REQUEST");
+  if (reviewed.type === "QUESTION_REQUEST")
+    throw new Error("Unexpected question");
+  assert.equal(reviewed.status, "APPROVED");
   assert.throws(() => parseResult("codeReviewer", { status: "probably fine" }));
   assert.throws(() =>
     parseResult("codeReviewer", {

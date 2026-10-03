@@ -195,7 +195,7 @@ export function analyzeConfigDrift(
       else if (parts[0] === "workflow" && runtimeWorkflow.has(parts[1]))
         add("runtime", path);
       else if (
-        (state.results.pentester as any)?.status === "BLOCKED" &&
+        state.results.pentester?.status === "BLOCKED" &&
         ["pentest.localHttp.allowedOrigins", "pentest.localUrls"].includes(path)
       )
         add("runtime", path);
