@@ -61,6 +61,11 @@ logging:
 toolActivity:
   mappings: {}
 commands: []
+execution:
+  sandbox:
+    mode: auto # auto, required, or none
+    network: deny # development, test, and static; allow only when explicitly needed
+    pentestNetwork: deny # set allow only for explicitly authorized network tests
 agents:
   orchestrator:
     name: Orchestrator

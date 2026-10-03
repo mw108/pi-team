@@ -142,6 +142,8 @@ test("allow once executes exactly once per prompt and keeps workflow approvals e
   }
   assert.equal(f.requests.length, 2);
   assert.equal(evidence.length, 2);
+  assert.ok(evidence.every((item) => item.sandbox.temporaryHome));
+  assert.ok(evidence.every((item) => item.sandbox.mode !== "none"));
   assert.equal(f.state.approvedCommands.length, 0);
   assert.equal(f.state.runtimeApprovedCommandIds.length, 0);
 });
@@ -270,6 +272,7 @@ test("workflow exact approval is reused and survives state reload; configured co
     {} as any,
   );
   assert.equal((result.details as any).id, "test");
+  assert.equal((result.details as any).sandbox.temporaryHome, true);
 });
 
 test("similar approval persists an explicit test prefix and excludes destructive artisan commands", async () => {

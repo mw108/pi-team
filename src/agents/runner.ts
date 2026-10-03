@@ -96,6 +96,7 @@ export function compactValidationEvidence(evidence: CommandEvidence[]) {
     output: command.output.slice(-2000),
     timedOut: command.timedOut,
     durationMs: command.durationMs,
+    sandbox: command.sandbox,
   }));
 }
 
@@ -495,7 +496,12 @@ export class PiRunner implements AgentRunner {
         for (const command of required) {
           activity?.(`validation_${command.purpose}`);
           try {
-            const result = await execute(command, state.cwd, executionSignal);
+            const result = await execute(
+              command,
+              state.cwd,
+              executionSignal,
+              effectiveConfig(state).execution.sandbox,
+            );
             evidence.push(result);
             validationLog.append({
               type: "validation_command",
@@ -504,6 +510,7 @@ export class PiRunner implements AgentRunner {
               output: result.output,
               timedOut: result.timedOut,
               durationMs: result.durationMs,
+              sandbox: result.sandbox,
             });
           } finally {
             activity?.(undefined);

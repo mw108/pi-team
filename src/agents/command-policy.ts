@@ -8,6 +8,15 @@ export const commandCategories = [
 ] as const;
 export type CommandCategory = (typeof commandCategories)[number];
 
+/** Network access is never inferred from an agent's command description. */
+export function commandNetworkPolicy(
+  category: CommandCategory,
+  network: "deny" | "allow",
+  pentestNetwork: "deny" | "allow",
+): "deny" | "allow" {
+  return category === "pentest" ? pentestNetwork : network;
+}
+
 const roleCategories: Partial<Record<Role, readonly CommandCategory[]>> = {
   implementor: ["development", "test", "static"],
   tester: ["test", "static"],

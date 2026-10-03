@@ -77,9 +77,32 @@ test("semantic fingerprint ignores runtime and presentation fields", () => {
   current.agents.implementor.requestTimeoutMs = 900000;
   current.agents.solver1.name = "Architecture Expert";
   current.ui.progress.refreshMs = 3000;
+  current.execution.sandbox.mode = "required";
+  current.execution.sandbox.network = "allow";
+  current.execution.sandbox.pentestNetwork = "allow";
   assert.equal(semanticConfigHash(previous), semanticConfigHash(current));
   current.agents.reviewer.model = "different-model";
   assert.notEqual(semanticConfigHash(previous), semanticConfigHash(current));
+});
+
+test("sandbox settings are non-blocking runtime drift", async () => {
+  const { cwd, state } = await blockedAt("IMPLEMENT", [
+    "codeReviewer",
+    "tester",
+    "reporter",
+  ]);
+  await editConfig(cwd, (value) => {
+    value.execution = {
+      sandbox: { mode: "required", network: "allow", pentestNetwork: "allow" },
+    };
+  });
+  const drift = analyzeConfigDrift(state, await loadConfig(cwd));
+  assert.equal(drift.blocking, false);
+  assert.deepEqual(drift.runtimeChanges, [
+    "execution.sandbox.mode",
+    "execution.sandbox.network",
+    "execution.sandbox.pentestNetwork",
+  ]);
 });
 
 test("request timeout changes remain non-blocking runtime drift", async () => {

@@ -1,3 +1,4 @@
+import { SandboxSetupError } from "./sandbox.ts";
 /** Allowlisted, bounded provider errors. Never traverse arbitrary enumerable fields. */
 export interface ErrorDiagnostics {
   constructor?: string | Function;
@@ -13,6 +14,10 @@ export interface ErrorDiagnostics {
   cause?: ErrorDiagnostics;
   errors?: ErrorDiagnostics[];
   truncated?: "depth" | "circular";
+  sandboxMode?: "bubblewrap";
+  sandboxSetup?: "failed";
+  reason?: "unsafe_internal_path";
+  path?: string;
 }
 
 function safeText(value: string, max = 300): string {
@@ -42,6 +47,12 @@ export function serializeErrorDiagnostics(error: unknown): ErrorDiagnostics {
     seen.add(value);
     const result: ErrorDiagnostics = {};
     try {
+      if (value instanceof SandboxSetupError) {
+        result.sandboxMode = value.sandboxMode;
+        result.sandboxSetup = value.sandboxSetup;
+        if (value.reason) result.reason = value.reason;
+        if (value.path) result.path = value.path;
+      }
       const constructor = get(value, "constructor");
       const constructorName =
         constructor && typeof constructor === "function"

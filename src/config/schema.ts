@@ -234,6 +234,19 @@ export const configSchema = z
       )
       .strict(),
     commands: z.array(commandSchema).default([]),
+    execution: z
+      .object({
+        sandbox: z
+          .object({
+            mode: z.enum(["auto", "required", "none"]).default("auto"),
+            network: z.enum(["deny", "allow"]).default("deny"),
+            pentestNetwork: z.enum(["deny", "allow"]).default("deny"),
+          })
+          .strict()
+          .default({}),
+      })
+      .strict()
+      .default({}),
     commit: z.object({ runHooks: z.boolean().default(false) }).default({}),
     pentest: z
       .object({

@@ -12,6 +12,12 @@ import {
   normalizedRuntimeCommand,
   type RuntimeCommandRequest,
 } from "./runtime-commands.ts";
+import {
+  prepareExecution,
+  SandboxSetupError,
+  sandboxSetupFailure,
+  type SandboxDetails,
+} from "./sandbox.ts";
 export type RuntimeCommandApprover = (
   command: Command,
   request: RuntimeCommandRequest,
@@ -25,74 +31,99 @@ export interface CommandEvidence {
   stderr?: string;
   timedOut?: boolean;
   durationMs?: number;
+  sandbox: SandboxDetails;
 }
 export async function execute(
   command: Command,
   cwd: string,
   signal?: AbortSignal,
+  sandboxConfig: TeamConfig["execution"]["sandbox"] = {
+    mode: "auto",
+    network: "deny",
+    pentestNetwork: "deny",
+  },
 ): Promise<CommandEvidence> {
   if (signal?.aborted) throw new Error("Command aborted");
   const startedAt = Date.now();
-  const env = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) =>
-      ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SHELL"].includes(key),
-    ),
-  );
-  return new Promise((resolve, reject) => {
-    const child = spawn(command.executable, command.args, {
-      cwd,
-      env,
-      shell: false,
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "",
-      stdout = "",
-      stderr = "",
-      timedOut = false;
-    const append = (data: Buffer) => {
-      output = (output + data.toString()).slice(-50000);
-    };
-    child.stdout.on("data", (data) => {
-      stdout = (stdout + data.toString()).slice(-50000);
-      append(data);
-    });
-    child.stderr.on("data", (data) => {
-      stderr = (stderr + data.toString()).slice(-50000);
-      append(data);
-    });
-    const kill = () => {
-      try {
-        if (child.pid && process.platform !== "win32")
-          process.kill(-child.pid, "SIGKILL");
-        else child.kill("SIGKILL");
-      } catch {}
-    };
-    const timer = setTimeout(() => {
-      output += "\nCommand timeout";
-      timedOut = true;
-      kill();
-    }, command.timeoutMs);
-    signal?.addEventListener("abort", kill, { once: true });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", kill);
-      reject(e);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", kill);
-      resolve({
-        id: command.id,
-        exitCode: code ?? -1,
-        output,
-        stdout,
-        stderr,
-        timedOut,
-        durationMs: Math.max(0, Date.now() - startedAt),
+  const prepared = await prepareExecution(command, cwd, sandboxConfig);
+  if (signal?.aborted) {
+    await prepared.cleanup();
+    throw new Error("Command aborted");
+  }
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(prepared.executable, prepared.args, {
+        cwd: prepared.cwd,
+        env: prepared.env,
+        shell: false,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "",
+        stdout = "",
+        stderr = "",
+        timedOut = false;
+      const append = (data: Buffer) => {
+        output = (output + data.toString()).slice(-50000);
+      };
+      child.stdout.on("data", (data) => {
+        stdout = (stdout + data.toString()).slice(-50000);
+        append(data);
+      });
+      child.stderr.on("data", (data) => {
+        stderr = (stderr + data.toString()).slice(-50000);
+        append(data);
+      });
+      const kill = () => {
+        try {
+          if (child.pid && process.platform !== "win32")
+            process.kill(-child.pid, "SIGKILL");
+          else child.kill("SIGKILL");
+        } catch {}
+      };
+      const timer = setTimeout(() => {
+        output += "\nCommand timeout";
+        timedOut = true;
+        kill();
+      }, command.timeoutMs);
+      signal?.addEventListener("abort", kill, { once: true });
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", kill);
+        reject(
+          prepared.sandbox.mode === "bubblewrap"
+            ? new SandboxSetupError(`Bubblewrap could not start: ${e.message}`)
+            : e,
+        );
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", kill);
+        const setupFailure = sandboxSetupFailure(
+          prepared.sandbox,
+          code,
+          stderr,
+          timedOut,
+        );
+        if (setupFailure) {
+          reject(setupFailure);
+          return;
+        }
+        resolve({
+          id: command.id,
+          exitCode: code ?? -1,
+          output,
+          stdout,
+          stderr,
+          timedOut,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          sandbox: prepared.sandbox,
+        });
       });
     });
-  });
+  } finally {
+    await prepared.cleanup();
+  }
 }
 export function commandTool(
   role: Role,
@@ -158,7 +189,12 @@ export function commandTool(
           command = normalized.command;
         }
       }
-      const result = await execute(command, cwd, signal);
+      const result = await execute(
+        command,
+        cwd,
+        signal,
+        config.execution.sandbox,
+      );
       evidence.push(result);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],

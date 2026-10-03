@@ -53,7 +53,10 @@ function semanticConfig(config: TeamConfig) {
     ...Object.fromEntries(
       Object.entries(config).filter(
         ([key]) =>
-          !presentationRoots.has(key) && key !== "agents" && key !== "workflow",
+          !presentationRoots.has(key) &&
+          key !== "agents" &&
+          key !== "workflow" &&
+          key !== "execution",
       ),
     ),
     workflow: Object.fromEntries(
@@ -188,6 +191,7 @@ export function analyzeConfigDrift(
         (parts[0] === "agents" && parts[2] === "name")
       )
         add("presentation", path);
+      else if (parts[0] === "execution") add("runtime", path);
       else if (parts[0] === "workflow" && runtimeWorkflow.has(parts[1]))
         add("runtime", path);
       else if (

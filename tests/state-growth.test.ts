@@ -12,6 +12,12 @@ test("validation state retains routing facts and bounds command output", () => {
       output: "x".repeat(50000),
       timedOut: false,
       durationMs: 123,
+      sandbox: {
+        mode: "constrained-host",
+        network: "host",
+        temporaryHome: true,
+        filesystemIsolation: false,
+      },
     },
   ]);
   assert.equal(item.output.length, 2000);
