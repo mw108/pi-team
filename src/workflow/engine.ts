@@ -1197,23 +1197,48 @@ export class WorkflowEngine {
                 networkRetry: event.retry,
                 message: redactVisibleText(event.message),
               });
-              if (event.type === "network_retry_scheduled")
+              if (
+                event.type === "network_error" ||
+                event.type === "network_retry_scheduled"
+              )
                 this.emitAgentEvent({
                   type: "networkRetry",
                   role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  providerRequest: providerRequests,
                   retry: event.retry,
                   maxRetries: event.maxRetries,
-                  delayMs: event.delayMs!,
+                  delayMs: event.delayMs ?? 0,
                   category: event.category,
-                  retryAt: Date.now() + event.delayMs!,
+                  ...(event.delayMs === undefined
+                    ? {}
+                    : { retryAt: Date.now() + event.delayMs }),
                 });
               if (event.type === "network_retry_started")
-                this.emitAgentEvent({ type: "networkStarted", role });
+                this.emitAgentEvent({
+                  type: "networkStarted",
+                  role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  providerRequest: providerRequests,
+                  retry: event.retry,
+                });
               if (
                 event.type === "network_recovered" ||
                 event.type === "network_retries_exhausted"
               )
-                this.emitAgentEvent({ type: "networkClear", role });
+                this.emitAgentEvent({
+                  type: "networkClear",
+                  role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  providerRequest: providerRequests,
+                  reason:
+                    event.type === "network_recovered"
+                      ? "recovered"
+                      : "exhausted",
+                });
               if (
                 (event.type === "network_retry_started" && event.retry === 1) ||
                 event.type === "network_recovered" ||
@@ -1324,6 +1349,15 @@ export class WorkflowEngine {
               if (event.type === "provider_request_failure")
                 failedRequest = record;
               logged?.logger.append(record);
+              if (event.type === "provider_request_end" && event.success)
+                this.emitAgentEvent({
+                  type: "networkClear",
+                  role,
+                  workflowId: s.id,
+                  attempt: attemptNumber,
+                  providerRequest: event.providerRequest,
+                  reason: "recovered",
+                });
               if (
                 event.type === "provider_request_failure" &&
                 event.error &&

@@ -33,12 +33,16 @@ export interface AgentProgress {
   doomLoopReason?: string;
   toolsDisabledForFinalization?: boolean;
   networkRetry?: {
+    status: "waiting_retry" | "reconnecting";
     retry: number;
     maxRetries: number;
     delayMs: number;
     retryAt?: number;
     category: string;
+    nextProviderRequest: number;
   };
+  latestProviderRequest?: number;
+  endedProviderRequest?: number;
   contextUsage?: ContextUsage;
   providerProgress?: ProviderLiveProgress;
   modelPreflight?: Extract<ModelPreflightUpdate, { kind: "model_preflight" }>;
@@ -72,14 +76,31 @@ export type AgentEvent =
   | {
       type: "networkRetry";
       role: Role;
+      workflowId: string;
+      attempt: number;
+      providerRequest: number;
       retry: number;
       maxRetries: number;
       delayMs: number;
-      retryAt: number;
+      retryAt?: number;
       category: string;
     }
-  | { type: "networkStarted"; role: Role }
-  | { type: "networkClear"; role: Role }
+  | {
+      type: "networkStarted";
+      role: Role;
+      workflowId: string;
+      attempt: number;
+      providerRequest: number;
+      retry: number;
+    }
+  | {
+      type: "networkClear";
+      role: Role;
+      workflowId: string;
+      attempt: number;
+      providerRequest: number;
+      reason: "recovered" | "exhausted";
+    }
   | {
       type: "providerProgress";
       role: Role;
@@ -217,16 +238,31 @@ export class ProgressRuntime {
         existing.attempt !== event.attempt
       )
         return;
-      const currentRequest = existing.providerProgress?.providerRequest ?? 0;
+      const currentRequest = existing.latestProviderRequest ?? 0;
       if (event.update.providerRequest < currentRequest) return;
+      if (
+        !("ended" in event.update) &&
+        event.update.providerRequest <= (existing.endedProviderRequest ?? 0)
+      )
+        return;
+      existing.latestProviderRequest = event.update.providerRequest;
       if ("ended" in event.update) {
+        existing.endedProviderRequest = event.update.providerRequest;
         if (event.update.providerRequest === currentRequest)
           existing.providerProgress = undefined;
       } else {
         existing.providerProgress = event.update;
         existing.modelPreflight = undefined;
+        if (
+          event.update.streamEventCount > 0 &&
+          event.update.providerRequest >=
+            (existing.networkRetry?.nextProviderRequest ?? Infinity)
+        ) {
+          existing.networkRetry = undefined;
+          this.emit();
+        }
       }
-      // The existing UI heartbeat renders timestamps without a repaint per delta.
+      // The heartbeat renders ordinary deltas; recovery repaints immediately.
       return;
     }
     if (event.type === "start")
@@ -279,6 +315,8 @@ export class ProgressRuntime {
     else if (event.type === "restarting" && existing) {
       existing.controlActivity = `Restarting as run ${event.attempt}`;
       existing.networkRetry = undefined;
+      existing.latestProviderRequest = undefined;
+      existing.endedProviderRequest = undefined;
       existing.providerProgress = undefined;
       existing.modelPreflight = undefined;
     } else if (event.type === "aborted" && existing) {
@@ -318,17 +356,45 @@ export class ProgressRuntime {
       existing.toolCallId = undefined;
       existing.providerProgress = undefined;
       existing.modelPreflight = undefined;
-    } else if (event.type === "networkRetry" && existing) {
+    } else if (
+      event.type === "networkRetry" &&
+      existing?.status === "running" &&
+      this.state?.id === event.workflowId &&
+      existing.attempt === event.attempt &&
+      event.providerRequest >= (existing.latestProviderRequest ?? 0) &&
+      (existing.networkRetry?.nextProviderRequest !==
+        event.providerRequest + 1 ||
+        event.retry >= existing.networkRetry.retry)
+    ) {
       existing.networkRetry = {
+        status: "waiting_retry",
         retry: event.retry,
         maxRetries: event.maxRetries,
         delayMs: event.delayMs,
         retryAt: event.retryAt,
         category: event.category,
+        nextProviderRequest: event.providerRequest + 1,
       };
-    } else if (event.type === "networkStarted" && existing?.networkRetry) {
+    } else if (
+      event.type === "networkStarted" &&
+      this.state?.id === event.workflowId &&
+      existing?.status === "running" &&
+      existing.attempt === event.attempt &&
+      event.providerRequest ===
+        (existing.networkRetry?.nextProviderRequest ?? 0) - 1 &&
+      existing.networkRetry?.retry === event.retry
+    ) {
+      existing.networkRetry.status = "reconnecting";
       existing.networkRetry.retryAt = undefined;
-    } else if (event.type === "networkClear" && existing) {
+    } else if (
+      event.type === "networkClear" &&
+      this.state?.id === event.workflowId &&
+      existing?.status === "running" &&
+      existing.attempt === event.attempt &&
+      event.providerRequest >=
+        (existing.networkRetry?.nextProviderRequest ?? Infinity) -
+          (event.reason === "exhausted" ? 1 : 0)
+    ) {
       existing.networkRetry = undefined;
     } else if (
       event.type === "commandApproved" &&

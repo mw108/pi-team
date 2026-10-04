@@ -1119,11 +1119,14 @@ test("parallel progress tracks each solver reconnect independently", () => {
   const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
   runtime.bind(state);
   for (const role of ["solver1", "solver2", "solver3"] as Role[])
-    runtime.event({ type: "start", role });
+    runtime.event({ type: "start", role, attempt: 1 });
   runtime.event({ type: "complete", role: "solver1" });
   runtime.event({
     type: "networkRetry",
     role: "solver2",
+    workflowId: state.id,
+    attempt: 1,
+    providerRequest: 0,
     retry: 3,
     maxRetries: 10,
     delayMs: 3000,
@@ -1142,7 +1145,14 @@ test("parallel progress tracks each solver reconnect independently", () => {
   );
   assert.match(text, /Solver Alternative.*\n.*Context7/);
   assert.doesNotMatch(text, /retry 1\/1/);
-  runtime.event({ type: "networkClear", role: "solver2" });
+  runtime.event({
+    type: "networkClear",
+    role: "solver2",
+    workflowId: state.id,
+    attempt: 1,
+    providerRequest: 1,
+    reason: "recovered",
+  });
   assert.doesNotMatch(
     renderProgress(state, runtime).join("\n"),
     /Reconnecting/,
@@ -1166,7 +1176,7 @@ test("parallel model requests isolate one solver's reconnect from its siblings",
   } as any;
   progress.bind(state);
   for (const role of ["solver1", "solver2", "solver3"] as Role[])
-    progress.event({ type: "start", role });
+    progress.event({ type: "start", role, attempt: 1 });
   let scheduled!: () => void;
   const reconnectScheduled = new Promise<void>((resolve) => {
     scheduled = resolve;
@@ -1185,6 +1195,9 @@ test("parallel model requests isolate one solver's reconnect from its siblings",
           progress.event({
             type: "networkRetry",
             role,
+            workflowId: state.id,
+            attempt: 1,
+            providerRequest: 1,
             retry: event.retry,
             maxRetries: event.maxRetries,
             delayMs: event.delayMs!,
@@ -1194,7 +1207,14 @@ test("parallel model requests isolate one solver's reconnect from its siblings",
           scheduled();
         }
         if (event.type === "network_recovered")
-          progress.event({ type: "networkClear", role });
+          progress.event({
+            type: "networkClear",
+            role,
+            workflowId: state.id,
+            attempt: 1,
+            providerRequest: 2,
+            reason: "recovered",
+          });
       },
     );
   const requests = [first, second, third].map((fixture, index) =>

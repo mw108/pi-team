@@ -388,6 +388,250 @@ test("provider replacement and agent retry discard prior live progress", () => {
   runtime.dispose();
 });
 
+test("live reconnect clears on the first stream event and supports a later retry cycle", () => {
+  let clock = 1000;
+  let renders = 0;
+  const state = newState("/tmp/fixture", "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  const runtime = new ProgressRuntime(
+    () => renders++,
+    2000,
+    () => clock,
+    false,
+  );
+  runtime.bind(state);
+  runtime.event({ type: "start", role: "solver1", attempt: 1 });
+  const progress = (
+    providerRequest: number,
+    providerState: "waiting" | "reasoning" | "generating",
+    streamEventCount: number,
+  ) =>
+    runtime.event({
+      type: "providerProgress",
+      workflowId: state.id,
+      role: "solver1",
+      attempt: 1,
+      update: {
+        providerRequest,
+        startedAt: clock,
+        state: providerState,
+        streamEventCount,
+        ...(streamEventCount > 0 ? { lastActivityAt: clock } : {}),
+      },
+    });
+  const retry = (number: number, providerRequest: number, retryAt?: number) =>
+    runtime.event({
+      type: "networkRetry",
+      workflowId: state.id,
+      role: "solver1",
+      attempt: 1,
+      providerRequest,
+      retry: number,
+      maxRetries: 10,
+      delayMs: 1000,
+      retryAt,
+      category: "transport",
+    });
+  const started = (number: number) =>
+    runtime.event({
+      type: "networkStarted",
+      workflowId: state.id,
+      role: "solver1",
+      attempt: 1,
+      providerRequest: number === 1 ? 1 : 2,
+      retry: number,
+    });
+  const clear = (providerRequest: number) =>
+    runtime.event({
+      type: "networkClear",
+      workflowId: state.id,
+      role: "solver1",
+      attempt: 1,
+      providerRequest,
+      reason: "recovered",
+    });
+  const rendered = () => renderProgress(state, runtime).join("\n");
+
+  progress(1, "waiting", 0);
+  runtime.event({
+    type: "providerProgress",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    update: { providerRequest: 1, ended: true },
+  });
+  retry(1, 1); // network_error
+  assert.equal(runtime.agents.solver1?.networkRetry?.status, "waiting_retry");
+  assert.match(rendered(), /Reconnecting · network error · 1\/10/);
+  retry(1, 1, 2000); // network_retry_scheduled
+  started(1); // network_retry_started
+  assert.equal(runtime.agents.solver1?.networkRetry?.status, "reconnecting");
+  runtime.event({
+    type: "modelPreflight",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    update: {
+      kind: "model_preflight",
+      model: "fixture",
+      state: "ready",
+      startedAt: clock,
+    },
+  });
+  progress(2, "waiting", 0); // provider_request_start is not recovery
+  assert.match(rendered(), /Reconnecting · network error · 1\/10/);
+  clock = 2100;
+  const beforeRecovery = renders;
+  progress(2, "reasoning", 17);
+  assert.equal(renders, beforeRecovery + 1);
+  assert.equal(runtime.agents.solver1?.networkRetry, undefined);
+  assert.match(rendered(), /reasoning · active 0\.0s ago/);
+  assert.doesNotMatch(rendered(), /Reconnecting/);
+  progress(2, "generating", 185);
+  assert.match(rendered(), /generating · active 0\.0s ago/);
+  assert.doesNotMatch(rendered(), /Reconnecting/);
+  clear(2); // provider_request_end success=true
+  clear(2); // network_recovered
+  assert.equal(runtime.agents.solver1?.networkRetry, undefined);
+  assert.match(rendered(), /generating/);
+  assert.doesNotMatch(rendered(), /Reconnecting/);
+  retry(1, 2); // a later request can begin a fresh retry cycle
+  assert.match(rendered(), /Reconnecting · network error · 1\/10/);
+  progress(3, "reasoning", 1);
+  assert.doesNotMatch(rendered(), /Reconnecting/);
+  runtime.dispose();
+});
+
+test("failed reconnect and stale events cannot clear a newer retry", () => {
+  const state = newState("/tmp/fixture", "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  const runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  runtime.bind(state);
+  runtime.event({ type: "start", role: "solver1", attempt: 1 });
+  const retry = (number: number, request: number) =>
+    runtime.event({
+      type: "networkRetry",
+      workflowId: state.id,
+      role: "solver1",
+      attempt: 1,
+      providerRequest: request,
+      retry: number,
+      maxRetries: 10,
+      delayMs: 1000,
+      category: "transport",
+    });
+  retry(1, 1);
+  runtime.event({
+    type: "networkStarted",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    providerRequest: 1,
+    retry: 1,
+  });
+  runtime.event({
+    type: "providerProgress",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    update: {
+      providerRequest: 2,
+      startedAt: 1,
+      state: "waiting",
+      streamEventCount: 0,
+    },
+  });
+  runtime.event({
+    type: "providerProgress",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    update: { providerRequest: 2, ended: true },
+  }); // provider_request_failure and unsuccessful end
+  assert.match(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting.*1\/10/,
+  );
+  retry(2, 2);
+  assert.match(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting.*2\/10/,
+  );
+  retry(1, 1); // late event from the older request
+  assert.match(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting.*2\/10/,
+  );
+  runtime.event({
+    type: "networkClear",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    providerRequest: 2,
+    reason: "recovered",
+  });
+  runtime.event({
+    type: "providerProgress",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    update: {
+      providerRequest: 2,
+      startedAt: 1,
+      lastActivityAt: 2,
+      state: "reasoning",
+      streamEventCount: 1,
+    },
+  });
+  assert.match(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting.*2\/10/,
+  );
+  runtime.event({
+    type: "networkClear",
+    workflowId: "other-workflow",
+    role: "solver1",
+    attempt: 1,
+    providerRequest: 3,
+    reason: "recovered",
+  });
+  runtime.event({
+    type: "networkClear",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 2,
+    providerRequest: 3,
+    reason: "recovered",
+  });
+  assert.match(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting.*2\/10/,
+  );
+  runtime.event({
+    type: "networkClear",
+    workflowId: state.id,
+    role: "solver1",
+    attempt: 1,
+    providerRequest: 3,
+    reason: "recovered",
+  }); // network_recovered fallback when no stream was rendered
+  assert.doesNotMatch(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting/,
+  );
+  runtime.dispose();
+});
+
 test("network retry starts a fresh provider progress snapshot", async () => {
   let calls = 0;
   const runtime = {
@@ -499,4 +743,115 @@ test("workflow JSONL records compact provider_progress without streamed content"
   assert.equal(progress?.outputTokens, undefined);
   assert.equal(progress?.tokensPerSecond, undefined);
   assert.equal(progress?.abortReason, undefined);
+});
+
+test("successful provider end clears live reconnect without stream activity and retains retry diagnostics", async () => {
+  const cwd = await repository();
+  let runtime: ProgressRuntime;
+  const runner: AgentRunner = {
+    async run(
+      _role,
+      state,
+      _signal,
+      _activity,
+      _attempt,
+      _output,
+      network,
+      _registry,
+      _guardEvent,
+      providerEvent,
+      providerProgress,
+    ) {
+      const identity = (providerRequest: number, networkRetry: number) => ({
+        providerRequest,
+        provider: "local",
+        model: "fixture",
+        api: "openai-completions",
+        networkRetry,
+        requestStartedAt: new Date().toISOString(),
+      });
+      providerProgress?.({
+        providerRequest: 1,
+        startedAt: 1,
+        state: "waiting",
+        streamEventCount: 0,
+      });
+      providerEvent?.({ type: "provider_request_start", ...identity(1, 0) });
+      providerProgress?.({ providerRequest: 1, ended: true });
+      providerEvent?.({
+        type: "provider_request_failure",
+        ...identity(1, 0),
+      });
+      providerEvent?.({
+        type: "provider_request_end",
+        ...identity(1, 0),
+        success: false,
+      });
+      for (const type of [
+        "network_error",
+        "network_retry_scheduled",
+        "network_retry_started",
+      ] as const)
+        network?.({
+          type,
+          retry: 1,
+          maxRetries: 10,
+          category: "transport",
+          message: "connection lost",
+          delayMs: 1000,
+        });
+      assert.match(
+        renderProgress(state, runtime).join("\n"),
+        /Reconnecting.*1\/10/,
+      );
+      providerProgress?.({
+        providerRequest: 2,
+        startedAt: 2,
+        state: "waiting",
+        streamEventCount: 0,
+      });
+      providerEvent?.({ type: "provider_request_start", ...identity(2, 1) });
+      assert.match(
+        renderProgress(state, runtime).join("\n"),
+        /Reconnecting.*1\/10/,
+      );
+      providerProgress?.({ providerRequest: 2, ended: true });
+      providerEvent?.({
+        type: "provider_request_end",
+        ...identity(2, 1),
+        success: true,
+      });
+      assert.doesNotMatch(
+        renderProgress(state, runtime).join("\n"),
+        /Reconnecting/,
+      );
+      network?.({
+        type: "network_recovered",
+        retry: 1,
+        maxRetries: 10,
+        category: "transport",
+        message: "connection recovered",
+      });
+      return research;
+    },
+  };
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+    agentEvent: (event) => runtime.event(event),
+  });
+  const state = await engine.start("reconnect fixture", config());
+  runtime = new ProgressRuntime(() => {}, 2000, Date.now, false);
+  runtime.bind(state);
+  await engine.invoke("researcher", state);
+  const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  const success = events.find(
+    (event) => event.type === "provider_request_end" && event.success,
+  );
+  assert.equal(success?.networkRetry, 1);
+  assert.doesNotMatch(
+    renderProgress(state, runtime).join("\n"),
+    /Reconnecting/,
+  );
+  runtime.dispose();
 });
