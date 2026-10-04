@@ -206,6 +206,17 @@ export const stateSchema = z.object({
   manualRetry: z
     .object({ agent: z.enum(roles), phase: z.enum(phases) })
     .optional(),
+  interruptedMutationRecovery: z
+    .object({
+      agent: z.enum(roles),
+      phase: z.enum(phases),
+      attempt: z.number().int().positive(),
+      reason: z.enum(["user_stop", "process_interrupted"]),
+      hashes: z.record(z.string()),
+      createdPaths: z.array(exactPath),
+      discardablePaths: z.array(exactPath),
+    })
+    .optional(),
   blocker: z.string().optional(),
   gateHashes: z.record(z.string()).optional(),
   testMutationCycles: z.number().int().min(0).default(0),

@@ -34,6 +34,8 @@ Then enter:
 /team-steer solver1 Stop repeating failed reads and finalize.
 /team-abort solver1
 /team-retry solver1
+/team-retry implementor keep
+/team-retry implementor discard
 /team-stop
 /team resume
 /team resume <workflow-id>
@@ -111,8 +113,10 @@ workflow:
 | Command                            | Behavior                                                                                                                                                                                                                             |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/team-steer <agent-id> <message>` | Queue guidance in the same Pi session and run. Delivery waits until Pi finishes the current tool calls. The existing timeout keeps running.                                                                                          |
-| `/team-abort <agent-id>`           | Stop only that run, without a replacement or failure-budget charge. Other agents continue.                                                                                                                                           |
+| `/team-abort <agent-id>`           | Stop only that run, without a replacement or failure-budget charge. For blocked interrupted Implementor recovery, abort the workflow and preserve repository changes. Other active agents continue.                                  |
 | `/team-retry <agent-id>`           | Stop the current run if needed, dispose its session, and start a fresh technical retry run with the same phase input. The request does not use the automatic retry or failure budget. A genuine failure in the new run still counts. |
+| `/team-retry <agent-id> keep`      | For an interrupted mutating run, preserve the current working tree and restart the agent.                                                                                                                                            |
+| `/team-retry <agent-id> discard`   | For an interrupted mutating run, safely revert only changes attributed to that attempt, then restart the agent. Ambiguous or user-owned changes are never removed automatically.                                                     |
 | `/team-continue`                   | Continue a BLOCKED workflow at the next safe incomplete phase after checking prerequisites, configuration and repository state. It takes no agent or phase argument.                                                                 |
 | `/team-stop`                       | Stop the entire workflow.                                                                                                                                                                                                            |
 
@@ -120,7 +124,7 @@ Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`.
 
 ### Runtime recovery
 
-`/team-continue` advances a BLOCKED workflow only when the next agent has never started and all earlier phases completed. For example, `✓ Implementor`, `○ Code Reviewer`, `BLOCKED` continues with Code Reviewer run 1. A failed Implementor instead needs `/team-retry implementor` after inspecting its repository effects. `✓ Commit Agent`, `○ Reporter`, `BLOCKED` can continue at Reporter. A workflow in `WAITING_USER` needs its pending answer or approval. `/team-status` and the BLOCKED report show the same next safe action.
+`/team-continue` advances a BLOCKED workflow only when the next agent has never started and all earlier phases completed. For example, `✓ Implementor`, `○ Code Reviewer`, `BLOCKED` continues with Code Reviewer run 1. A failed Implementor instead needs `/team-retry implementor` after inspecting its repository effects. An interrupted mutating Implementor needs an explicit `/team-retry implementor keep` or `/team-retry implementor discard` choice; `/team-continue` does not resolve it. `keep` leaves all current changes in place. `discard` uses recorded successful file mutations, attempt-specific hashes, the original baseline and Git staging checks; it refuses ambiguous changes and leaves them for manual inspection or `keep`. `✓ Commit Agent`, `○ Reporter`, `BLOCKED` can continue at Reporter. A workflow in `WAITING_USER` needs its pending answer or approval. `/team-status` and the BLOCKED report show recovery options and a repository summary.
 
 `/team-retry <agent-id>` reruns a specific agent with an existing attempt or result. `/team resume` restores or replays persisted interrupted work after Pi restarts, following its existing read-only replay rules. `/team-continue` moves from a safely recoverable BLOCKED transition to the next incomplete phase without rerunning completed work.
 

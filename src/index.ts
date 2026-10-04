@@ -21,6 +21,7 @@ import { projectRoot } from "./config/project.ts";
 import { AgentLogStore } from "./workflow/agent-logs.ts";
 import {
   getWorkflowRecoveryPlan,
+  interruptedMutationRecovery,
   recoveryAction,
 } from "./workflow/recovery.ts";
 import { roles, completionReportSchema, type Role } from "./agents/schemas.ts";
@@ -194,26 +195,54 @@ export default function teamExtension(pi: ExtensionAPI) {
       try {
         const role = target(args, "team-abort");
         const root = await projectRoot(ctx.cwd);
-        if (!active?.state || active.state.cwd !== root || !active.engine)
-          throw new Error(
-            `Agent "${active?.state ? getAgentDisplayName(active.state.config, role) : role}" (${role}) is not currently running.`,
+        if (
+          active?.state &&
+          active.state.cwd === root &&
+          active.engine &&
+          active.state.phase !== "BLOCKED"
+        ) {
+          await active.engine.abortAgent(active.state, role);
+          ctx.ui.notify(
+            `${getAgentDisplayName(active.state.config, role)} (${role}) abort requested.`,
+            "info",
           );
-        await active.engine.abortAgent(active.state, role);
-        ctx.ui.notify(
-          `${getAgentDisplayName(active.state.config, role)} (${role}) abort requested.`,
-          "info",
-        );
+        } else {
+          const state = await new StateStore(root).latest();
+          if (!state || interruptedMutationRecovery(state)?.agent !== role)
+            throw new Error(
+              `Agent "${role}" (${role}) is not currently running.`,
+            );
+          await new WorkflowEngine(root, new PiRunner(), {
+            progress: () => {},
+            ask: async () => undefined,
+          }).abortInterruptedRecovery(state, role);
+          ctx.ui.notify(
+            `${getAgentDisplayName(state.config, role)} (${role}) recovery aborted; repository changes preserved.`,
+            "info",
+          );
+        }
       } catch (e) {
         ctx.ui.notify(formatErrorForPiNotification(e), "error");
       }
     },
   });
   pi.registerCommand("team-retry", {
-    description: "Start a fresh attempt for one agent: /team-retry <agent-id>",
+    description: "Retry an agent: /team-retry <agent-id> [keep|discard]",
     handler: async (args, ctx) => {
       let ownedRuntime: ProgressRuntime | undefined;
       try {
-        const role = target(args, "team-retry");
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        if (
+          parts.length < 1 ||
+          parts.length > 2 ||
+          !roles.includes(parts[0] as Role) ||
+          (parts[1] !== undefined &&
+            parts[1] !== "keep" &&
+            parts[1] !== "discard")
+        )
+          throw new Error("Usage: /team-retry <agent-id> [keep|discard]");
+        const role = parts[0] as Role;
+        const mode = parts[1] as "keep" | "discard" | undefined;
         if (continuationPending)
           throw new Error("Workflow continuation is in progress.");
         if (active && !active.state)
@@ -240,7 +269,9 @@ export default function teamExtension(pi: ExtensionAPI) {
           });
         runtime.bindSessions(engine.sessions);
         if (!active) ownedRuntime = runtime;
-        const message = engine.retryConfirmation(state, role);
+        const message = mode
+          ? undefined
+          : engine.retryConfirmation(state, role);
         let confirmed = false;
         if (message) {
           const selected = await askApproval(pi, ctx, {
@@ -266,7 +297,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           }
           confirmed = true;
         }
-        const result = await engine.retryAgent(state, role, confirmed);
+        const result = await engine.retryAgent(state, role, confirmed, mode);
         ctx.ui.notify(
           `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
           "info",
@@ -383,7 +414,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
             redactVisibleText(
-              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> · /team-continue`,
+              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> [keep|discard] · /team-continue`,
             ),
             "info",
           );

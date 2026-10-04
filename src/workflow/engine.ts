@@ -3,7 +3,7 @@ import {
   type AttemptControl,
 } from "./approval-coordinator.ts";
 import { appendFile, readFile } from "node:fs/promises";
-import { unlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { resolve } from "node:path";
 import { projectRootSync } from "../config/project.ts";
@@ -54,6 +54,8 @@ import {
   gateSnapshot,
   unexpectedWorkflowPaths,
   classifyOrphanedImplementation,
+  classifyAttributedImplementation,
+  discardAttributedImplementation,
   prepareCommit,
   createCommit,
 } from "./git.ts";
@@ -73,7 +75,10 @@ import {
   inactiveSolverError,
 } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
-import { getWorkflowRecoveryPlan } from "./recovery.ts";
+import {
+  getWorkflowRecoveryPlan,
+  interruptedMutationRecovery,
+} from "./recovery.ts";
 import {
   analyzeConfigDrift,
   acceptConfigDrift,
@@ -291,6 +296,47 @@ export class WorkflowEngine {
     this.emitAgentEvent({ type: "aborting", role });
     control.controller.abort();
   }
+  async abortInterruptedRecovery(state: WorkflowState, role: Role) {
+    const unlock = await this.store.lock();
+    try {
+      const latest = await this.store.latest();
+      if (!latest || latest.id !== state.id)
+        throw new Error("Workflow mismatch for interrupted recovery.");
+      for (const key of Object.keys(state))
+        delete (state as Record<string, unknown>)[key];
+      Object.assign(state, latest);
+      const recovery = interruptedMutationRecovery(state);
+      if (!recovery || recovery.agent !== role)
+        throw new Error(`Agent ${role} has no interrupted recovery to abort.`);
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length
+      )
+        throw new Error(`Agent ${role} is currently active.`);
+      if (state.manualRetry && state.manualRetry.agent !== role)
+        throw new Error(
+          `Cannot clear unrelated manual retry for ${state.manualRetry.agent}.`,
+        );
+      delete state.manualRetry;
+      delete state.inFlight;
+      delete state.interruptedMutationRecovery;
+      state.blocker =
+        "Workflow aborted after interrupted Implementor run; repository changes preserved";
+      record(
+        state,
+        "interrupted_mutation_recovery_aborted",
+        `implementor attempt ${recovery.attempt}`,
+        {
+          agent: role,
+          attempt: recovery.attempt,
+        },
+      );
+      await this.store.save(state);
+    } finally {
+      await unlock();
+    }
+  }
   retryConfirmation(state: WorkflowState, role: Role) {
     if (role === "reporter" && state.reportFailure) return undefined;
     if (role === "pentester" && state.results.pentester?.status === "BLOCKED")
@@ -306,9 +352,18 @@ export class WorkflowEngine {
     );
     return `${getAgentDisplayName(state.config, role)} (${role}) already completed successfully. Retrying will replace its result${downstream.length ? ` and invalidate ${downstream.map((id) => getAgentDisplayName(state.config, id)).join(", ")}` : ""}. Continue?`;
   }
-  async retryAgent(state: WorkflowState, role: Role, confirmed = false) {
+  async retryAgent(
+    state: WorkflowState,
+    role: Role,
+    confirmed = false,
+    mode?: "keep" | "discard",
+  ) {
+    if (mode !== undefined && mode !== "keep" && mode !== "discard")
+      throw new Error("Usage: /team-retry <agent-id> [keep|discard]");
     // An active run already owns the workflow lock. Detached retries take it
     // here and refresh state so a second process cannot replay a stale retry.
+    if (mode && this.running)
+      throw new Error("Cannot recover while a workflow run is active.");
     if (this.running) return this.retryAgentLocked(state, role, confirmed);
     const unlock = await this.store.lock();
     try {
@@ -322,7 +377,7 @@ export class WorkflowEngine {
           delete (state as Record<string, unknown>)[key];
         Object.assign(state, latest);
       }
-      return await this.retryAgentLocked(state, role, confirmed);
+      return await this.retryAgentLocked(state, role, confirmed, mode);
     } finally {
       await unlock();
     }
@@ -331,6 +386,7 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed: boolean,
+    mode?: "keep" | "discard",
   ) {
     this.assertActiveAgent(state, role);
     const label = getAgentDisplayName(state.config, role);
@@ -339,6 +395,120 @@ export class WorkflowEngine {
     const control = this.activeAttempts.get(role);
     if (control && control.workflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
+    const recovery = interruptedMutationRecovery(state);
+    if (mode || (recovery && recovery.agent === role)) {
+      if (!mode)
+        throw new Error(
+          `Interrupted ${label} changes require an explicit recovery choice. Use /team-retry ${role} keep or /team-retry ${role} discard.`,
+        );
+      if (!recovery || recovery.agent !== role)
+        throw new Error(
+          `No interrupted mutating attempt for ${role}; use /team-retry ${role} for an ordinary retry.`,
+        );
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length ||
+        this.retryRequests.has(role)
+      )
+        throw new Error(
+          `Agent ${label} (${role}) is currently active; stop it before recovery.`,
+        );
+      if (
+        state.pendingApproval ||
+        state.pendingQuestion ||
+        state.pendingRuntimeCommands.length ||
+        state.driftCandidate
+      )
+        throw new Error(
+          "A separate user decision or configuration review is pending.",
+        );
+      if (state.commit)
+        throw new Error(
+          "Cannot recover interrupted implementation after a commit.",
+        );
+      if (state.manualRetry && state.manualRetry.agent !== role)
+        throw new Error(
+          `Cannot clear unrelated manual retry for ${state.manualRetry.agent}.`,
+        );
+      const currentConfig = await loadConfig(this.cwd);
+      const drift = analyzeConfigDrift(state, currentConfig);
+      if (drift.blocking)
+        throw new Error(
+          `Configuration drift requires review.\n${driftSummary(drift)}`,
+        );
+      if (mode === "discard") {
+        const classification = await classifyAttributedImplementation(
+          state,
+          recovery,
+          "interrupted",
+        );
+        if (classification.ambiguous.length) {
+          record(
+            state,
+            "manual_retry_recovery_blocked_ambiguous",
+            `${classification.ambiguous.length} ambiguous path(s)`,
+            {
+              agent: role,
+              attempt: recovery.attempt,
+              count: classification.ambiguous.length,
+            },
+          );
+          await this.store.save(state);
+          throw new Error(
+            `Cannot safely discard all interrupted changes. Inspect ambiguous paths: ${classification.ambiguous.join(", ")}. Then use /team-retry ${role} keep or reconcile them manually.`,
+          );
+        }
+        await discardAttributedImplementation(
+          state,
+          classification.discardable,
+          recovery,
+        );
+        record(
+          state,
+          "manual_retry_recovery_discard",
+          `${classification.discardable.length} path(s) discarded`,
+          {
+            agent: role,
+            attempt: recovery.attempt,
+            count: classification.discardable.length,
+          },
+        );
+      } else {
+        record(
+          state,
+          "manual_retry_recovery_keep",
+          `${role} attempt ${recovery.attempt}`,
+          {
+            agent: role,
+            attempt: recovery.attempt,
+          },
+        );
+      }
+      delete state.manualRetry;
+      delete state.inFlight;
+      delete state.interruptedMutationRecovery;
+      delete state.results[role];
+      this.invalidateDependents(state, role);
+      delete state.reportInput;
+      delete state.reportFailure;
+      delete state.implementationStartHashes;
+      state.phase = recovery.phase;
+      delete state.blocker;
+      state.manualRetry = { agent: role, phase: recovery.phase };
+      this.manualReruns.add(role);
+      record(
+        state,
+        "agent_retry_requested_by_user",
+        `${role} interrupted mutation recovery`,
+        {
+          agent: role,
+          attempt: recovery.attempt,
+        },
+      );
+      await this.store.save(state);
+      return "prepared";
+    }
     if (control && control.workflowId === state.id && !control.settled) {
       if (control.manualRetry)
         throw new Error(`Agent ${label} (${role}) is already restarting.`);
@@ -569,6 +739,95 @@ export class WorkflowEngine {
           )
           .map((h) => h.meta!.attempt),
       ) + 1
+    );
+  }
+  private async markInterruptedImplementor(
+    state: WorkflowState,
+    reason: "user_stop" | "process_interrupted",
+  ) {
+    const started = state.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "implementor",
+    );
+    const attempt = started?.meta?.attempt;
+    if (!attempt) return;
+    const startIndex = state.history.lastIndexOf(started);
+    if (
+      state.history
+        .slice(startIndex + 1)
+        .some(
+          (event) =>
+            event.event === "agent_completed" && event.detail === "implementor",
+        )
+    )
+      return;
+    const dirty = (await dirtyPaths(this.cwd)).filter(
+      (path) => !path.startsWith(".pi/team/"),
+    );
+    const untracked = new Set(
+      (
+        await git(this.cwd, [
+          "ls-files",
+          "--others",
+          "--exclude-standard",
+          "-z",
+        ])
+      )
+        .split("\0")
+        .filter(Boolean),
+    );
+    const current: Record<string, string> = {};
+    const owned: string[] = [];
+    if (reason === "user_stop") {
+      for (const path of dirty) {
+        try {
+          current[path] = (await hashes(this.cwd, [path]))[path];
+        } catch {
+          continue;
+        }
+        if (
+          state.baseline.dirtyPaths.includes(path) ||
+          !state.observedImplementorMutations.some(
+            (mutation) =>
+              mutation.attempt === attempt &&
+              mutation.identity === policyPath(path),
+          )
+        )
+          continue;
+        const before = state.implementationStartHashes?.[path];
+        if (before === undefined) continue;
+        let headHash = "DELETED";
+        if (!untracked.has(path)) {
+          try {
+            headHash = createHash("sha256")
+              .update(await git(this.cwd, ["show", `HEAD:${path}`]))
+              .digest("hex");
+          } catch {
+            continue;
+          }
+        }
+        if (before === headHash) owned.push(path);
+      }
+    }
+    state.interruptedMutationRecovery = {
+      agent: "implementor",
+      phase: "IMPLEMENT",
+      attempt,
+      reason,
+      hashes: current,
+      createdPaths: dirty.filter((path) => untracked.has(path)),
+      discardablePaths: owned,
+    };
+    record(
+      state,
+      "interrupted_mutation_recovery_required",
+      `implementor attempt ${attempt}`,
+      {
+        agent: "implementor",
+        attempt,
+        count: owned.length,
+      },
     );
   }
   async start(task: string, config: TeamConfig, definition?: TeamDefinition) {
@@ -1363,6 +1622,12 @@ export class WorkflowEngine {
     if (s.inFlight) {
       const unsafe = s.inFlight.roles.some((r) => mutatingRoles.includes(r));
       if (unsafe) {
+        if (
+          s.inFlight.phase === "IMPLEMENT" &&
+          s.inFlight.roles.includes("implementor") &&
+          !s.interruptedMutationRecovery
+        )
+          await this.markInterruptedImplementor(s, "process_interrupted");
         block(
           s,
           `Interrupted ${s.inFlight.phase}; inspect repository effects before recovery. Automatic replay of mutating work is disabled.`,
@@ -1810,19 +2075,11 @@ export class WorkflowEngine {
                     : "Workflow aborted with orphaned implementation preserved",
                 );
               else {
-                for (const path of classification.discardable) {
-                  assertRelative(path);
-                  if (prior.createdPaths.includes(path))
-                    await unlink(join(this.cwd, path));
-                  else
-                    await git(this.cwd, [
-                      "restore",
-                      "--source=HEAD",
-                      "--worktree",
-                      "--",
-                      path,
-                    ]);
-                }
+                await discardAttributedImplementation(
+                  s,
+                  classification.discardable,
+                  prior,
+                );
                 if (classification.discardable.length)
                   record(
                     s,
@@ -2264,11 +2521,14 @@ export class WorkflowEngine {
         delete s.inFlight;
         if (signal?.aborted) {
           record(s, "interrupted");
-          if (runRoles.some((r) => mutatingRoles.includes(r)))
+          if (runRoles.some((r) => mutatingRoles.includes(r))) {
+            if (s.phase === "IMPLEMENT" && runRoles.includes("implementor"))
+              await this.markInterruptedImplementor(s, "user_stop");
             block(
               s,
               "Interrupted mutating phase; inspect effects before recovery",
             );
+          }
           await this.store.save(s);
           break;
         }

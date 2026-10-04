@@ -7,6 +7,7 @@ import {
   gateSnapshot,
   unexpectedWorkflowPaths,
   head,
+  classifyAttributedImplementation,
 } from "./git.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
 import {
@@ -26,11 +27,86 @@ const mutating = new Set<Role>([
 export type WorkflowRecoveryPlan =
   | { kind: "continue"; nextPhase: Phase; agentId: Role; reason: string }
   | { kind: "retry-agent"; agentId: Role; reason: string }
+  | { kind: "interrupted-mutation"; agentId: Role; reason: string }
   | { kind: "waiting-user" | "unsafe" | "none"; reason: string };
+
+export function interruptedMutationRecovery(state: WorkflowState) {
+  if (state.phase !== "BLOCKED") return undefined;
+  const marker = state.interruptedMutationRecovery;
+  const legacy =
+    state.blocker?.startsWith("Interrupted mutating phase;") ||
+    state.blocker?.startsWith("Interrupted IMPLEMENT;");
+  if (!marker && !legacy) return undefined;
+  const started = state.history.findLast(
+    (event) =>
+      event.event === "agent_attempt_started" &&
+      event.meta?.agent === "implementor",
+  );
+  const attempt = marker?.attempt ?? started?.meta?.attempt;
+  if (marker && started?.meta?.attempt !== marker.attempt) return undefined;
+  if (
+    !attempt ||
+    (marker && (marker.agent !== "implementor" || marker.phase !== "IMPLEMENT"))
+  )
+    return undefined;
+  const startIndex = state.history.findLastIndex(
+    (event) =>
+      event.event === "agent_attempt_started" &&
+      event.meta?.agent === "implementor" &&
+      event.meta.attempt === attempt,
+  );
+  if (
+    startIndex < 0 ||
+    state.history
+      .slice(startIndex + 1)
+      .some(
+        (event) =>
+          event.event === "agent_completed" && event.detail === "implementor",
+      )
+  )
+    return undefined;
+  if (marker) {
+    const markerIndex = state.history.findLastIndex(
+      (event) =>
+        event.event === "interrupted_mutation_recovery_required" &&
+        event.meta?.agent === marker.agent &&
+        event.meta.attempt === marker.attempt,
+    );
+    if (
+      markerIndex < 0 ||
+      state.history[markerIndex + 1]?.event !== "blocked" ||
+      state.history.findLastIndex((event) => event.event === "blocked") !==
+        markerIndex + 1 ||
+      state.history[markerIndex + 1]?.phase !== marker.phase
+    )
+      return undefined;
+    return marker;
+  }
+  if (
+    state.history.findLast((event) => event.event === "blocked")?.phase !==
+    "IMPLEMENT"
+  )
+    return undefined;
+  const prior =
+    state.priorImplementation?.attempt === attempt
+      ? state.priorImplementation
+      : undefined;
+  return {
+    agent: "implementor" as const,
+    phase: "IMPLEMENT" as const,
+    attempt,
+    reason: "process_interrupted" as const,
+    hashes: prior?.hashes ?? {},
+    createdPaths: prior?.createdPaths ?? [],
+    discardablePaths: prior?.discardablePaths ?? [],
+  };
+}
 
 export function recoveryAction(plan: WorkflowRecoveryPlan): string {
   if (plan.kind === "continue") return "/team-continue";
   if (plan.kind === "retry-agent") return `/team-retry ${plan.agentId}`;
+  if (plan.kind === "interrupted-mutation")
+    return `/team-retry ${plan.agentId} keep or discard`;
   if (plan.kind === "waiting-user")
     return "Answer the pending question or approval.";
   return plan.reason;
@@ -61,10 +137,6 @@ export async function getWorkflowRecoveryPlan(
   if (state.phase === "DONE")
     return { kind: "none", reason: "Workflow is already DONE." };
   if (state.phase !== "BLOCKED") return unsafe("Workflow is already running.");
-  if (state.inFlight)
-    return unsafe(
-      `Interrupted ${state.inFlight.phase}; inspect repository effects before continuing.`,
-    );
   if (state.driftCandidate)
     return unsafe("Configuration drift requires user review.");
   if (
@@ -84,6 +156,26 @@ export async function getWorkflowRecoveryPlan(
   const drift = analyzeConfigDrift(state, current);
   if (drift.blocking)
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
+  const interrupted = interruptedMutationRecovery(state);
+  if (interrupted) {
+    const classification = await classifyAttributedImplementation(
+      state,
+      interrupted,
+      "interrupted",
+    );
+    const safe = classification.discardable.length;
+    const ambiguous = classification.ambiguous.length;
+    const recommendDiscard = !ambiguous && !state.baseline.dirtyPaths.length;
+    return {
+      kind: "interrupted-mutation",
+      agentId: interrupted.agent,
+      reason: `Recovery required: Implementor was interrupted during a mutating run.\nRepository: ${safe} safe to discard; ${ambiguous} ambiguous.\n${ambiguous ? `Inspect ambiguous paths: ${classification.ambiguous.join(", ")}\n` : recommendDiscard ? "Recommended: /team-retry implementor discard\n" : ""}Options: /team-retry implementor keep · /team-retry implementor discard · /team-abort implementor\nPlease inspect repository changes before retrying.`,
+    };
+  }
+  if (state.inFlight)
+    return unsafe(
+      `Interrupted ${state.inFlight.phase}; inspect repository effects before continuing.`,
+    );
   if (
     state.blocker?.startsWith("Pentest blocked:") &&
     state.results.pentester?.status === "BLOCKED"

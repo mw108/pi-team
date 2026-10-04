@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, lstat, realpath } from "node:fs/promises";
+import { readFile, lstat, realpath, unlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -202,22 +202,47 @@ export async function unexpectedWorkflowPaths(
       !artifacts.has(path),
   );
 }
-export async function classifyOrphanedImplementation(s: WorkflowState) {
-  const prior = s.priorImplementation;
+type DiscardEvidence = NonNullable<WorkflowState["priorImplementation"]>;
+export async function classifyAttributedImplementation(
+  s: WorkflowState,
+  prior: DiscardEvidence | undefined,
+  scope: "orphan" | "interrupted",
+) {
   if (!prior) return { discardable: [] as string[], ambiguous: [] as string[] };
-  const contract = contractSchema.parse(s.results.reviewer);
-  const allowed = new Set(contractPaths(contract).map(policyPath));
+  const allowed =
+    scope === "orphan"
+      ? new Set(
+          contractPaths(contractSchema.parse(s.results.reviewer)).map(
+            policyPath,
+          ),
+        )
+      : new Set<string>();
   const baseline = new Set(s.baseline.dirtyPaths.map(policyPath));
-  const artifacts = await runtimeArtifacts(s.cwd);
+  const artifacts =
+    scope === "orphan" ? await runtimeArtifacts(s.cwd) : new Set<string>();
   const dirty = await dirtyPaths(s.cwd);
   const candidates = dirty.filter(
     (path) =>
       !path.startsWith(".pi/team/") &&
-      (!baseline.has(policyPath(path)) || Object.hasOwn(prior.hashes, path)) &&
+      (!baseline.has(policyPath(path)) ||
+        (scope === "orphan"
+          ? Object.hasOwn(prior.hashes, path)
+          : s.observedImplementorMutations.some(
+              (mutation) =>
+                mutation.attempt === prior.attempt &&
+                mutation.identity === policyPath(path),
+            ))) &&
       !allowed.has(policyPath(path)) &&
       !artifacts.has(path),
   );
-  const current = await hashes(s.cwd, candidates);
+  const current: Record<string, string> = {};
+  for (const path of candidates) {
+    try {
+      Object.assign(current, await hashes(s.cwd, [path]));
+    } catch {
+      // Non-regular files and unsafe path aliases remain ambiguous.
+    }
+  }
   const staged = new Set(
     (await git(s.cwd, ["diff", "--cached", "--name-only", "-z"]))
       .split("\0")
@@ -241,6 +266,8 @@ export async function classifyOrphanedImplementation(s: WorkflowState) {
       !baseline.has(policyPath(path)) &&
       prior.discardablePaths.includes(path) &&
       observed.has(policyPath(path)) &&
+      Object.hasOwn(current, path) &&
+      Object.hasOwn(prior.hashes, path) &&
       prior.hashes[path] === current[path] &&
       !staged.has(policyPath(path)) &&
       prior.createdPaths.includes(path) === untracked.has(path),
@@ -250,6 +277,22 @@ export async function classifyOrphanedImplementation(s: WorkflowState) {
     discardable,
     ambiguous: candidates.filter((path) => !safe.has(path)),
   };
+}
+export function classifyOrphanedImplementation(s: WorkflowState) {
+  return classifyAttributedImplementation(s, s.priorImplementation, "orphan");
+}
+export async function discardAttributedImplementation(
+  s: WorkflowState,
+  paths: string[],
+  evidence: DiscardEvidence,
+) {
+  for (const path of paths) {
+    assertRelative(path);
+    await assertWithin(s.cwd, path);
+    if (evidence.createdPaths.includes(path)) await unlink(join(s.cwd, path));
+    else
+      await git(s.cwd, ["restore", "--source=HEAD", "--worktree", "--", path]);
+  }
 }
 export function gitInspectTool(s: WorkflowState): ToolDefinition {
   return {

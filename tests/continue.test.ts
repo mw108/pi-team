@@ -532,7 +532,7 @@ test("interrupted mutating phase refuses continuation", async () => {
   state.blocker = "Interrupted mutating phase; inspect effects before recovery";
   await engine.store.save(state);
   const plan = await getWorkflowRecoveryPlan(state, cwd);
-  assert.equal(plan.kind, "unsafe");
+  assert.equal(plan.kind, "interrupted-mutation");
   await assert.rejects(
     engine.continueBlocked(state),
     /inspect repository changes/,
