@@ -314,7 +314,7 @@ function displayAgent(
       : undefined;
   const guardStatus =
     status === "running" && live
-      ? `  ↳ ${live.doomLoopInterventions ? `doom-loop interventions: ${live.doomLoopInterventions}/${state.config.agents[role].doomLoop?.maxInterventions ?? state.config.workflow.doomLoop.maxInterventions} · ` : ""}tool calls: ${live.toolCalls ?? 0}${(state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls) > 0 ? `/${state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls}` : ""}${live.toolsDisabledForFinalization ? " · tools: disabled for finalization" : ""}`
+      ? `  ↳ ${live.doomLoopInterventions ? `Doom Loop intervention ${live.doomLoopInterventions}/${state.config.agents[role].doomLoop?.maxInterventions ?? state.config.workflow.doomLoop.maxInterventions}${live.doomLoopReason ? ` · ${live.doomLoopReason}` : ""} · ` : ""}tool calls: ${live.toolCalls ?? 0}${(state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls) > 0 ? `/${state.config.agents[role].maxToolCalls ?? state.config.workflow.maxToolCalls}` : ""}${live.toolsDisabledForFinalization ? " · tools disabled for finalization" : ""}`
       : undefined;
   const persistedRetry = state.history.findLast(
     (entry) => entry.meta?.agent === role && entry.event === "agent_retry",

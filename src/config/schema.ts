@@ -66,6 +66,9 @@ const agent = z
         maxIdenticalCalls: z.number().int().min(2).max(100).optional(),
         maxRepeatedPattern: z.number().int().min(2).max(20).optional(),
         maxInterventions: z.number().int().min(1).max(10).optional(),
+        maxToolCallsPerResponse: z.number().int().min(0).optional(),
+        maxConsecutiveToolFailures: z.number().int().min(0).optional(),
+        maxNoProgressToolCalls: z.number().int().min(0).optional(),
         steerPrompt: z.string().trim().min(1).max(4000).optional(),
       })
       .strict()
@@ -149,6 +152,9 @@ export const configSchema = z
             maxIdenticalCalls: z.number().int().min(2).max(100).default(4),
             maxRepeatedPattern: z.number().int().min(2).max(20).default(3),
             maxInterventions: z.number().int().min(1).max(10).default(2),
+            maxToolCallsPerResponse: z.number().int().min(0).default(32),
+            maxConsecutiveToolFailures: z.number().int().min(0).default(8),
+            maxNoProgressToolCalls: z.number().int().min(0).default(100),
             steerPrompt: z.string().trim().min(1).max(4000).optional(),
           })
           .strict()

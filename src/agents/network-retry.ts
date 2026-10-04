@@ -56,7 +56,8 @@ export type ProviderRequestEvent = {
     | "provider_request_start"
     | "provider_request_end"
     | "provider_request_failure"
-    | "provider_progress";
+    | "provider_progress"
+    | "tool_call_burst_stream_cutoff";
   providerRequest: number;
   provider: string;
   model: string;
@@ -74,6 +75,9 @@ export type ProviderRequestEvent = {
   error?: ErrorDiagnostics;
   classification?: "network" | "provider" | "rate_limit" | "other";
   matchedRule?: string | null;
+  observed?: number;
+  limit?: number;
+  outcome?: "doom_loop_cutoff";
   providerTimeouts?: {
     requestTimeoutMs?: ResolvedRequestTimeout | number;
     maxRetries?: number;
@@ -216,6 +220,42 @@ function providerErrorEvent(
   return { type: "error", reason: error.stopReason, error };
 }
 
+function controlledCutoffMessage(model: Model<Api>): AssistantMessageEvent {
+  const message = {
+    role: "assistant" as const,
+    content: [
+      {
+        type: "text" as const,
+        text: "Host stopped an oversized tool-call response before completion. No tools from that response were executed.",
+      },
+    ],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop" as const,
+    timestamp: Date.now(),
+  };
+  return { type: "done", reason: "stop", message };
+}
+
+export interface StreamToolCallGuard {
+  limit: number;
+  isFinalizing(): boolean;
+  cutoff(
+    providerRequest: number,
+    observed: number,
+    limit: number,
+  ): Promise<void>;
+}
+
 /** One retry owner for model requests. Pi session retry stays disabled and provider retries are set to zero. */
 export function configureNetworkRetry(
   runtime: ModelRuntime,
@@ -236,6 +276,7 @@ export function configureNetworkRetry(
   observePreflight?: (event: ModelPreflightEvent) => void,
   observePreflightProgress?: (update: ModelPreflightUpdate) => void,
   requestTimeout?: ResolvedRequestTimeout,
+  streamGuard?: StreamToolCallGuard,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -340,12 +381,22 @@ export function configureNetworkRetry(
         let rawError: unknown;
         let firstEventAt: number | undefined;
         let lastActivityAt: number | undefined;
+        let responseToolCallCount = 0;
+        const responseToolCallIndices = new Set<number>();
+        let controlledCutoff = false;
+        const requestAbort = streamGuard ? new AbortController() : undefined;
+        const abortRequestFromParent = () =>
+          requestAbort?.abort(signal?.reason);
+        signal?.addEventListener("abort", abortRequestFromParent, {
+          once: true,
+        });
+        if (signal?.aborted) abortRequestFromParent();
         const requestOptions = {
           ...options,
           ...(requestTimeout
             ? { timeoutMs: piRequestTimeoutMs(requestTimeout) }
             : {}),
-          signal,
+          signal: requestAbort?.signal ?? signal,
           maxRetries: 0,
           onProviderStreamEvent: async (
             data: unknown,
@@ -401,6 +452,31 @@ export function configureNetworkRetry(
         let events: AssistantMessageEvent[] = [];
         try {
           for await (const event of original(model, context, requestOptions)) {
+            if (
+              event.type === "toolcall_start" &&
+              streamGuard &&
+              !signal?.aborted &&
+              (streamGuard.limit > 0 || streamGuard.isFinalizing())
+            ) {
+              if (!responseToolCallIndices.has(event.contentIndex)) {
+                responseToolCallIndices.add(event.contentIndex);
+                responseToolCallCount++;
+                const limit = streamGuard.limit;
+                if (
+                  streamGuard.isFinalizing() ||
+                  (limit > 0 && responseToolCallCount > limit)
+                ) {
+                  controlledCutoff = true;
+                  requestAbort?.abort("doom_loop_tool_call_burst");
+                  await streamGuard.cutoff(
+                    providerRequest,
+                    responseToolCallCount,
+                    limit,
+                  );
+                  break;
+                }
+              }
+            }
             const at = now();
             // Pi's "start" is emitted before an HTTP response. Terminal
             // "error"/"done" events are outcomes, not stream activity.
@@ -424,10 +500,17 @@ export function configureNetworkRetry(
             events.push(event);
           }
         } catch (error) {
-          rawError ??= error;
-          // A synchronous provider failure has no assistant event to forward.
-          events = [providerErrorEvent(model, String(error), signal?.aborted)];
+          if (!controlledCutoff) {
+            rawError ??= error;
+            // A synchronous provider failure has no assistant event to forward.
+            events = [
+              providerErrorEvent(model, String(error), signal?.aborted),
+            ];
+          }
         }
+        if (controlledCutoff && signal?.aborted)
+          events = [providerErrorEvent(model, "Request aborted", true)];
+        signal?.removeEventListener("abort", abortRequestFromParent);
         try {
           stopProgress();
         } catch {
@@ -450,6 +533,26 @@ export function configureNetworkRetry(
             ? {}
             : { timeSinceLastActivityMs: now() - lastActivityAt }),
         };
+        if (controlledCutoff && !signal?.aborted) {
+          observeRequest?.({
+            type: "tool_call_burst_stream_cutoff",
+            ...identity,
+            ...timing,
+            observed: responseToolCallCount,
+            limit: streamGuard!.limit,
+            outcome: "doom_loop_cutoff",
+          });
+          observeRequest?.({
+            type: "provider_request_end",
+            ...identity,
+            ...timing,
+            success: false,
+            outcome: "doom_loop_cutoff",
+          });
+          result.push(controlledCutoffMessage(model));
+          result.end();
+          return;
+        }
         const diagnosticError = failed
           ? serializeErrorDiagnostics(
               rawError ??

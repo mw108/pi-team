@@ -245,64 +245,74 @@ export class AgentLogStore {
                         ? "model preflight unsupported"
                         : event.type === "provider_request_failure"
                           ? `provider request ${event.providerRequest} failed after ${seconds(event.requestDurationMs)}`
-                          : event.type === "agent_steer_requested"
-                            ? "steering requested"
-                            : event.type === "agent_steer"
-                              ? "steering message queued"
-                              : event.type === "doom_loop_detected"
-                                ? `repeated tool pattern detected: ${event.tool}`
-                                : event.type === "doom_loop_steer"
-                                  ? `automatic steering ${event.intervention}`
-                                  : event.type === "doom_loop_finalization"
-                                    ? "loop persisted; tools disabled, final response requested"
-                                    : event.type === "tool_budget_finalization"
-                                      ? "tool budget reached; tools disabled, final response requested"
-                                      : event.type === "doom_loop_failed"
-                                        ? "final response invalid after repeated tool loop"
-                                        : event.type === "agent_aborted_by_user"
-                                          ? "aborted by user"
+                          : event.type === "tool_call_burst_stream_cutoff"
+                            ? `provider response stopped at tool call ${event.observed} (limit ${event.limit})`
+                            : event.type === "agent_steer_requested"
+                              ? "steering requested"
+                              : event.type === "agent_steer"
+                                ? "steering message queued"
+                                : event.type === "doom_loop_detected"
+                                  ? `Doom Loop detected: ${event.patternType}`
+                                  : event.type === "tool_call_burst_limited"
+                                    ? `tool-call burst limited to ${event.allowed}/${event.emitted}`
+                                    : event.type === "doom_loop_progress_reset"
+                                      ? `Doom Loop progress: ${event.reason}`
+                                      : event.type === "doom_loop_steer"
+                                        ? `automatic steering ${event.intervention}`
+                                        : event.type ===
+                                            "doom_loop_finalization"
+                                          ? "loop persisted; tools disabled, final response requested"
                                           : event.type ===
-                                              "agent_superseded_by_upstream_retry"
-                                            ? "stopped for upstream retry"
-                                            : event.type ===
-                                                "agent_retry_requested_by_user"
-                                              ? `manual retry → attempt ${event.nextAttempt}`
+                                              "tool_budget_finalization"
+                                            ? "tool budget reached; tools disabled, final response requested"
+                                            : event.type === "doom_loop_failed"
+                                              ? "final response invalid after repeated tool loop"
                                               : event.type ===
-                                                  "command_approval_requested"
-                                                ? `command approval requested · ${formatApprovedCommand(event) ?? event.commandId}`
+                                                  "agent_aborted_by_user"
+                                                ? "aborted by user"
                                                 : event.type ===
-                                                    "command_approval_decided"
-                                                  ? `command approval ${event.decision}`
-                                                  : event.type === "tool_start"
-                                                    ? event.tool ===
-                                                      "team_command"
-                                                      ? `team_command · ${formatApprovedCommand(event.summary) ?? event.activity}`
-                                                      : event.activity
+                                                    "agent_superseded_by_upstream_retry"
+                                                  ? "stopped for upstream retry"
+                                                  : event.type ===
+                                                      "agent_retry_requested_by_user"
+                                                    ? `manual retry → attempt ${event.nextAttempt}`
                                                     : event.type ===
-                                                        "network_error"
-                                                      ? "network connection lost"
+                                                        "command_approval_requested"
+                                                      ? `command approval requested · ${formatApprovedCommand(event) ?? event.commandId}`
                                                       : event.type ===
-                                                          "network_retry_scheduled"
-                                                        ? `network retry ${event.retry} scheduled`
+                                                          "command_approval_decided"
+                                                        ? `command approval ${event.decision}`
                                                         : event.type ===
-                                                            "network_retry_started"
-                                                          ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
+                                                            "tool_start"
+                                                          ? event.tool ===
+                                                            "team_command"
+                                                            ? `team_command · ${formatApprovedCommand(event.summary) ?? event.activity}`
+                                                            : event.activity
                                                           : event.type ===
-                                                              "network_recovered"
-                                                            ? "connection recovered"
+                                                              "network_error"
+                                                            ? "network connection lost"
                                                             : event.type ===
-                                                                "network_retries_exhausted"
-                                                              ? "network retries exhausted"
+                                                                "network_retry_scheduled"
+                                                              ? `network retry ${event.retry} scheduled`
                                                               : event.type ===
-                                                                  "provider_error"
-                                                                ? event.label
+                                                                  "network_retry_started"
+                                                                ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
                                                                 : event.type ===
-                                                                    "retry"
-                                                                  ? `retry → attempt ${event.nextAttempt}`
+                                                                    "network_recovered"
+                                                                  ? "connection recovered"
                                                                   : event.type ===
-                                                                      "agent_complete"
-                                                                    ? "completed"
-                                                                    : undefined;
+                                                                      "network_retries_exhausted"
+                                                                    ? "network retries exhausted"
+                                                                    : event.type ===
+                                                                        "provider_error"
+                                                                      ? event.label
+                                                                      : event.type ===
+                                                                          "retry"
+                                                                        ? `retry → attempt ${event.nextAttempt}`
+                                                                        : event.type ===
+                                                                            "agent_complete"
+                                                                          ? "completed"
+                                                                          : undefined;
       if (label) lines.push(`${time} ${label}`);
       if (event.type === "provider_request_failure") {
         lines.push(...errorLines(event.error));

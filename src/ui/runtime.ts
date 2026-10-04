@@ -30,6 +30,7 @@ export interface AgentProgress {
   manualRetry?: boolean;
   toolCalls?: number;
   doomLoopInterventions?: number;
+  doomLoopReason?: string;
   toolsDisabledForFinalization?: boolean;
   networkRetry?: {
     retry: number;
@@ -247,9 +248,17 @@ export class ProgressRuntime {
     else if (event.type === "steer" && existing)
       existing.controlActivity = "Steering message queued";
     else if (event.type === "guard" && existing) {
-      if (event.event.type === "doom_loop_steer") {
+      if (event.event.type === "doom_loop_detected") {
+        existing.doomLoopReason =
+          event.event.patternType === "tool_call_burst" &&
+          event.event.limit !== undefined
+            ? `tool-call burst >${event.event.limit}`
+            : `${event.event.repeatCount} ${event.event.patternType.replaceAll("_", " ")}`;
+      } else if (event.event.type === "tool_call_burst_limited") {
+        existing.doomLoopReason = `tool-call burst ${event.event.allowed}/${event.event.emitted} allowed`;
+      } else if (event.event.type === "doom_loop_steer") {
         existing.doomLoopInterventions = event.event.intervention;
-        existing.controlActivity = `Repeated tool pattern detected · steering ${event.event.intervention}/${event.event.maxInterventions}`;
+        existing.controlActivity = `Doom Loop intervention ${event.event.intervention}/${event.event.maxInterventions} · ${existing.doomLoopReason ?? "repeated tool use"}`;
       } else if (event.event.type === "doom_loop_finalization") {
         existing.toolsDisabledForFinalization = true;
         existing.controlActivity =

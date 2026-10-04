@@ -287,17 +287,17 @@ test("zero doom-loop interventions stay hidden while tool calls and finalization
   runtime.agents.solver1!.toolCalls = 12;
   let text = lines(s, runtime);
   assert.match(text, /tool calls: 12\/80/);
-  assert.doesNotMatch(text, /doom-loop interventions/);
+  assert.doesNotMatch(text, /Doom Loop intervention/);
   runtime.agents.solver1!.doomLoopInterventions = 1;
   runtime.agents.solver1!.toolCalls = 53;
   text = lines(s, runtime);
-  assert.match(text, /doom-loop interventions: 1\/2 · tool calls: 53\/80/);
+  assert.match(text, /Doom Loop intervention 1\/2 · tool calls: 53\/80/);
   runtime.agents.solver1!.toolsDisabledForFinalization = true;
-  assert.match(lines(s, runtime), /tools: disabled for finalization/);
+  assert.match(lines(s, runtime), /tools disabled for finalization/);
   runtime.agents.solver1!.doomLoopInterventions = 0;
   text = lines(s, runtime);
-  assert.doesNotMatch(text, /doom-loop interventions/);
-  assert.match(text, /tool calls: 53\/80 · tools: disabled for finalization/);
+  assert.doesNotMatch(text, /Doom Loop intervention/);
+  assert.match(text, /tool calls: 53\/80 · tools disabled for finalization/);
   runtime.dispose();
 });
 

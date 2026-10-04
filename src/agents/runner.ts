@@ -100,6 +100,47 @@ export function compactValidationEvidence(evidence: CommandEvidence[]) {
   }));
 }
 
+/** Pi's execution events cover calls rejected before the tool_call hook. */
+export function installToolExecutionAccounting(
+  pi: ExtensionAPI,
+  guardState: { entry: ActiveAgentSession; guard: ToolUseGuard } | undefined,
+  mutations?: FileMutationTracker,
+  activity?: ActivityObserver,
+) {
+  pi.on("tool_execution_start", async (event) => {
+    mutations?.start(event.toolCallId, event.toolName, event.args);
+    const invocation = toolInvocation(event.toolName, event.args);
+    await guardState?.guard.start(
+      event.toolCallId,
+      invocation.tool,
+      invocation.input,
+    );
+    if (guardState) guardState.entry.toolCalls = guardState.guard.toolCalls;
+    activity?.(
+      event.toolName,
+      event.toolCallId,
+      event.toolName === "mcp" ? invocation.tool : undefined,
+      undefined,
+      invocation.input,
+    );
+  });
+  pi.on("tool_execution_end", async (event) => {
+    await guardState?.guard.complete(
+      event.toolCallId,
+      !event.isError,
+      event.result,
+      event.isError,
+    );
+    if (guardState) {
+      guardState.entry.doomLoopInterventions = guardState.guard.interventions;
+      guardState.entry.toolsDisabledForFinalization =
+        guardState.guard.toolsDisabledForFinalization;
+    }
+    await mutations?.end(event.toolCallId, event.isError);
+    activity?.(undefined, event.toolCallId, undefined, !event.isError);
+  });
+}
+
 export interface AgentRunner {
   run(
     role: Role,
@@ -201,6 +242,14 @@ export class PiRunner implements AgentRunner {
       providerEvent,
       providerProgress,
       resolveRequestTimeout(config, role),
+      guardState
+        ? {
+            limit: guardState.guard.streamToolCallLimit,
+            isFinalizing: () => guardState.guard.toolsDisabledForFinalization,
+            cutoff: (providerRequest, observed, limit) =>
+              guardState.guard.streamCutoff(providerRequest, observed, limit),
+          }
+        : undefined,
     );
     const paths: string[] = [],
       factories: any[] = [];
@@ -232,6 +281,14 @@ export class PiRunner implements AgentRunner {
         ? new FileMutationTracker(s.cwd, mutationObserver)
         : undefined;
     const guard = (pi: ExtensionAPI) => {
+      pi.on("message_end", async (event) => {
+        if (!guardState || event.message.role !== "assistant") return;
+        const message = await guardState.guard.limitResponse(event.message);
+        guardState.entry.doomLoopInterventions = guardState.guard.interventions;
+        guardState.entry.toolsDisabledForFinalization =
+          guardState.guard.toolsDisabledForFinalization;
+        return message === event.message ? undefined : { message };
+      });
       pi.on("tool_call", async (event) => {
         const { tool, input } = toolInvocation(event.toolName, event.input);
         const guarded = await guardState?.guard.call(
@@ -270,26 +327,10 @@ export class PiRunner implements AgentRunner {
             },
           );
         } catch (e) {
-          guardState?.guard.discard(event.toolCallId);
           return { block: true, reason: String(e) };
         }
       });
-      pi.on("tool_execution_start", (event) => {
-        mutations?.start(event.toolCallId, event.toolName, event.args);
-        const invocation = toolInvocation(event.toolName, event.args);
-        activity?.(
-          event.toolName,
-          event.toolCallId,
-          event.toolName === "mcp" ? invocation.tool : undefined,
-          undefined,
-          invocation.input,
-        );
-      });
-      pi.on("tool_execution_end", async (event) => {
-        guardState?.guard.complete(event.toolCallId, !event.isError);
-        await mutations?.end(event.toolCallId, event.isError);
-        activity?.(undefined, event.toolCallId, undefined, !event.isError);
-      });
+      installToolExecutionAccounting(pi, guardState, mutations, activity);
       pi.on("tool_result", sanitizeToolResult);
     };
     const schema = zodToJsonSchema(
@@ -356,6 +397,9 @@ export class PiRunner implements AgentRunner {
             ],
     });
     await session.bindExtensions({ mode: "print" });
+    // Pi defaults to parallel batches; sequential execution lets a failed-call
+    // guard stop the remainder of a response before more tools run.
+    session.agent.toolExecution = "sequential";
     return session;
   }
   async run(
@@ -443,6 +487,8 @@ export class PiRunner implements AgentRunner {
           agentTimeoutTriggered: timedOut,
           doomLoop: {
             interventions: entry.doomLoopInterventions ?? 0,
+            consecutiveFailures: guard.consecutiveFailures,
+            noProgressToolCalls: guard.noProgressToolCalls,
             toolsDisabledForFinalization:
               entry.toolsDisabledForFinalization ?? false,
           },

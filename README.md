@@ -145,6 +145,9 @@ workflow:
     maxIdenticalCalls: 4
     maxRepeatedPattern: 3
     maxInterventions: 2
+    maxToolCallsPerResponse: 32
+    maxConsecutiveToolFailures: 8
+    maxNoProgressToolCalls: 100
     # steerPrompt: "Stop repeating tool calls and finalize."
 agents:
   researcher:
@@ -154,7 +157,9 @@ agents:
     # maxToolCalls: 150
 ```
 
-Each agent override inherits omitted fields from `workflow.doomLoop`. The window accepts 4–100 calls. The identical threshold and repeated-pattern threshold are at least 2; interventions are 1–10. `maxInterventions: 0` is invalid, so automatic steering cannot continue without a bound. The optional prompt changes only the steering text.
+Each agent override inherits omitted fields from `workflow.doomLoop`. Existing configurations receive the defaults above. The three new guards accept nonnegative integers; `0` disables each individual guard. The window accepts 4–100 calls. The identical threshold and repeated-pattern threshold are at least 2; interventions are 1–10. `maxInterventions: 0` is invalid, so automatic steering cannot continue without a bound. The optional prompt changes only the steering text.
+
+Every host tool attempt counts, including failed commands and invalid tool arguments. `maxToolCalls` is the absolute attempt budget; `maxToolCallsPerResponse` stops a provider response when its next `toolcall_start` exceeds the limit. The completed-response guard remains a fallback for adapters without incremental tool events. A single long tool argument counts once, regardless of its streaming chunks. `maxConsecutiveToolFailures` catches failing calls with different arguments, and `maxNoProgressToolCalls` catches repeated work without useful progress. Successful file mutations, successful commands, and the first successful observation of a new target reset no-progress accounting. Repeating the same read does not. These counters remain in host state across provider retries, compaction, and `/team-steer`; a fresh agent attempt starts new counters. After repeated interventions, tools are disabled and the agent must return a structured final result.
 
 For a repeated failing tool call, try `/team-steer solver1 Stop repeating failed reads and finalize.` If it remains stuck, use `/team-retry solver1` for a fresh conversation. Use `/team-abort solver1` when no replacement is wanted.
 

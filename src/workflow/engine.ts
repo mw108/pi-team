@@ -914,18 +914,24 @@ export class WorkflowEngine {
               logged?.logger.append({
                 ...event,
                 ...(event.type === "doom_loop_detected"
-                  ? { tool: safeTool }
+                  ? { tool: safeTool, reason: event.patternType }
                   : {}),
+                agent: role,
+                attempt: attemptNumber,
                 agentAttempt: attemptNumber,
               });
               const label =
                 event.type === "doom_loop_detected"
-                  ? `${role} repeated ${safeTool} tool pattern detected`
-                  : event.type === "doom_loop_steer"
-                    ? `${role} automatic steering ${event.intervention}/${event.maxInterventions}`
-                    : event.type === "doom_loop_finalization"
-                      ? `${role} tool loop persisted; finalizing without tools`
-                      : `${role} tool budget exhausted; finalizing without tools`;
+                  ? `${role} Doom Loop: ${event.patternType} (${event.repeatCount})`
+                  : event.type === "tool_call_burst_limited"
+                    ? `${role} tool-call burst limited to ${event.allowed}/${event.emitted}`
+                    : event.type === "doom_loop_progress_reset"
+                      ? `${role} Doom Loop progress: ${event.reason}`
+                      : event.type === "doom_loop_steer"
+                        ? `${role} automatic steering ${event.intervention}/${event.maxInterventions}`
+                        : event.type === "doom_loop_finalization"
+                          ? `${role} tool loop persisted; finalizing without tools`
+                          : `${role} tool budget exhausted; finalizing without tools`;
               networkHistoryWrites.push(
                 this.persistAttempt(authoritative, event.type, label, {
                   agent: role,

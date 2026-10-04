@@ -13,6 +13,8 @@ You may not use additional tools. Using only the information already available i
 export const TOOL_BUDGET_FINALIZE = `You have reached the tool-call budget.
 
 Do not call any more tools. Use the information already collected and produce your required final structured result now.`;
+export const TOOL_BURST_STEER = `Too many tool calls were emitted in one response. Remaining calls were not executed. Reassess the task and make a small number of targeted calls.`;
+export const TOOL_BURST_STREAM_STEER = `Your previous response emitted too many tool calls and was stopped before completion. No calls from that response were executed. Do not retry the batch. Reassess the task, summarize the intended action, and make only a small number of targeted calls.`;
 
 export function resolveDoomLoop(config: TeamConfig, role: Role) {
   return {
@@ -146,11 +148,23 @@ export interface LoopPattern {
 export type GuardEvent =
   | {
       type: "doom_loop_detected";
-      patternType: LoopPattern["patternType"];
+      patternType:
+        | LoopPattern["patternType"]
+        | "tool_call_burst"
+        | "consecutive_tool_failures"
+        | "no_progress_tool_calls";
       tool: string;
       repeatCount: number;
       progressEpoch: number;
+      limit?: number;
     }
+  | {
+      type: "tool_call_burst_limited";
+      emitted: number;
+      allowed: number;
+      discarded: number;
+    }
+  | { type: "doom_loop_progress_reset"; reason: string }
   | { type: "doom_loop_steer"; intervention: number; maxInterventions: number }
   | { type: "doom_loop_finalization" | "tool_budget_finalization" };
 
@@ -266,6 +280,19 @@ export class ToolUseGuard {
     string,
     { tool: string; signature: string }
   >();
+  private readonly pendingCalls = new Map<
+    string,
+    { tool: string; input: unknown; observed: boolean }
+  >();
+  private readonly seenCallIds = new Set<string>();
+  private readonly blockedByGuard = new Set<string>();
+  private readonly observedTargets = new Set<string>();
+  private responseBlocked = false;
+  private responseActive = false;
+  private lastStreamCutoffRequest?: number;
+  private streamCutoffPending = false;
+  consecutiveFailures = 0;
+  noProgressToolCalls = 0;
   toolCalls = 0;
   interventions = 0;
   toolsDisabledForFinalization = false;
@@ -285,11 +312,264 @@ export class ToolUseGuard {
     this.detector.clear();
     this.pendingMutations.clear();
   }
-  complete(toolCallId: string, success: boolean) {
+  get streamToolCallLimit() {
+    return this.config.enabled ? this.config.maxToolCallsPerResponse : 0;
+  }
+  async streamCutoff(providerRequest: number, observed: number, limit: number) {
+    if (this.lastStreamCutoffRequest === providerRequest) return;
+    this.lastStreamCutoffRequest = providerRequest;
+    this.streamCutoffPending = true;
+    if (!this.toolsDisabledForFinalization && limit > 0)
+      await this.detect(
+        "tool_call_burst",
+        "provider_response",
+        observed,
+        false,
+        0,
+        true,
+        limit,
+      );
+  }
+  /** Pi emits this for every call, including invalid arguments and failed commands. */
+  async start(toolCallId: string, tool: string, input: unknown) {
+    if (this.seenCallIds.has(toolCallId)) return;
+    this.seenCallIds.add(toolCallId);
+    this.pendingCalls.set(toolCallId, { tool, input, observed: true });
+    this.toolCalls++;
+    if (this.maxToolCalls > 0 && this.toolCalls > this.maxToolCalls) {
+      this.blockedByGuard.add(toolCallId);
+      await this.finalizeBudget();
+      return;
+    }
+    if (!this.responseBlocked && !this.toolsDisabledForFinalization) {
+      const loop = this.detector.observe(tool, input);
+      if (loop)
+        await this.detect(
+          loop.patternType,
+          loop.tool,
+          loop.repeatCount,
+          true,
+          loop.progressEpoch,
+        );
+    }
+  }
+  private progress(reason: string) {
+    this.consecutiveFailures = 0;
+    this.noProgressToolCalls = 0;
+    if (reason === "file_mutation")
+      this.event?.({ type: "doom_loop_progress_reset", reason });
+  }
+  private async finalizeBudget() {
+    if (this.toolsDisabledForFinalization) return;
+    this.finalizationReason = "tool_budget";
+    this.toolsDisabledForFinalization = true;
+    this.event?.({ type: "tool_budget_finalization" });
+    await this.session().steer(TOOL_BUDGET_FINALIZE);
+    this.session().setActiveToolsByName([]);
+  }
+  private async detect(
+    reason:
+      | "tool_call_burst"
+      | "consecutive_tool_failures"
+      | "no_progress_tool_calls"
+      | LoopPattern["patternType"],
+    tool: string,
+    count: number,
+    blockResponse = true,
+    progressEpoch = 0,
+    streaming = false,
+    limit?: number,
+  ) {
+    if (!this.config.enabled || this.toolsDisabledForFinalization) return;
+    this.event?.({
+      type: "doom_loop_detected",
+      patternType: reason,
+      tool,
+      repeatCount: count,
+      progressEpoch,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    this.detector.clear();
+    this.consecutiveFailures = 0;
+    this.noProgressToolCalls = 0;
+    if (blockResponse && this.responseActive) this.responseBlocked = true;
+    if (this.interventions < this.config.maxInterventions) {
+      this.interventions++;
+      this.event?.({
+        type: "doom_loop_steer",
+        intervention: this.interventions,
+        maxInterventions: this.config.maxInterventions,
+      });
+      await this.session().steer(
+        reason === "tool_call_burst"
+          ? streaming
+            ? TOOL_BURST_STREAM_STEER
+            : TOOL_BURST_STEER
+          : this.config.steerPrompt,
+      );
+    } else {
+      this.finalizationReason = "doom_loop";
+      this.toolsDisabledForFinalization = true;
+      this.event?.({ type: "doom_loop_finalization" });
+      await this.session().steer(DOOM_LOOP_FINALIZE);
+      this.session().setActiveToolsByName([]);
+    }
+  }
+  /** Runs at Pi's completed assistant-message barrier, before tool execution. */
+  async limitResponse<T extends { role: string; content?: unknown[] }>(
+    message: T,
+  ): Promise<T> {
+    if (message.role !== "assistant") return message;
+    this.responseActive = true;
+    this.responseBlocked = false;
+    if (this.streamCutoffPending) {
+      this.streamCutoffPending = false;
+      return {
+        ...message,
+        content: message.content?.filter(
+          (item) =>
+            !item ||
+            typeof item !== "object" ||
+            (item as { type?: string }).type !== "toolCall",
+        ),
+      };
+    }
+    if (this.toolsDisabledForFinalization)
+      return {
+        ...message,
+        content: message.content?.filter(
+          (item) =>
+            !item ||
+            typeof item !== "object" ||
+            (item as { type?: string }).type !== "toolCall",
+        ),
+      };
+    const calls =
+      message.content?.filter(
+        (item) =>
+          !!item &&
+          typeof item === "object" &&
+          (item as { type?: string }).type === "toolCall",
+      ) ?? [];
+    const limit = this.config.enabled ? this.config.maxToolCallsPerResponse : 0;
+    if (!limit || calls.length <= limit) return message;
+    let retained = 0;
+    const content = message.content!.filter((item) => {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        (item as { type?: string }).type !== "toolCall"
+      )
+        return true;
+      return ++retained <= limit;
+    });
+    await this.detect(
+      "tool_call_burst",
+      "provider_response",
+      calls.length,
+      false,
+      0,
+      false,
+      limit,
+    );
+    this.event?.({
+      type: "tool_call_burst_limited",
+      emitted: calls.length,
+      allowed: this.toolsDisabledForFinalization ? 0 : limit,
+      discarded: calls.length - (this.toolsDisabledForFinalization ? 0 : limit),
+    });
+    return {
+      ...message,
+      content: this.toolsDisabledForFinalization
+        ? content.filter(
+            (item) =>
+              !item ||
+              typeof item !== "object" ||
+              (item as { type?: string }).type !== "toolCall",
+          )
+        : content,
+    };
+  }
+  async complete(
+    toolCallId: string,
+    success: boolean,
+    result?: unknown,
+    isError = !success,
+  ) {
+    const invocation = this.pendingCalls.get(toolCallId);
+    this.pendingCalls.delete(toolCallId);
+    if (this.blockedByGuard.delete(toolCallId)) return;
     const pending = this.pendingMutations.get(toolCallId);
-    if (!pending) return;
     this.pendingMutations.delete(toolCallId);
-    this.detector.completeMutation(pending.tool, pending.signature, success);
+    if (!invocation && !pending) return;
+    const tool = invocation?.tool ?? pending!.tool;
+    const details =
+      result && typeof result === "object"
+        ? (result as { details?: unknown }).details
+        : undefined;
+    const command =
+      tool === "team_command" && details && typeof details === "object"
+        ? (details as { exitCode?: number; code?: string; status?: string })
+        : undefined;
+    const approvalDenied =
+      command?.code === "COMMAND_APPROVAL_DENIED" ||
+      command?.code === "COMMAND_APPROVAL_PENDING";
+    const worked =
+      success &&
+      !isError &&
+      (command?.exitCode === undefined || command.exitCode === 0) &&
+      !approvalDenied;
+    if (pending)
+      this.detector.completeMutation(pending.tool, pending.signature, worked);
+    if (!this.config.enabled) return;
+    this.noProgressToolCalls++;
+    if (!worked) {
+      if (!approvalDenied) this.consecutiveFailures++;
+    } else {
+      const behavior = toolBehavior(tool);
+      if (
+        behavior === "mutating" &&
+        pending &&
+        !this.observedTargets.has(pending.signature)
+      ) {
+        this.observedTargets.add(pending.signature);
+        this.progress("file_mutation");
+      } else if (behavior === "validation") {
+        this.progress("successful_command");
+      } else if (behavior === "observational" && invocation) {
+        const args =
+          invocation.input && typeof invocation.input === "object"
+            ? (invocation.input as Record<string, unknown>)
+            : {};
+        const path = args.path ?? args.relative_path ?? args.file_path;
+        const target =
+          typeof path === "string"
+            ? `${tool}:${path}`
+            : toolSignature(tool, invocation.input);
+        if (!this.observedTargets.has(target)) {
+          this.observedTargets.add(target);
+          this.progress("new_observation");
+        }
+      }
+    }
+    if (
+      this.config.maxConsecutiveToolFailures > 0 &&
+      this.consecutiveFailures >= this.config.maxConsecutiveToolFailures
+    )
+      await this.detect(
+        "consecutive_tool_failures",
+        tool,
+        this.consecutiveFailures,
+      );
+    else if (
+      this.config.maxNoProgressToolCalls > 0 &&
+      this.noProgressToolCalls >= this.config.maxNoProgressToolCalls
+    )
+      await this.detect(
+        "no_progress_tool_calls",
+        tool,
+        this.noProgressToolCalls,
+      );
   }
   discard(toolCallId: string) {
     this.pendingMutations.delete(toolCallId);
@@ -300,26 +580,41 @@ export class ToolUseGuard {
     aborted = false,
     toolCallId?: string,
   ) {
-    this.toolCalls++;
-    if (aborted || this.toolsDisabledForFinalization)
+    if (!toolCallId || !this.pendingCalls.has(toolCallId)) {
+      if (toolCallId) await this.start(toolCallId, tool, input);
+      else this.toolCalls++;
+    } else {
+      const pending = this.pendingCalls.get(toolCallId)!;
+      this.pendingCalls.set(toolCallId, { ...pending, tool, input });
+    }
+    if (aborted || this.toolsDisabledForFinalization) {
+      if (toolCallId) this.blockedByGuard.add(toolCallId);
       return {
         block: true,
         reason:
           "Tools disabled for finalization; produce your final structured result now",
       };
+    }
+    if (this.responseBlocked) {
+      if (toolCallId) this.blockedByGuard.add(toolCallId);
+      return {
+        block: true,
+        reason:
+          "Doom Loop intervention: remaining calls in this response were not executed",
+      };
+    }
     if (this.maxToolCalls > 0 && this.toolCalls > this.maxToolCalls) {
-      this.finalizationReason = "tool_budget";
-      this.toolsDisabledForFinalization = true;
-      this.event?.({ type: "tool_budget_finalization" });
-      // AgentSession.steer() queues a role=user message.
-      await this.session().steer(TOOL_BUDGET_FINALIZE);
-      this.session().setActiveToolsByName([]);
+      await this.finalizeBudget();
+      if (toolCallId) this.blockedByGuard.add(toolCallId);
       return {
         block: true,
         reason: "Agent tool-call limit reached; final response requested",
       };
     }
-    const loop = this.detector.observe(tool, input);
+    const loop =
+      toolCallId && this.pendingCalls.get(toolCallId)?.observed
+        ? undefined
+        : this.detector.observe(tool, input);
     if (!loop) {
       if (toolCallId && toolBehavior(tool) === "mutating")
         this.pendingMutations.set(toolCallId, {
@@ -328,32 +623,25 @@ export class ToolUseGuard {
         });
       return;
     }
-    this.event?.({ type: "doom_loop_detected", ...loop });
-    this.resetHistory();
-    if (this.interventions < this.config.maxInterventions) {
-      this.interventions++;
-      this.event?.({
-        type: "doom_loop_steer",
-        intervention: this.interventions,
-        maxInterventions: this.config.maxInterventions,
-      });
-      await this.session().steer(this.config.steerPrompt);
-      if (toolCallId && toolBehavior(tool) === "mutating")
-        this.pendingMutations.set(toolCallId, {
-          tool,
-          signature: toolSignature(tool, input),
-        });
-    } else {
-      this.finalizationReason = "doom_loop";
-      this.toolsDisabledForFinalization = true;
-      this.event?.({ type: "doom_loop_finalization" });
-      await this.session().steer(DOOM_LOOP_FINALIZE);
-      this.session().setActiveToolsByName([]);
+    await this.detect(
+      loop.patternType,
+      loop.tool,
+      loop.repeatCount,
+      true,
+      loop.progressEpoch,
+    );
+    if (this.toolsDisabledForFinalization) {
+      if (toolCallId) this.blockedByGuard.add(toolCallId);
       return {
         block: true,
         reason:
           "Tools disabled for finalization; produce your final structured result now",
       };
     }
+    if (toolCallId && toolBehavior(tool) === "mutating")
+      this.pendingMutations.set(toolCallId, {
+        tool,
+        signature: toolSignature(tool, input),
+      });
   }
 }

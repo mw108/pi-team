@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
+import {
+  createAssistantMessageEventStream,
+  type Api,
+  type Model,
+  type AssistantMessage,
+} from "@earendil-works/pi-ai";
 import { config } from "./helpers.ts";
 import { repository, output } from "./helpers.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
-import { PiRunner } from "../src/agents/runner.ts";
+import {
+  PiRunner,
+  installToolExecutionAccounting,
+} from "../src/agents/runner.ts";
+import {
+  configureNetworkRetry,
+  type ProviderRequestEvent,
+  type NetworkRetryEvent,
+} from "../src/agents/network-retry.ts";
 import { AgentDoomLoopError } from "../src/agents/errors.ts";
 import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { ProgressRuntime } from "../src/ui/runtime.ts";
@@ -22,6 +40,31 @@ import {
 
 const options = () => resolveDoomLoop(config(), "researcher");
 const call = (path: string, offset = 0) => ({ path, offset, limit: 200 });
+
+const streamModel = {
+  api: "openai-completions",
+  provider: "fixture",
+  id: "fixture",
+} as Model<Api>;
+function streamMessage(): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [],
+    api: streamModel.api,
+    provider: streamModel.provider,
+    model: streamModel.id,
+    stopReason: "stop",
+    timestamp: 0,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  };
+}
 
 test("tool signatures order keys, ignore transient metadata, and preserve meaningful ranges", () => {
   assert.equal(
@@ -122,7 +165,7 @@ function guardHarness() {
   async function step(tool: string, input: unknown, success = true) {
     const id = String(++nextId);
     await guard.call(tool, input, false, id);
-    guard.complete(id, success);
+    await guard.complete(id, success);
   }
   const detections = () =>
     events.filter((event) => event.type === "doom_loop_detected");
@@ -457,6 +500,541 @@ test("tool budget schema accepts zero and positive integers only", () => {
   }
 });
 
+test("new Doom Loop guards inherit defaults and accept zero overrides", () => {
+  const cfg = config();
+  assert.equal(cfg.workflow.doomLoop.maxToolCallsPerResponse, 32);
+  assert.equal(cfg.workflow.doomLoop.maxConsecutiveToolFailures, 8);
+  assert.equal(cfg.workflow.doomLoop.maxNoProgressToolCalls, 100);
+  cfg.agents.researcher.doomLoop = {
+    maxToolCallsPerResponse: 0,
+    maxConsecutiveToolFailures: 0,
+    maxNoProgressToolCalls: 0,
+  };
+  const resolved = resolveDoomLoop(configSchema.parse(cfg), "researcher");
+  assert.equal(resolved.maxToolCallsPerResponse, 0);
+  assert.equal(resolved.maxConsecutiveToolFailures, 0);
+  assert.equal(resolved.maxNoProgressToolCalls, 0);
+  for (const field of [
+    "maxToolCallsPerResponse",
+    "maxConsecutiveToolFailures",
+    "maxNoProgressToolCalls",
+  ] as const) {
+    cfg.agents.researcher.doomLoop[field] = -1;
+    assert.equal(configSchema.safeParse(cfg).success, false);
+    cfg.agents.researcher.doomLoop[field] = 0;
+  }
+});
+
+test("failed host tool attempts count even when argument validation skips tool_call", async () => {
+  const events: GuardEvent[] = [];
+  const messages: string[] = [];
+  const guard = new ToolUseGuard(
+    { ...options(), maxIdenticalCalls: 100, maxConsecutiveToolFailures: 8 },
+    0,
+    () => ({
+      async steer(message: string) {
+        messages.push(message);
+      },
+      setActiveToolsByName(_names: string[]) {},
+    }),
+    (event) => events.push(event),
+  );
+  for (let i = 0; i < 8; i++) {
+    const id = `invalid-${i}`;
+    await guard.start(id, "team_command", {
+      executable: `missing-${i}`,
+      args: [],
+    });
+    await guard.complete(id, false, undefined, true);
+  }
+  assert.equal(guard.toolCalls, 8);
+  assert.equal(guard.interventions, 1);
+  assert.equal(messages.length, 1);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "doom_loop_detected" &&
+        event.patternType === "consecutive_tool_failures",
+    ),
+  );
+});
+
+test("absolute tool budget also catches invalid-argument host attempts", async () => {
+  const messages: string[] = [];
+  const guard = new ToolUseGuard(options(), 2, () => ({
+    async steer(message: string) {
+      messages.push(message);
+    },
+    setActiveToolsByName(_names: string[]) {},
+  }));
+  for (let i = 0; i < 3; i++) {
+    await guard.start(`bad-${i}`, "team_command", { id: i });
+    await guard.complete(`bad-${i}`, false);
+  }
+  assert.equal(guard.toolCalls, 3);
+  assert.equal(guard.finalizationReason, "tool_budget");
+  assert.equal(messages.length, 1);
+});
+
+test("one 1000-call provider response retains only the first 32 calls", async () => {
+  const events: GuardEvent[] = [];
+  const messages: string[] = [];
+  const guard = new ToolUseGuard(
+    {
+      ...options(),
+      maxIdenticalCalls: 100,
+      maxConsecutiveToolFailures: 0,
+      maxNoProgressToolCalls: 0,
+    },
+    0,
+    () => ({
+      async steer(message: string) {
+        messages.push(message);
+      },
+      setActiveToolsByName(_names: string[]) {},
+    }),
+    (event) => events.push(event),
+  );
+  const response = {
+    role: "assistant",
+    content: Array.from({ length: 1000 }, (_, i) => ({
+      type: "toolCall",
+      id: `${i}`,
+      name: "team_command",
+      arguments: { id: `${i}` },
+    })),
+  };
+  const limited = await guard.limitResponse(response);
+  assert.equal(limited.content.length, 32);
+  for (const item of limited.content) {
+    await guard.start(item.id, item.name, item.arguments);
+    assert.equal(
+      await guard.call(item.name, item.arguments, false, item.id),
+      undefined,
+    );
+    await guard.complete(item.id, true, { details: { exitCode: 0 } }, false);
+  }
+  assert.equal(guard.toolCalls, 32);
+  assert.equal(guard.interventions, 1);
+  assert.match(messages[0]!, /Remaining calls were not executed/);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "tool_call_burst_limited" && event.discarded === 968,
+    ),
+  );
+});
+
+test("provider stream stops at toolcall_start 33 and recovers without network retry", async () => {
+  const source = createAssistantMessageEventStream();
+  let requestSignal: AbortSignal | undefined;
+  const runtime = {
+    streamSimple(
+      _model: unknown,
+      _context: unknown,
+      requestOptions: { signal: AbortSignal },
+    ) {
+      requestSignal = requestOptions.signal;
+      return source;
+    },
+  } as unknown as ModelRuntime;
+  const providerEvents: ProviderRequestEvent[] = [];
+  const networkEvents: NetworkRetryEvent[] = [];
+  const steers: string[] = [];
+  const guard = new ToolUseGuard(options(), 0, () => ({
+    async steer(message: string) {
+      steers.push(message);
+    },
+    setActiveToolsByName(_names: string[]) {},
+  }));
+  configureNetworkRetry(
+    runtime,
+    { maxRetries: 3, delayMs: 1 },
+    () => undefined,
+    (event) => networkEvents.push(event),
+    (event) => providerEvents.push(event),
+    Date.now,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      limit: guard.streamToolCallLimit,
+      isFinalizing: () => guard.toolsDisabledForFinalization,
+      cutoff: (providerRequest, observed, limit) =>
+        guard.streamCutoff(providerRequest, observed, limit),
+    },
+  );
+  const final = runtime.streamSimple(streamModel, { messages: [] }).result();
+  const partial = streamMessage();
+  source.push({ type: "start", partial });
+  for (let i = 1; i <= 33; i++) {
+    partial.content.push({
+      type: "toolCall",
+      id: `call-${i}`,
+      name: "team_command",
+      arguments: { id: `command-${i}` },
+    });
+    source.push({ type: "toolcall_start", contentIndex: i - 1, partial });
+    if (i === 1)
+      source.push({ type: "toolcall_start", contentIndex: 0, partial });
+  }
+  const message = await final;
+  assert.equal(requestSignal?.aborted, true);
+  assert.equal(message.stopReason, "stop");
+  assert.equal(
+    message.content.filter((item) => item.type === "toolCall").length,
+    0,
+  );
+  assert.equal(guard.interventions, 1);
+  assert.equal(guard.toolCalls, 0);
+  assert.match(steers[0]!, /stopped before completion/);
+  assert.equal(
+    (await guard.limitResponse(message)).content?.length,
+    message.content.length,
+  );
+  assert.equal(guard.interventions, 1);
+  assert.deepEqual(networkEvents, []);
+  assert.equal(
+    providerEvents.filter(
+      (event) => event.type === "tool_call_burst_stream_cutoff",
+    ).length,
+    1,
+  );
+  assert.equal(
+    providerEvents.find(
+      (event) => event.type === "tool_call_burst_stream_cutoff",
+    )?.observed,
+    33,
+  );
+  assert.equal(
+    providerEvents.some((event) => event.type === "provider_request_failure"),
+    false,
+  );
+  assert.equal(
+    providerEvents.find((event) => event.type === "provider_request_end")
+      ?.outcome,
+    "doom_loop_cutoff",
+  );
+});
+
+test("stream burst guard counts starts only and zero disables it", async () => {
+  for (const limit of [32, 0]) {
+    const source = createAssistantMessageEventStream();
+    const runtime = { streamSimple: () => source } as unknown as ModelRuntime;
+    let cutoffs = 0;
+    configureNetworkRetry(
+      runtime,
+      { maxRetries: 1, delayMs: 1 },
+      () => undefined,
+      undefined,
+      undefined,
+      Date.now,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        limit,
+        isFinalizing: () => false,
+        async cutoff() {
+          cutoffs++;
+        },
+      },
+    );
+    const final = runtime.streamSimple(streamModel, { messages: [] }).result();
+    const partial = streamMessage();
+    source.push({ type: "start", partial });
+    partial.content.push({
+      type: "toolCall",
+      id: "one",
+      name: "write",
+      arguments: {},
+    });
+    source.push({ type: "toolcall_start", contentIndex: 0, partial });
+    source.push({ type: "toolcall_start", contentIndex: 0, partial });
+    for (let i = 0; i < 1000; i++)
+      source.push({
+        type: "toolcall_delta",
+        contentIndex: 0,
+        delta: "x",
+        partial,
+      });
+    if (limit === 0)
+      for (let i = 1; i < 40; i++) {
+        partial.content.push({
+          type: "toolCall",
+          id: `${i}`,
+          name: "read",
+          arguments: { path: `${i}.ts` },
+        });
+        source.push({ type: "toolcall_start", contentIndex: i, partial });
+      }
+    assert.equal(cutoffs, 0);
+    source.push({ type: "done", reason: "stop", message: partial });
+    source.end();
+    await final;
+    assert.equal(cutoffs, 0);
+    if (limit === 0) assert.equal(partial.content.length, 40);
+  }
+});
+
+test("finalization mode cuts off the first streamed tool call without another intervention", async () => {
+  const guard = new ToolUseGuard(options(), 0, () => ({
+    async steer(_message: string) {},
+    setActiveToolsByName(_names: string[]) {},
+  }));
+  await guard.streamCutoff(1, 33, 32);
+  await guard.streamCutoff(2, 33, 32);
+  await guard.streamCutoff(3, 33, 32);
+  assert.equal(guard.toolsDisabledForFinalization, true);
+  const source = createAssistantMessageEventStream();
+  const runtime = { streamSimple: () => source } as unknown as ModelRuntime;
+  configureNetworkRetry(
+    runtime,
+    { maxRetries: 1, delayMs: 1 },
+    () => undefined,
+    undefined,
+    undefined,
+    Date.now,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      limit: guard.streamToolCallLimit,
+      isFinalizing: () => guard.toolsDisabledForFinalization,
+      cutoff: (providerRequest, observed, limit) =>
+        guard.streamCutoff(providerRequest + 3, observed, limit),
+    },
+  );
+  const final = runtime.streamSimple(streamModel, { messages: [] }).result();
+  const partial = streamMessage();
+  source.push({ type: "start", partial });
+  partial.content.push({
+    type: "toolCall",
+    id: "again",
+    name: "team_command",
+    arguments: {},
+  });
+  source.push({ type: "toolcall_start", contentIndex: 0, partial });
+  const message = await final;
+  assert.equal(
+    message.content.some((item) => item.type === "toolCall"),
+    false,
+  );
+  assert.equal(guard.interventions, 2);
+});
+
+test("runner execution hooks count failed invalid arguments once by call ID", async () => {
+  const handlers = new Map<string, (event: any) => Promise<void>>();
+  const pi = {
+    on(type: string, handler: (event: any) => Promise<void>) {
+      handlers.set(type, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const guard = new ToolUseGuard(options(), 0, () => ({
+    async steer(_message: string) {},
+    setActiveToolsByName(_names: string[]) {},
+  }));
+  const entry = {
+    toolCalls: 0,
+    doomLoopInterventions: 0,
+    toolsDisabledForFinalization: false,
+  } as any;
+  installToolExecutionAccounting(pi, { entry, guard });
+  const start = {
+    toolCallId: "call-1",
+    toolName: "team_command",
+    args: { id: 123 },
+  };
+  await handlers.get("tool_execution_start")!(start);
+  await handlers.get("tool_execution_start")!(start);
+  await handlers.get("tool_execution_end")!({
+    toolCallId: "call-1",
+    toolName: "team_command",
+    result: { content: [] },
+    isError: true,
+  });
+  await handlers.get("tool_execution_end")!({
+    toolCallId: "call-1",
+    toolName: "team_command",
+    result: { content: [] },
+    isError: true,
+  });
+  assert.equal(entry.toolCalls, 1);
+  assert.equal(guard.toolCalls, 1);
+  assert.equal(guard.consecutiveFailures, 1);
+  assert.equal(guard.noProgressToolCalls, 1);
+});
+
+test("varying observational calls hit watchdog and mutation resets it", async () => {
+  const events: GuardEvent[] = [];
+  const guard = new ToolUseGuard(
+    { ...options(), maxIdenticalCalls: 100, maxNoProgressToolCalls: 10 },
+    0,
+    () => ({
+      async steer(_message: string) {},
+      setActiveToolsByName(_names: string[]) {},
+    }),
+    (event) => events.push(event),
+  );
+  for (let i = 0; i < 9; i++) {
+    const id = `${i}`;
+    await guard.call("read", { path: "same.ts", offset: i }, false, id);
+    await guard.complete(id, true);
+  }
+  assert.equal(guard.noProgressToolCalls, 8);
+  await guard.call(
+    "edit",
+    { path: "same.ts", oldText: "a", newText: "b" },
+    false,
+    "edit",
+  );
+  await guard.complete("edit", true);
+  assert.equal(guard.noProgressToolCalls, 0);
+  for (let i = 0; i < 10; i++) {
+    const id = `later-${i}`;
+    await guard.call("read", { path: "same.ts", offset: 100 + i }, false, id);
+    await guard.complete(id, true);
+  }
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "doom_loop_detected" &&
+        event.patternType === "no_progress_tool_calls",
+    ),
+  );
+});
+
+test("successful commands and distinct file mutations reset failure state", async () => {
+  const guard = new ToolUseGuard(
+    { ...options(), maxIdenticalCalls: 100 },
+    0,
+    () => ({
+      async steer(_message: string) {},
+      setActiveToolsByName(_names: string[]) {},
+    }),
+  );
+  const fail = async (id: string) => {
+    await guard.call("team_command", { id }, false, id);
+    await guard.complete(id, true, { details: { exitCode: 1 } }, false);
+  };
+  await fail("fail-1");
+  assert.equal(guard.consecutiveFailures, 1);
+  await guard.call("team_command", { id: "pass" }, false, "pass");
+  await guard.complete("pass", true, { details: { exitCode: 0 } }, false);
+  assert.equal(guard.consecutiveFailures, 0);
+  for (const tool of ["write", "edit", "team_delete"]) {
+    await fail(`fail-${tool}`);
+    await guard.call(tool, { path: `${tool}.ts`, content: tool }, false, tool);
+    await guard.complete(tool, true);
+    assert.equal(guard.consecutiveFailures, 0);
+    assert.equal(guard.noProgressToolCalls, 0);
+  }
+  await guard.call("team_command", { id: "approval" }, false, "approval");
+  await guard.complete(
+    "approval",
+    true,
+    { details: { code: "COMMAND_APPROVAL_DENIED" } },
+    false,
+  );
+  assert.equal(guard.consecutiveFailures, 0);
+  assert.equal(guard.noProgressToolCalls, 1);
+});
+
+test("network retry and manual steering leave attempt failure counts intact", async () => {
+  const guard = new ToolUseGuard(
+    { ...options(), maxIdenticalCalls: 100, maxConsecutiveToolFailures: 8 },
+    0,
+    () => ({
+      async steer(_message: string) {},
+      setActiveToolsByName(_names: string[]) {},
+    }),
+  );
+  for (let i = 0; i < 5; i++) {
+    const id = `before-${i}`;
+    await guard.start(id, "team_command", { id });
+    await guard.complete(id, false);
+  }
+  guard.resetHistory(); // /team-steer resets signatures, not host failure state.
+  for (let i = 0; i < 3; i++) {
+    const id = `after-retry-${i}`;
+    await guard.start(id, "team_command", { id });
+    await guard.complete(id, false);
+  }
+  assert.equal(guard.toolCalls, 8);
+  assert.equal(guard.interventions, 1);
+});
+
+test("incident sequence stops failed command storms despite ignored steering", async () => {
+  const events: GuardEvent[] = [];
+  const steers: string[] = [];
+  const disabled: string[][] = [];
+  const guard = new ToolUseGuard(
+    { ...options(), maxIdenticalCalls: 100 },
+    0,
+    () => ({
+      async steer(message: string) {
+        steers.push(message);
+      },
+      setActiveToolsByName(names: string[]) {
+        disabled.push(names);
+      },
+    }),
+    (event) => events.push(event),
+  );
+  const batch = (prefix: string) => ({
+    role: "assistant",
+    content: Array.from({ length: 1000 }, (_, i) => ({
+      type: "toolCall",
+      id: `${prefix}-${i}`,
+      name: "team_command",
+      arguments: { id: `${prefix}-${i}` },
+    })),
+  });
+  const first = await guard.limitResponse(batch("first"));
+  let executed = 0;
+  for (const call of first.content) {
+    await guard.start(call.id, call.name, call.arguments);
+    const decision = await guard.call(
+      call.name,
+      call.arguments,
+      false,
+      call.id,
+    );
+    if (!decision?.block) {
+      executed++;
+      // Pi reports an executed nonzero command with isError=false.
+      await guard.complete(call.id, true, { details: { exitCode: 1 } }, false);
+    } else await guard.complete(call.id, false);
+  }
+  assert.equal(executed, 8);
+  assert.equal(guard.toolCalls, 32);
+  assert.equal(guard.interventions, 2);
+  await guard.limitResponse(batch("second"));
+  assert.equal(guard.toolsDisabledForFinalization, true);
+  assert.deepEqual(disabled, [[]]);
+  assert.equal(
+    (await guard.call("team_command", { id: "later" }))?.block,
+    true,
+  );
+  assert.equal(steers.length, 3);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "doom_loop_detected" &&
+        event.patternType === "consecutive_tool_failures",
+    ),
+  );
+});
+
 test("aborted attempts cannot queue automatic steering", async () => {
   const messages: string[] = [];
   const guard = new ToolUseGuard(options(), 80, () => ({
@@ -642,12 +1220,16 @@ test("engine persists safe detector events and exposes live finalization status"
     false,
   );
   assert.equal(
+    events.find((event) => event.type === "doom_loop_detected")?.reason,
+    "identical",
+  );
+  assert.equal(
     state.history.some((entry) => entry.event === "doom_loop_finalization"),
     true,
   );
   assert.equal(runtime.agents.solver1?.toolsDisabledForFinalization, true);
-  assert.match(liveStatus, /doom-loop interventions: 1\/2/);
-  assert.match(liveStatus, /tools: disabled for finalization/);
+  assert.match(liveStatus, /Doom Loop intervention 1\/2/);
+  assert.match(liveStatus, /tools disabled for finalization/);
   runtime.dispose();
 });
 
