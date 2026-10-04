@@ -82,6 +82,11 @@ export const phases = [
   "DONE",
 ] as const;
 export type Phase = (typeof phases)[number];
+export const pendingQuestionSchema = questionSchema.extend({
+  route: z.literal("FIX_REQUIREMENTS").optional(),
+  sourceAgent: z.enum(roles).optional(),
+  sourcePhase: z.enum(phases).optional(),
+});
 export const baselineSchema = z.object({
   head: z.string().nullable(),
   dirtyPaths: z.array(z.string()),
@@ -159,11 +164,12 @@ export const stateSchema = z.object({
             ])
             .optional(),
           count: z.number().int().nonnegative().optional(),
+          sourcePhase: z.enum(phases).optional(),
         })
         .optional(),
     }),
   ),
-  pendingQuestion: questionSchema.optional(),
+  pendingQuestion: pendingQuestionSchema.optional(),
   pendingResearchQuestions: z.array(z.string().min(1)).optional(),
   researchClarificationPending: z.boolean().optional(),
   resumePhase: z.enum(phases).optional(),

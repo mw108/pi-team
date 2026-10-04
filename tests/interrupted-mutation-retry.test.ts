@@ -12,6 +12,7 @@ import {
   FixtureRunner,
   output,
   repository,
+  assertAgentAttemptLifecycle,
 } from "./helpers.ts";
 
 const ui = {
@@ -106,6 +107,7 @@ test("real stopped Implementor with stale retry survives restart and discards at
     1,
   );
   await engine.run(state);
+  assertAgentAttemptLifecycle(state, "implementor", 2, true);
   const runs = state.history.filter(
     (event) =>
       event.event === "agent_attempt_started" &&
@@ -135,6 +137,7 @@ test("keep after restart preserves dirty files and replaces stale manual retry",
     state.history.some((event) => event.event === "manual_retry_recovery_keep"),
   );
   await engine.run(state);
+  assertAgentAttemptLifecycle(state, "implementor", 2, true);
   assert.equal(
     state.history.findLast(
       (event) =>
@@ -270,7 +273,10 @@ test("retry command rejects unsupported recovery modes", async () => {
     });
   assert.equal(notices.length, 4);
   for (const notice of notices)
-    assert.match(notice, /Usage: \/team-retry <agent-id> \[keep\|discard\]/);
+    assert.match(
+      notice,
+      /Usage: \/team-retry <agent-id> \[keep\|discard\|override\]/,
+    );
 });
 
 test("team-status offers concrete recovery actions with stale inFlight state", async () => {

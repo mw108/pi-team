@@ -1,5 +1,6 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
+import assert from "node:assert/strict";
 import YAML from "yaml";
 import { initTeam } from "../src/config/init.ts";
 import { tmpdir } from "node:os";
@@ -13,6 +14,47 @@ import type { AgentRunner } from "../src/agents/runner.ts";
 import type { MutationObserver } from "../src/agents/mutation-attribution.ts";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { effectiveConfig } from "../src/agents/discovery.ts";
+
+export function assertAgentAttemptLifecycle(
+  state: WorkflowState,
+  role: Role,
+  executions: number,
+  allowInterrupted = false,
+) {
+  const starts = state.history.filter(
+    (event) =>
+      event.event === "agent_attempt_started" && event.meta?.agent === role,
+  );
+  assert.equal(
+    starts.length,
+    executions,
+    `${role} starts vs runner executions`,
+  );
+  const attempts = starts.map((event) => event.meta!.attempt);
+  assert.equal(new Set(attempts).size, attempts.length, `${role} attempt IDs`);
+  const terminalEvents = allowInterrupted
+    ? [
+        "agent_attempt_completed",
+        "agent_attempt_failed",
+        "agent_aborted_by_user",
+        "agent_superseded_by_upstream_retry",
+      ]
+    : ["agent_attempt_completed", "agent_attempt_failed"];
+  for (const attempt of attempts) {
+    const terminals = state.history.filter(
+      (event) =>
+        terminalEvents.includes(event.event) &&
+        event.meta?.agent === role &&
+        event.meta.attempt === attempt,
+    );
+    assert.equal(
+      terminals.length,
+      1,
+      `${role} attempt ${attempt} terminal events`,
+    );
+  }
+  return starts;
+}
 export function config() {
   const defaults = YAML.parse(
     readFileSync(new URL("../templates/team.yaml", import.meta.url), "utf8"),

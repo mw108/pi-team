@@ -80,6 +80,7 @@ import { solverIds } from "../agents/schemas.ts";
 import {
   getWorkflowRecoveryPlan,
   interruptedMutationRecovery,
+  pendingFixRequirements,
 } from "./recovery.ts";
 import {
   analyzeConfigDrift,
@@ -340,6 +341,7 @@ export class WorkflowEngine {
     }
   }
   retryConfirmation(state: WorkflowState, role: Role) {
+    if (pendingFixRequirements(state)) return undefined;
     if (role === "reporter" && state.reportFailure) return undefined;
     if (role === "pentester" && state.results.pentester?.status === "BLOCKED")
       return undefined;
@@ -358,10 +360,15 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed = false,
-    mode?: "keep" | "discard",
+    mode?: "keep" | "discard" | "override",
   ) {
-    if (mode !== undefined && mode !== "keep" && mode !== "discard")
-      throw new Error("Usage: /team-retry <agent-id> [keep|discard]");
+    if (
+      mode !== undefined &&
+      mode !== "keep" &&
+      mode !== "discard" &&
+      mode !== "override"
+    )
+      throw new Error("Usage: /team-retry <agent-id> [keep|discard|override]");
     // An active run already owns the workflow lock. Detached retries take it
     // here and refresh state so a second process cannot replay a stale retry.
     if (mode && this.running)
@@ -369,7 +376,7 @@ export class WorkflowEngine {
     if (this.running) return this.retryAgentLocked(state, role, confirmed);
     const unlock = await this.store.lock();
     try {
-      if (state !== this.ownedState) {
+      if (mode === "override" || state !== this.ownedState) {
         const latest = await this.store.latest();
         if (!latest || latest.id !== state.id)
           throw new Error(
@@ -388,7 +395,7 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed: boolean,
-    mode?: "keep" | "discard",
+    mode?: "keep" | "discard" | "override",
   ) {
     this.assertActiveAgent(state, role);
     const label = getAgentDisplayName(state.config, role);
@@ -397,6 +404,67 @@ export class WorkflowEngine {
     const control = this.activeAttempts.get(role);
     if (control && control.workflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
+    const requirement = pendingFixRequirements(state);
+    if (mode === "override") {
+      if (!requirement)
+        throw new Error(
+          "No unanswered FIX_REQUIREMENTS decision with clear provenance is pending. Answer the pending question with /team resume instead.",
+        );
+      if (role !== requirement.sourceAgent)
+        throw new Error(
+          `Pending FIX_REQUIREMENTS was raised by ${getAgentDisplayName(state.config, requirement.sourceAgent)}. Use /team-retry ${requirement.sourceAgent} override or answer the pending question with /team resume ${state.id}.`,
+        );
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length ||
+        this.retryRequests.size
+      )
+        throw new Error(
+          "Workflow or agent is already active; stop it before overriding the requirement decision.",
+        );
+      if (state.commit)
+        throw new Error("Cannot retry an agent after a commit.");
+      const drift = analyzeConfigDrift(state, await loadConfig(this.cwd));
+      if (drift.blocking)
+        throw new Error(
+          `Configuration drift requires review.\n${driftSummary(drift)}`,
+        );
+      record(state, "fix_requirements_override_requested", "", {
+        agent: role,
+        attempt: requirement.attempt,
+        sourcePhase: requirement.sourcePhase,
+      });
+      record(
+        state,
+        "agent_retry_requested_by_user",
+        `${role} requirements override retry`,
+        {
+          agent: role,
+          attempt: requirement.attempt,
+          sourcePhase: requirement.sourcePhase,
+        },
+      );
+      delete state.pendingQuestion;
+      delete state.resumePhase;
+      delete state.results[role];
+      this.invalidateDependents(state, role);
+      delete state.reportInput;
+      delete state.reportFailure;
+      state.phase = requirement.sourcePhase;
+      state.manualRetry = { agent: role, phase: requirement.sourcePhase };
+      record(state, "fix_requirements_override_applied", "", {
+        agent: role,
+        attempt: requirement.attempt,
+        sourcePhase: requirement.sourcePhase,
+      });
+      await this.store.save(state);
+      return "prepared";
+    }
+    if (!mode && requirement && role === requirement.sourceAgent)
+      throw new Error(
+        `${label} is waiting on a FIX_REQUIREMENTS decision. Use /team-retry ${role} override to keep existing requirements and retry ${requirement.sourcePhase}, or /team resume ${state.id} to answer the requirement question.`,
+      );
     const recovery = interruptedMutationRecovery(state);
     if (mode || (recovery && recovery.agent === role)) {
       if (!mode)
@@ -944,26 +1012,26 @@ export class WorkflowEngine {
     for (;;) {
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
-      const prior = authoritative.history
-        .filter(
-          (h) => h.event === "agent_attempt_started" && h.meta?.agent === role,
-        )
-        .map((h) => h.meta!.attempt);
+      const nextAttempt = this.nextAttempt(authoritative, role);
       const logged =
         s.config.logging.agentLogs.level === "off"
           ? undefined
           : await this.logs
-              .create(s.id, role, Math.max(0, ...prior) + 1)
+              .create(s.id, role, nextAttempt)
               .catch(() => undefined);
-      const attemptNumber = logged?.attempt ?? Math.max(0, ...prior) + 1;
+      const attemptNumber = logged?.attempt ?? nextAttempt;
       const retryNumber =
-        authoritative.history.filter(
-          (h) =>
-            h.event === "agent_attempt_started" &&
-            h.meta?.agent === role &&
-            (h.meta.trigger === "manual_retry" ||
-              h.meta.trigger === "automatic_retry"),
-        ).length +
+        new Set(
+          authoritative.history
+            .filter(
+              (h) =>
+                h.event === "agent_attempt_started" &&
+                h.meta?.agent === role &&
+                (h.meta.trigger === "manual_retry" ||
+                  h.meta.trigger === "automatic_retry"),
+            )
+            .map((h) => h.meta!.attempt),
+        ).size +
         (trigger === "manual_retry" || trigger === "automatic_retry" ? 1 : 0);
       const control: AttemptControl = {
         workflowId: s.id,
@@ -2659,6 +2727,9 @@ export class WorkflowEngine {
           break;
         }
         if (error) {
+          // A prepared manual retry has now executed and failed. Its intent
+          // must not block the user's next explicit retry.
+          delete s.manualRetry;
           block(s, `Agent execution failed: ${error}`);
           await this.store.save(s);
           break;

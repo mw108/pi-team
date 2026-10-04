@@ -7,6 +7,7 @@ import {
   repository,
   output,
   finding,
+  assertAgentAttemptLifecycle,
 } from "./helpers.ts";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -61,6 +62,7 @@ for (const status of ["FIX_LOCAL", "FIX_DESIGN", "FIX_REQUIREMENTS"] as const)
     assert.equal(s.phase, "DONE", s.blocker);
     assert.equal(runner.counts.researcher, status === "FIX_LOCAL" ? 1 : 2);
     assert.equal(runner.counts.implementor, 2);
+    assertAgentAttemptLifecycle(s, "implementor", runner.counts.implementor);
     assert.equal(s.agentFailures, 0);
     const implementationRuns = s.history.filter(
       (event) =>

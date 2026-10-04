@@ -18,6 +18,89 @@ import type { Phase, WorkflowState } from "./state.ts";
 import { isLimitBlockerStillActive } from "./limit-blocker.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 
+export type FixRequirementsOrigin = {
+  sourceAgent: "implementor" | "codeReviewer";
+  sourcePhase: "IMPLEMENT" | "CODE_REVIEW";
+  attempt: number;
+};
+
+/** Only a still-unanswered requirement decision may be replaced by a retry. */
+export function pendingFixRequirements(
+  state: WorkflowState,
+): FixRequirementsOrigin | undefined {
+  if (
+    state.phase !== "WAITING_USER" ||
+    !state.pendingQuestion ||
+    state.resumePhase !== "ORCHESTRATE" ||
+    state.pendingApproval ||
+    state.pendingResearchQuestions?.length ||
+    state.pendingRuntimeCommands.length ||
+    state.pendingRuntimeFiles.length ||
+    state.inFlight ||
+    state.manualRetry ||
+    state.driftCandidate
+  )
+    return undefined;
+  const question = state.pendingQuestion;
+  if (
+    (question.route || question.sourceAgent || question.sourcePhase) &&
+    (!question.route || !question.sourceAgent || !question.sourcePhase)
+  )
+    return undefined;
+  if (question.route && question.route !== "FIX_REQUIREMENTS") return undefined;
+  const routeIndex = state.history.findLastIndex(
+    (event) => event.event === "FIX_REQUIREMENTS",
+  );
+  if (routeIndex < 1) return undefined;
+  const route = state.history[routeIndex];
+  const completion = state.history[routeIndex - 1];
+  if (
+    completion.event !== "agent_completed" ||
+    completion.phase !== route.phase ||
+    state.history
+      .slice(routeIndex + 1)
+      .some(
+        (event) =>
+          event.event !== "phase_completed" || event.phase !== "WAITING_USER",
+      )
+  )
+    return undefined;
+  const sourcePhase = route.phase;
+  const sourceAgent = completion.detail;
+  if (
+    !(
+      (sourcePhase === "IMPLEMENT" && sourceAgent === "implementor") ||
+      (sourcePhase === "CODE_REVIEW" && sourceAgent === "codeReviewer")
+    ) ||
+    (question.sourceAgent && question.sourceAgent !== sourceAgent) ||
+    (question.sourcePhase && question.sourcePhase !== sourcePhase) ||
+    (question.route && question.route !== route.event)
+  )
+    return undefined;
+  const result = state.results[sourceAgent];
+  if (
+    sourceAgent === "implementor"
+      ? result?.status !== "IMPLEMENTATION_BLOCKED" ||
+        result.suggestedRoute !== "FIX_REQUIREMENTS"
+      : result?.status !== "FIX_REQUIREMENTS"
+  )
+    return undefined;
+  const started = state.history
+    .slice(0, routeIndex)
+    .findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === sourceAgent,
+    );
+  const attempt = started?.meta?.attempt;
+  if (
+    !attempt ||
+    (completion.meta?.agent && completion.meta.agent !== sourceAgent)
+  )
+    return undefined;
+  return { sourceAgent, sourcePhase, attempt };
+}
+
 const mutating = new Set<Role>([
   "implementor",
   "pentester",

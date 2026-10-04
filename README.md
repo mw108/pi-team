@@ -36,6 +36,7 @@ Then enter:
 /team-retry solver1
 /team-retry implementor keep
 /team-retry implementor discard
+/team-retry implementor override
 /team-stop
 /team resume
 /team resume <workflow-id>
@@ -117,6 +118,7 @@ workflow:
 | `/team-retry <agent-id>`           | Stop the current run if needed, dispose its session, and start a fresh technical retry run with the same phase input. The request does not use the automatic retry or failure budget. A genuine failure in the new run still counts. |
 | `/team-retry <agent-id> keep`      | For an interrupted mutating run, preserve the current working tree and restart the agent.                                                                                                                                            |
 | `/team-retry <agent-id> discard`   | For an interrupted mutating run, safely revert only changes attributed to that attempt, then restart the agent. Ambiguous or user-owned changes are never removed automatically.                                                     |
+| `/team-retry <agent-id> override`  | While waiting on a `FIX_REQUIREMENTS` decision, keep the current requirements, cancel the pending requirement rewind, and retry the agent that requested it from its original phase.                                                 |
 | `/team-continue`                   | Continue a BLOCKED workflow at the next safe incomplete phase after checking prerequisites, configuration and repository state. It takes no agent or phase argument.                                                                 |
 | `/team-stop`                       | Stop the entire workflow.                                                                                                                                                                                                            |
 
@@ -127,6 +129,8 @@ Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`.
 `/team-continue` advances a BLOCKED workflow only when the next agent has never started and all earlier phases completed. For example, `✓ Implementor`, `○ Code Reviewer`, `BLOCKED` continues with Code Reviewer run 1. A failed Implementor instead needs `/team-retry implementor` after inspecting its repository effects. An interrupted mutating Implementor needs an explicit `/team-retry implementor keep` or `/team-retry implementor discard` choice; `/team-continue` does not resolve it. `keep` leaves all current changes in place. `discard` uses recorded successful file mutations, attempt-specific hashes, the original baseline and Git staging checks; it refuses ambiguous changes and leaves them for manual inspection or `keep`. `✓ Commit Agent`, `○ Reporter`, `BLOCKED` can continue at Reporter. A workflow in `WAITING_USER` needs its pending answer or approval. `/team-status` and the BLOCKED report show recovery options and a repository summary.
 
 `/team-retry <agent-id>` reruns a specific agent with an existing attempt or result. `/team resume` restores or replays persisted interrupted work after Pi restarts, following its existing read-only replay rules. `/team-continue` moves from a safely recoverable BLOCKED transition to the next incomplete phase without rerunning completed work.
+
+For a pending `FIX_REQUIREMENTS` question, `/team-status` shows the source agent and both choices: `/team resume <workflow-id>` answers the question and restarts from ORCHESTRATE; `/team-retry <source-agent> override` cancels that unanswered question and retries the source phase with existing requirements and upstream results. `keep` and `discard` are only for interrupted repository mutation recovery. `override` does not change repository files or apply to research clarification and tool approvals. The `questionCount` counter counts answered questions, so an unanswered question canceled by override does not change it.
 
 ## Doom-loop detection
 

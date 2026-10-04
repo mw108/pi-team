@@ -16,6 +16,7 @@ import {
   FixtureRunner,
   research,
   contract,
+  assertAgentAttemptLifecycle,
 } from "./helpers.ts";
 
 const ui = {
@@ -319,6 +320,7 @@ test("manual retry recovers a Critic blocked by its own failure", async () => {
   await engine.run(state);
   assert.equal(state.phase, "DONE", state.blocker);
   assert.equal(runner.counts.critic, 2);
+  assertAgentAttemptLifecycle(state, "critic", runner.counts.critic);
   assert.equal(runner.counts.solver1, 1);
   assert.equal(
     state.history.findLast(
@@ -327,6 +329,75 @@ test("manual retry recovers a Critic blocked by its own failure", async () => {
         event.meta?.agent === "critic",
     )?.meta?.trigger,
     "manual_retry",
+  );
+});
+
+test("ordinary Implementor retry records one start and terminal per execution", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.qualityGates.commit.enabled = false;
+  const runner = new FixtureRunner(async (role, _state, count) => {
+    if (role === "implementor" && count === 1)
+      throw new Error("Temporary failure");
+  });
+  const engine = new WorkflowEngine(cwd, runner, ui);
+  const state = await engine.start("Fix", cfg);
+  await engine.run(state);
+  assert.equal(state.phase, "BLOCKED");
+  await engine.retryAgent(state, "implementor");
+  assertAgentAttemptLifecycle(state, "implementor", 1);
+  await engine.run(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.implementor, 2);
+  const starts = assertAgentAttemptLifecycle(state, "implementor", 2);
+  assert.deepEqual(
+    starts.map((event) => [event.meta?.attempt, event.meta?.retryNumber]),
+    [
+      [1, 0],
+      [2, 1],
+    ],
+  );
+});
+
+test("old duplicate start rows do not inflate a later retry number", async () => {
+  const cwd = await repository();
+  const runner = new FixtureRunner(async (role, _state, count) => {
+    if (role === "critic" && count <= 2) throw new Error("Malformed critique");
+  });
+  const engine = new WorkflowEngine(cwd, runner, ui);
+  const state = await engine.start("Fix", config());
+  await engine.run(state);
+  await engine.retryAgent(state, "critic");
+  await engine.run(state);
+  assert.equal(state.phase, "BLOCKED");
+  const secondStart = state.history.findLast(
+    (event) =>
+      event.event === "agent_attempt_started" && event.meta?.agent === "critic",
+  )!;
+  assert.equal(secondStart.meta?.attempt, 2);
+  state.history.push(structuredClone(secondStart));
+  await engine.store.save(state);
+  await engine.retryAgent(state, "critic");
+  await engine.run(state);
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.critic, 3);
+  const starts = state.history.filter(
+    (event) =>
+      event.event === "agent_attempt_started" && event.meta?.agent === "critic",
+  );
+  assert.deepEqual(
+    starts.map((event) => event.meta?.attempt),
+    [1, 2, 2, 3],
+  );
+  assert.equal(starts.at(-1)?.meta?.retryNumber, 2);
+  assert.equal(
+    state.history.filter(
+      (event) =>
+        event.event === "agent_attempt_completed" &&
+        event.meta?.agent === "critic" &&
+        event.meta.attempt === 3,
+    ).length,
+    1,
   );
 });
 

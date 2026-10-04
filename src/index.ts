@@ -227,7 +227,8 @@ export default function teamExtension(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("team-retry", {
-    description: "Retry an agent: /team-retry <agent-id> [keep|discard]",
+    description:
+      "Retry an agent: /team-retry <agent-id> [keep|discard|override]",
     handler: async (args, ctx) => {
       let ownedRuntime: ProgressRuntime | undefined;
       try {
@@ -238,11 +239,14 @@ export default function teamExtension(pi: ExtensionAPI) {
           !roles.includes(parts[0] as Role) ||
           (parts[1] !== undefined &&
             parts[1] !== "keep" &&
-            parts[1] !== "discard")
+            parts[1] !== "discard" &&
+            parts[1] !== "override")
         )
-          throw new Error("Usage: /team-retry <agent-id> [keep|discard]");
+          throw new Error(
+            "Usage: /team-retry <agent-id> [keep|discard|override]",
+          );
         const role = parts[0] as Role;
-        const mode = parts[1] as "keep" | "discard" | undefined;
+        const mode = parts[1] as "keep" | "discard" | "override" | undefined;
         if (continuationPending)
           throw new Error("Workflow continuation is in progress.");
         if (active && !active.state)
@@ -414,7 +418,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
             redactVisibleText(
-              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> [keep|discard] · /team-continue`,
+              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> [keep|discard|override] · /team-continue`,
             ),
             "info",
           );

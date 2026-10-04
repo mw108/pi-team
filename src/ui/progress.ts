@@ -8,6 +8,7 @@ import { solverIds } from "../agents/schemas.ts";
 import { formatCommandLine } from "../agents/command-observability.ts";
 import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
+import { pendingFixRequirements } from "../workflow/recovery.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -37,11 +38,31 @@ export interface DerivedAgentProgress {
   detail?: string;
 }
 const roleOrder = [...roles];
-function invalidates(event: WorkflowState["history"][number], role: Role) {
+function invalidates(
+  event: WorkflowState["history"][number],
+  role: Role,
+  state: WorkflowState,
+  index: number,
+) {
   if (event.event === "configuration_refresh") return true;
   if (event.event === "research_questions_answered")
     return role === "researcher";
-  if (event.event === "FIX_REQUIREMENTS") return true;
+  if (event.event === "FIX_REQUIREMENTS")
+    return !(
+      (pendingFixRequirements(state) &&
+        state.history.findLastIndex(
+          (entry) => entry.event === "FIX_REQUIREMENTS",
+        ) === index) ||
+      state.history
+        .slice(index + 1)
+        .find((later) =>
+          [
+            "fix_requirements_override_applied",
+            "user_answer",
+            "FIX_REQUIREMENTS",
+          ].includes(later.event),
+        )?.event === "fix_requirements_override_applied"
+    );
   if (event.event === "FIX_DESIGN")
     return roleOrder.indexOf(role) >= roleOrder.indexOf("researcher");
   if (event.event === "FIX_LOCAL")
@@ -65,8 +86,8 @@ export function deriveAgentProgressState(
 ): DerivedAgentProgress {
   const live = runtime?.agents[role];
   const history = state.history;
-  const invalidation = history.findLastIndex((entry) =>
-    invalidates(entry, role),
+  const invalidation = history.findLastIndex((entry, index) =>
+    invalidates(entry, role, state, index),
   );
   const lifecycle = history.findLastIndex(
     (entry) =>
@@ -120,6 +141,12 @@ export function deriveAgentProgressState(
       status: "waiting",
       attempt: latest?.meta?.attempt,
       detail: `waiting for user answers · ${state.pendingResearchQuestions.length} questions`,
+    };
+  if (pendingFixRequirements(state)?.sourceAgent === role)
+    return {
+      status: "waiting",
+      attempt: latest?.meta?.attempt,
+      detail: "waiting for requirement decision",
     };
   if (
     live?.status === "running" &&
@@ -381,6 +408,15 @@ export function renderProgress(
     `Team ${state.id.slice(0, 8)} · ${phase} · Design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`,
   ];
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
+  const requirement = pendingFixRequirements(state);
+  if (requirement) {
+    lines.push(
+      `Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase}.`,
+    );
+    lines.push(
+      `Options:\n/team resume ${state.id}\n  Answer the requirement question and restart from ORCHESTRATE.\n/team-retry ${requirement.sourceAgent} override\n  Keep the existing requirements, discard this pending question, and retry ${requirement.sourcePhase}.`,
+    );
+  }
   for (const request of state.pendingRuntimeCommands ?? [])
     lines.push(
       `◉ ${getAgentDisplayName(state.config, request.agentId)} · command approval required\n  ↳ ${formatCommandLine(request.command)}`,
@@ -522,9 +558,14 @@ export function renderLiveProgress(
     ? `Next: ${nextRoles.map((role) => getAgentDisplayName(state.config, role)).join(", ")}`
     : undefined;
   const footer = "/team-status for full workflow";
+  const requirement = pendingFixRequirements(state);
   const waiting =
     state.phase === "WAITING_USER" && !active.length
-      ? ["◉ Waiting for user input"]
+      ? [
+          requirement
+            ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
+            : "◉ Waiting for user input",
+        ]
       : [];
   const reserved =
     1 +

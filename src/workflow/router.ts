@@ -38,11 +38,18 @@ export function fix(
 ) {
   record(s, route, s.phase);
   if (route === "FIX_REQUIREMENTS") {
+    const sourcePhase = s.phase;
+    const sourceAgent = getPhaseRoles(s, sourcePhase)?.[0];
+    if (!sourceAgent)
+      throw new Error(`Unknown FIX_REQUIREMENTS source in ${sourcePhase}`);
     s.pendingQuestion = {
       type: "QUESTION_REQUEST",
       blocking: true,
       question: question ?? "Clarify the blocking requirement.",
       reason: "A quality gate needs a requirement decision.",
+      route,
+      sourceAgent,
+      sourcePhase,
     };
     s.resumePhase = "ORCHESTRATE";
     s.phase = "WAITING_USER";

@@ -11,7 +11,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { config, repository, FixtureRunner, output } from "./helpers.ts";
+import {
+  config,
+  repository,
+  FixtureRunner,
+  output,
+  assertAgentAttemptLifecycle,
+} from "./helpers.ts";
 import { configSchema } from "../src/config/schema.ts";
 import { teamRoot } from "../src/config/project.ts";
 import {
@@ -591,6 +597,7 @@ test("temporary failure recovers within one engine attempt without agent failure
       .map((e) => [e.meta?.attempt, e.meta?.retryNumber]),
     [[1, 0]],
   );
+  assertAgentAttemptLifecycle(state, "researcher", 1);
   assert.equal(
     state.history.filter((e) => e.event === "agent_retry").length,
     0,
