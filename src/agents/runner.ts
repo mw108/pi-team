@@ -87,6 +87,11 @@ export type ActivityObserver = (
   input?: unknown,
 ) => void;
 export type OutputObserver = (text: string) => void;
+export type RuntimeFileApprover = (
+  operation: "read" | "write",
+  path: string,
+  signal?: AbortSignal,
+) => Promise<boolean>;
 export type { GuardEvent } from "./doom-loop.ts";
 
 export function compactValidationEvidence(evidence: CommandEvidence[]) {
@@ -161,6 +166,7 @@ export interface AgentRunner {
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
+    fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
   ): Promise<unknown>;
 }
@@ -184,6 +190,7 @@ export class PiRunner implements AgentRunner {
       update: ProviderProgressUpdate | ModelPreflightUpdate,
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
+    fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
@@ -324,6 +331,9 @@ export class PiRunner implements AgentRunner {
                   contractIdentity(contractSchema.parse(s.results.reviewer))
                   ? s.approvedSensitivePaths
                   : [],
+              authorizeSensitive: (operation, path) =>
+                fileApproval?.(operation, path, getSignal()) ??
+                Promise.resolve(false),
             },
           );
         } catch (e) {
@@ -421,6 +431,7 @@ export class PiRunner implements AgentRunner {
     ) => void,
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
+    fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
   ) {
     const evidence: CommandEvidence[] = [];
@@ -507,6 +518,7 @@ export class PiRunner implements AgentRunner {
       },
       providerProgress,
       runtimeApproval,
+      fileApproval,
       mutationObserver,
     );
     entry.session = session;

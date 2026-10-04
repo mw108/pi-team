@@ -12,6 +12,7 @@ import {
   isSensitiveReadPath,
   policyPath,
   isWithinPath,
+  permissionPatternMatches,
 } from "./path-policy.ts";
 import { createHash } from "node:crypto";
 import type { Role, Contract } from "./schemas.ts";
@@ -134,6 +135,10 @@ export async function checkTool(
     dirtyPaths: string[];
     approvedDirtyPaths: string[];
     approvedSensitivePaths?: string[];
+    authorizeSensitive?: (
+      operation: "read" | "write",
+      path: string,
+    ) => Promise<boolean>;
   },
 ) {
   const serenaScope = name.startsWith("serena_")
@@ -176,23 +181,14 @@ export async function checkTool(
   if (typeof path === "string") {
     actualPath = await assertWithin(cwd, path);
     if (
-      (["read", "grep"].includes(name) || serenaScope === "file-read") &&
-      (isSensitiveReadPath(path) || isSensitiveReadPath(actualPath))
+      classifyPath(path) === "forbidden" ||
+      classifyPath(actualPath) === "forbidden"
     )
-      throw new Error("Access denied: path is classified as sensitive.");
+      throw new Error("Protected repository path is private");
     if (name === "grep" && (await stat(join(cwd, actualPath))).isDirectory())
       throw new Error(
         "Access denied: grep requires a specific non-sensitive file.",
       );
-    if (
-      serenaScope === "file-read" &&
-      !(await stat(join(cwd, actualPath))).isFile()
-    )
-      throw new Error(
-        "Access denied: Serena requires a specific non-sensitive file.",
-      );
-    if (classifyPath(path) === "forbidden")
-      throw new Error("Protected repository path is private");
   }
   const mutation = ["write", "edit", "team_delete", ...serenaWrite].includes(
     name,
@@ -203,11 +199,6 @@ export async function checkTool(
     assertRelative(path);
     if (policyPath(actualPath!) !== policyPath(path))
       throw new Error("Mutation through repository path alias denied");
-    if (
-      classifyPath(path) === "requires_user_approval" &&
-      !dirtyPolicy?.approvedSensitivePaths?.includes(policyPath(path))
-    )
-      throw new Error("Sensitive path requires explicit user approval");
     if (
       dirtyPolicy?.dirtyPaths.includes(path) &&
       !dirtyPolicy.approvedDirtyPaths.includes(path)
@@ -231,5 +222,36 @@ export async function checkTool(
     // Cross-file rename/delete can exceed the contract: use explicit edit operations instead.
     if (["serena_rename_symbol", "serena_safe_delete_symbol"].includes(name))
       throw new Error("Cross-file mutation denied; use contract-scoped edits");
+  }
+  if (typeof path === "string" && actualPath) {
+    const operation = mutation ? "write" : "read";
+    const sensitive = mutation
+      ? classifyPath(actualPath) === "requires_user_approval"
+      : (["read", "grep"].includes(name) || serenaScope === "file-read") &&
+        (isSensitiveReadPath(path) || isSensitiveReadPath(actualPath));
+    if (sensitive) {
+      const key = policyPath(actualPath);
+      const configured = (
+        operation === "read"
+          ? config.permissions.files.allowRead
+          : config.permissions.files.allowWrite
+      ).some((pattern) => permissionPatternMatches(pattern, key));
+      const legacy =
+        operation === "write" &&
+        dirtyPolicy?.approvedSensitivePaths?.includes(key);
+      if (
+        !configured &&
+        !legacy &&
+        !(await dirtyPolicy?.authorizeSensitive?.(operation, key))
+      )
+        throw new Error(
+          `Sensitive path is classified as sensitive; ${operation} authorization denied for ${key}`,
+        );
+    }
+    if (
+      serenaScope === "file-read" &&
+      !(await stat(join(cwd, actualPath))).isFile()
+    )
+      throw new Error("Access denied: Serena requires a specific file.");
   }
 }

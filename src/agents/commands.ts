@@ -7,6 +7,7 @@ import type { Role } from "./schemas.ts";
 import {
   allowedCommandCategories,
   commandCategories,
+  staticCommandMatches,
 } from "./command-policy.ts";
 import { commandKey } from "./discovery.ts";
 import {
@@ -132,7 +133,7 @@ export function commandTool(
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute an approved argv command by ID, or request a new structured argv command for user approval. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    description: `Execute an approved argv command by ID, or submit structured argv for static policy matching or user approval. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. Configured static rules: ${JSON.stringify(config.permissions.commands.allow)}. No shell interpolation.`,
     parameters: Type.Union([
       Type.Object({ id: Type.String() }),
       Type.Object({
@@ -159,6 +160,13 @@ export function commandTool(
         command = approvedNow.find(
           (c) => commandKey(c) === commandKey(normalized.command),
         );
+        if (
+          !command &&
+          config.permissions.commands.allow.some((rule) =>
+            staticCommandMatches(rule, normalized.command),
+          )
+        )
+          command = normalized.command;
         if (!command) {
           if (!runtimeApproval)
             throw new Error("Runtime command approval is unavailable");

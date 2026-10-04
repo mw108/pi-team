@@ -31,6 +31,8 @@ import {
   classifyPath,
   policyPath,
   isWithinPath,
+  isSensitiveReadPath,
+  permissionPatternMatches,
 } from "../agents/path-policy.ts";
 import {
   discoverCommands,
@@ -418,6 +420,7 @@ export class WorkflowEngine {
         state.pendingApproval ||
         state.pendingQuestion ||
         state.pendingRuntimeCommands.length ||
+        state.pendingRuntimeFiles.length ||
         state.driftCandidate
       )
         throw new Error(
@@ -1307,6 +1310,19 @@ export class WorkflowEngine {
                 attempt: attemptNumber,
                 ...recovery,
               }),
+            (operation, path, fileSignal) =>
+              this.commandApprovals.approveFile(
+                authoritative,
+                role,
+                control,
+                operation,
+                path,
+                fileSignal,
+                role === "implementor" && s.results.reviewer
+                  ? contractSchema.parse(s.results.reviewer).goal
+                  : "Agent requested access to a sensitive repository file",
+                (event) => logged?.logger.append(event),
+              ),
             async (mutation: ObservedFileMutation) => {
               if (role !== "implementor") return;
               const recordItem = { attempt: attemptNumber, ...mutation };
@@ -1750,6 +1766,60 @@ export class WorkflowEngine {
       }
       // A process restart loses the suspended agent session. Re-present saved
       // requests without ever replaying the command or consuming an allow-once grant.
+      if (s.pendingRuntimeFiles.length && this.activeAttempts.size === 0) {
+        for (const pending of [...s.pendingRuntimeFiles]) {
+          if (signal?.aborted) break;
+          const request = this.commandApprovals.runtimeFileApprovalPrompt(
+            s,
+            pending.agentId,
+            pending.operation,
+            pending.path,
+            "The requesting run ended before this decision.",
+          );
+          request.prompt +=
+            "\n\nThis decision will not execute the file operation; retry the agent after recovery.";
+          request.options = request.options.filter(
+            (option) => option.value !== "allow_once",
+          );
+          const selected = await this.ui.approve?.(request);
+          const choice = selected?.length === 1 ? selected[0] : undefined;
+          if (
+            !choice ||
+            !request.options.some((option) => option.value === choice)
+          )
+            break;
+          if (
+            choice === "allow_workflow" &&
+            !s.runtimeFileApprovals.some(
+              (item) =>
+                item.role === pending.agentId &&
+                item.operation === pending.operation &&
+                item.path === pending.path,
+            )
+          )
+            s.runtimeFileApprovals.push({
+              role: pending.agentId,
+              operation: pending.operation,
+              path: pending.path,
+            });
+          s.pendingRuntimeFiles = s.pendingRuntimeFiles.filter(
+            (item) => item.requestId !== pending.requestId,
+          );
+          record(
+            s,
+            choice === "deny"
+              ? "file_access_approval_denied"
+              : "file_access_approval_granted_workflow",
+            `${pending.agentId} ${pending.operation} ${pending.path}: ${choice}`,
+            { agent: pending.agentId, attempt: pending.run },
+          );
+          await this.store.save(s);
+        }
+        if (s.pendingRuntimeFiles.length) {
+          this.ui.progress(s);
+          return s;
+        }
+      }
       if (s.pendingRuntimeCommands.length && this.activeAttempts.size === 0) {
         for (const pending of [...s.pendingRuntimeCommands]) {
           if (signal?.aborted) break;
@@ -2001,6 +2071,7 @@ export class WorkflowEngine {
               );
               s.commandApprovalComplete = true;
               if (
+                !s.config.permissions.commands.allow.length &&
                 !effectiveConfig(s).commands.some((c) =>
                   allowedCommandCategories("tester").includes(c.purpose),
                 ) &&
@@ -2224,6 +2295,7 @@ export class WorkflowEngine {
           s.commandApprovalComplete = true;
           if (
             s.config.qualityGates.testing.enabled &&
+            !s.config.permissions.commands.allow.length &&
             ![
               ...effectiveConfig(s).commands,
               ...s.discoveredCommands.map((item) => item.command),
@@ -2250,7 +2322,12 @@ export class WorkflowEngine {
           const sensitive = [
             ...new Set(
               paths.filter(
-                (path) => classifyPath(path) === "requires_user_approval",
+                (path) =>
+                  classifyPath(path) === "requires_user_approval" &&
+                  !isSensitiveReadPath(path) &&
+                  !s.config.permissions.files.allowWrite.some((pattern) =>
+                    permissionPatternMatches(pattern, path),
+                  ),
               ),
             ),
           ];
@@ -2412,15 +2489,17 @@ export class WorkflowEngine {
             };
           }),
         );
-        if (s.pendingRuntimeCommands.length) {
+        if (s.pendingRuntimeCommands.length || s.pendingRuntimeFiles.length) {
           const waiting = [
             ...new Set(
-              s.pendingRuntimeCommands.map((request) => request.agentId),
+              [...s.pendingRuntimeCommands, ...s.pendingRuntimeFiles].map(
+                (request) => request.agentId,
+              ),
             ),
           ];
           block(
             s,
-            `Command approval pending for ${waiting.join(", ")}; review it with /team resume, then inspect and retry the agent.`,
+            `${s.pendingRuntimeFiles.length ? "File" : "Command"} approval pending for ${waiting.join(", ")}; review it with /team resume, then inspect and retry the agent.`,
           );
           delete s.inFlight;
           await this.store.save(s);

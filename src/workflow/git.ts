@@ -16,6 +16,7 @@ import {
   classifyPath,
   isSensitiveReadPath,
   policyPath,
+  permissionPatternMatches,
 } from "../agents/path-policy.ts";
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
@@ -341,18 +342,25 @@ export async function prepareCommit(
   const contract = contractSchema.parse(s.results.reviewer),
     allowed = contractPaths(contract),
     dirty = await dirtyPaths(s.cwd);
-  if (
-    s.sensitiveApprovalContractHash !== contractIdentity(contract) &&
-    allowed.some((path) => classifyPath(path) === "requires_user_approval")
-  )
-    throw new Error("Sensitive path approval does not match current contract");
+  const writeAuthorized = (path: string) =>
+    s.config.permissions.files.allowWrite.some((pattern) =>
+      permissionPatternMatches(pattern, path),
+    ) ||
+    s.runtimeFileApprovals.some(
+      (grant) =>
+        grant.role === "implementor" &&
+        grant.operation === "write" &&
+        grant.path === policyPath(path),
+    ) ||
+    (s.sensitiveApprovalContractHash === contractIdentity(contract) &&
+      s.approvedSensitivePaths.includes(policyPath(path)));
   for (const path of allowed) {
     assertRelative(path);
     if (policyPath(await assertWithin(s.cwd, path)) !== policyPath(path))
       throw new Error(`Commit path aliases another repository path: ${path}`);
     if (
       classifyPath(path) === "requires_user_approval" &&
-      !s.approvedSensitivePaths.includes(policyPath(path))
+      !writeAuthorized(path)
     )
       throw new Error(`Sensitive path approval missing: ${path}`);
   }

@@ -56,6 +56,7 @@ function semanticConfig(config: TeamConfig) {
           !presentationRoots.has(key) &&
           key !== "agents" &&
           key !== "workflow" &&
+          key !== "permissions" &&
           key !== "execution",
       ),
     ),
@@ -192,6 +193,7 @@ export function analyzeConfigDrift(
       )
         add("presentation", path);
       else if (parts[0] === "execution") add("runtime", path);
+      else if (parts[0] === "permissions") add("runtime", path);
       else if (parts[0] === "workflow" && runtimeWorkflow.has(parts[1]))
         add("runtime", path);
       else if (

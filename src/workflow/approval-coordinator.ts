@@ -44,6 +44,173 @@ export interface CommandApprovalDependencies {
 export class RuntimeCommandApprovalCoordinator {
   constructor(private readonly deps: CommandApprovalDependencies) {}
   private commandApprovalQueue = Promise.resolve();
+  runtimeFileApprovalPrompt(
+    s: WorkflowState,
+    role: Role,
+    operation: "read" | "write",
+    path: string,
+    reason: string,
+  ): ApprovalRequest {
+    const label = getAgentDisplayName(s.config, role);
+    return {
+      kind: "runtimeFile",
+      title: "Sensitive file access requested",
+      prompt: `Agent: ${label} (${role})\nOperation: ${operation === "read" ? "Read" : "Write"}\nPath: ${path}\n\nReason:\n${redactVisibleText(reason)}`,
+      options: [
+        {
+          value: "allow_once",
+          label: "Allow once",
+          description: "Authorize this operation one time",
+        },
+        {
+          value: "allow_workflow",
+          label: "Allow for workflow",
+          description:
+            "Authorize this role, operation and exact path in this workflow",
+        },
+        {
+          value: "deny",
+          label: "Deny",
+          description: "Do not access this file",
+        },
+      ],
+    };
+  }
+  async approveFile(
+    s: WorkflowState,
+    role: Role,
+    control: AttemptControl,
+    operation: "read" | "write",
+    path: string,
+    signal: AbortSignal | undefined,
+    reason: string,
+    log: (event: { type: string; [key: string]: unknown }) => void,
+  ): Promise<boolean> {
+    const current = () =>
+      control.workflowId === s.id &&
+      this.deps.activeAttempt(role) === control &&
+      !control.intention &&
+      !control.settled &&
+      !signal?.aborted;
+    if (!current()) return false;
+    const granted = () =>
+      s.runtimeFileApprovals.some(
+        (item) =>
+          item.role === role &&
+          item.operation === operation &&
+          item.path === path,
+      );
+    if (granted()) return true;
+    const pending = {
+      workflowId: s.id,
+      agentId: role,
+      run: control.attempt,
+      requestId: randomUUID(),
+      operation,
+      path,
+    };
+    s.pendingRuntimeFiles.push(pending);
+    log({
+      type: "file_access_approval_requested",
+      role,
+      operation,
+      path,
+      run: control.attempt,
+      requestId: pending.requestId,
+    });
+    await this.deps.persistAttempt(
+      s,
+      "file_access_approval_requested",
+      `${role} requests ${operation} ${path}`,
+      { agent: role, attempt: control.attempt },
+    );
+    this.deps.progress(s);
+    const decide = async () => {
+      if (!current()) return false;
+      if (granted()) {
+        s.pendingRuntimeFiles = s.pendingRuntimeFiles.filter(
+          (item) => item.requestId !== pending.requestId,
+        );
+        await this.deps.save(s);
+        return true;
+      }
+      const request = this.runtimeFileApprovalPrompt(
+        s,
+        role,
+        operation,
+        path,
+        reason,
+      );
+      const aborted = new Promise<undefined>((resolve) => {
+        if (signal?.aborted) resolve(undefined);
+        else
+          signal?.addEventListener("abort", () => resolve(undefined), {
+            once: true,
+          });
+      });
+      const selected = await Promise.race([
+        this.deps.approve?.(request) ?? Promise.resolve(undefined),
+        aborted,
+      ]);
+      if (
+        !current() ||
+        !s.pendingRuntimeFiles.some(
+          (item) =>
+            item.requestId === pending.requestId &&
+            item.workflowId === s.id &&
+            item.agentId === role &&
+            item.run === control.attempt,
+        )
+      )
+        return false;
+      const choice = selected?.length === 1 ? selected[0] : undefined;
+      if (!choice || !["allow_once", "allow_workflow", "deny"].includes(choice))
+        return false;
+      if (choice === "allow_workflow" && !granted())
+        s.runtimeFileApprovals.push({ role, operation, path });
+      s.pendingRuntimeFiles = s.pendingRuntimeFiles.filter(
+        (item) => item.requestId !== pending.requestId,
+      );
+      const event =
+        choice === "allow_once"
+          ? "file_access_approval_granted_once"
+          : choice === "allow_workflow"
+            ? "file_access_approval_granted_workflow"
+            : "file_access_approval_denied";
+      log({
+        type: event,
+        role,
+        operation,
+        path,
+        scope: choice,
+        run: control.attempt,
+        requestId: pending.requestId,
+      });
+      await this.deps.persistAttempt(
+        s,
+        event,
+        `${role} ${operation} ${path}: ${choice}`,
+        { agent: role, attempt: control.attempt },
+      );
+      this.deps.progress(s);
+      return choice !== "deny";
+    };
+    const turn = this.commandApprovalQueue.then(decide);
+    this.commandApprovalQueue = turn.then(
+      () => {},
+      () => {},
+    );
+    try {
+      return await turn;
+    } finally {
+      if (!current()) {
+        s.pendingRuntimeFiles = s.pendingRuntimeFiles.filter(
+          (item) => item.requestId !== pending.requestId,
+        );
+        await this.deps.save(s);
+      }
+    }
+  }
   runtimeApprovalPrompt(
     s: WorkflowState,
     role: Role,

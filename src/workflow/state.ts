@@ -45,6 +45,7 @@ export const approvalSchema = z.object({
     "configDrift",
     "manualRetry",
     "runtimeCommand",
+    "runtimeFile",
     "sensitivePaths",
     "orphanedImplementation",
   ]),
@@ -191,6 +192,31 @@ export const stateSchema = z.object({
           requestId: z.string().uuid(),
           command: commandSchema,
           purpose: z.string().max(500),
+        })
+        .strict(),
+    )
+    .default([]),
+  runtimeFileApprovals: z
+    .array(
+      z
+        .object({
+          role: z.enum(roles),
+          operation: z.enum(["read", "write"]),
+          path: exactPath,
+        })
+        .strict(),
+    )
+    .default([]),
+  pendingRuntimeFiles: z
+    .array(
+      z
+        .object({
+          workflowId: z.string().uuid(),
+          agentId: z.enum(roles),
+          run: z.number().int().positive(),
+          requestId: z.string().uuid(),
+          operation: z.enum(["read", "write"]),
+          path: exactPath,
         })
         .strict(),
     )
@@ -432,6 +458,15 @@ export function validateState(value: unknown): WorkflowState {
       pending.command.id !== detectedCommandId(pending.command)
     )
       throw new Error("Pending command approval identity mismatch");
+  for (const pending of state.pendingRuntimeFiles)
+    if (
+      pending.workflowId !== state.id ||
+      policyPath(pending.path) !== pending.path
+    )
+      throw new Error("Pending file approval identity mismatch");
+  for (const approval of state.runtimeFileApprovals)
+    if (policyPath(approval.path) !== approval.path)
+      throw new Error("Runtime file approval identity mismatch");
   for (const path of state.approvedDirtyPaths)
     if (!state.baseline.dirtyPaths.includes(path))
       throw new Error("Approved dirty path is not in the baseline");
@@ -470,6 +505,8 @@ export function newState(
     runtimeCommandApprovals: [],
     similarCommandRules: [],
     pendingRuntimeCommands: [],
+    runtimeFileApprovals: [],
+    pendingRuntimeFiles: [],
     approvedDirtyPaths: [],
     approvedSensitivePaths: [],
     commandApprovalComplete: false,

@@ -92,6 +92,7 @@ export function approvalParams(request: ApprovalRequest) {
           "configDrift",
           "manualRetry",
           "runtimeCommand",
+          "runtimeFile",
         ].includes(request.kind)
           ? "single"
           : "multi",

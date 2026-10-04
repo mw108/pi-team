@@ -6,6 +6,7 @@ import {
   hasUnsafeArgvToken,
   isForbiddenExecutable,
 } from "../agents/command-policy.ts";
+import { permissionPattern } from "../agents/path-policy.ts";
 export const logicalRoles = [
   "orchestrator",
   "researcher",
@@ -122,6 +123,37 @@ export const discoveredCommandSchema = z.object({
     "other",
   ]),
 });
+const filePermissionPattern = z
+  .string()
+  .min(1)
+  .superRefine((value, ctx) => {
+    try {
+      permissionPattern(value);
+    } catch (error) {
+      ctx.addIssue({ code: "custom", message: String(error) });
+    }
+  });
+const staticCommandRuleSchema = z
+  .object({
+    executable: z.string().trim().min(1),
+    argsPrefix: z.array(z.string()).default([]),
+    allowRemainingArgs: z.boolean().default(false),
+  })
+  .strict()
+  .superRefine((rule, ctx) => {
+    if (
+      rule.executable.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(rule.executable) ||
+      isForbiddenExecutable(rule.executable) ||
+      hasUnsafeArgvToken(rule.executable, rule.argsPrefix) ||
+      rule.argsPrefix.some((arg) => !arg || /[;&|`$<>]/.test(arg)) ||
+      /[;&|`$<>\s]/.test(rule.executable)
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "Unsafe static command permission",
+      });
+  });
 export const configSchema = z
   .object({
     workflow: z
@@ -240,6 +272,24 @@ export const configSchema = z
       )
       .strict(),
     commands: z.array(commandSchema).default([]),
+    permissions: z
+      .object({
+        files: z
+          .object({
+            allowRead: z.array(filePermissionPattern).default([]),
+            allowWrite: z.array(filePermissionPattern).default([]),
+          })
+          .strict()
+          .default({}),
+        commands: z
+          .object({
+            allow: z.array(staticCommandRuleSchema).default([]),
+          })
+          .strict()
+          .default({}),
+      })
+      .strict()
+      .default({}),
     execution: z
       .object({
         sandbox: z

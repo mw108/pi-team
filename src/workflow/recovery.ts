@@ -126,13 +126,16 @@ export async function getWorkflowRecoveryPlan(
     state.phase === "WAITING_USER" ||
     state.pendingQuestion ||
     state.pendingApproval ||
-    state.pendingRuntimeCommands?.length
+    state.pendingRuntimeCommands?.length ||
+    state.pendingRuntimeFiles?.length
   )
     return {
       kind: "waiting-user",
-      reason: state.pendingRuntimeCommands?.length
-        ? "Waiting for command approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
-        : "Workflow is waiting for user input.",
+      reason:
+        state.pendingRuntimeCommands?.length ||
+        state.pendingRuntimeFiles?.length
+          ? "Waiting for tool approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
+          : "Workflow is waiting for user input.",
     };
   if (state.phase === "DONE")
     return { kind: "none", reason: "Workflow is already DONE." };
@@ -186,10 +189,14 @@ export async function getWorkflowRecoveryPlan(
       reason:
         "Restore the required Pentest capability, then retry the Pentester. Upstream results remain valid.",
     };
-  if (state.blocker?.startsWith("Command approval pending for ")) {
-    const role = state.blocker
-      .slice("Command approval pending for ".length)
-      .split(/[;,]/, 1)[0] as Role;
+  if (
+    state.blocker?.startsWith("Command approval pending for ") ||
+    state.blocker?.startsWith("File approval pending for ")
+  ) {
+    const prefix = state.blocker.startsWith("File")
+      ? "File approval pending for "
+      : "Command approval pending for ";
+    const role = state.blocker.slice(prefix.length).split(/[;,]/, 1)[0] as Role;
     if (
       getPhaseRoles(
         state,
@@ -200,7 +207,7 @@ export async function getWorkflowRecoveryPlan(
       return {
         kind: "retry-agent",
         agentId: role,
-        reason: `Command approval was reviewed after ${role} run ended. Inspect repository effects, then retry ${role}.`,
+        reason: `Tool approval was reviewed after ${role} run ended. Inspect repository effects, then retry ${role}.`,
       };
   }
   const limitActive = isLimitBlockerStillActive(state, current.config);

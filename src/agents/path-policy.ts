@@ -20,6 +20,37 @@ export function isWithinPath(path: string, directory: string): boolean {
 }
 
 export type PathPolicy = "normal" | "requires_user_approval" | "forbidden";
+/** Conservative, component-boundary globs for trusted project configuration. */
+export function permissionPattern(pattern: string): string {
+  const key = policyPath(pattern);
+  if (
+    key.split("/").some((part) => part === ".git") ||
+    [".pi", ".serena"].includes(key.split("/")[0]) ||
+    key.split("/").some((part) => part === "*")
+  )
+    throw new Error(`Forbidden file permission pattern: ${pattern}`);
+  if (/[?\[\]{}\0\r\n]/.test(key) || key.includes("**"))
+    throw new Error("Only single-component * globs are supported");
+  return key;
+}
+
+export function permissionPatternMatches(
+  pattern: string,
+  path: string,
+): boolean {
+  const parts = permissionPattern(pattern).split("/");
+  const candidate = policyPath(path).split("/");
+  return (
+    parts.length === candidate.length &&
+    parts.every((part, index) => {
+      const expression = part
+        .split("*")
+        .map((piece) => piece.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("[^/]*");
+      return new RegExp(`^${expression}$`, "u").test(candidate[index]);
+    })
+  );
+}
 /** LLM-facing content reads use the same normalized path identity as writes. */
 export function isSensitiveReadPath(path: string): boolean {
   const key = policyPath(path);
@@ -44,7 +75,12 @@ export function classifyPath(path: string): PathPolicy {
     parts[0] === ".husky" ||
     key === ".vscode/tasks.json" ||
     [".gitmodules", ".gitattributes"].includes(key) ||
+    parts.some((part) => [".ssh", ".aws", ".gnupg"].includes(part)) ||
     parts.some((part) => part === ".env" || part.startsWith(".env.")) ||
+    /^(?:id_rsa|id_ed25519|auth\.json|credentials(?:\..*)?)$/.test(
+      name ?? "",
+    ) ||
+    /\.(?:pem|key|p12|pfx)$/.test(name ?? "") ||
     [
       "package.json",
       "composer.json",

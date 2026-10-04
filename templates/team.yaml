@@ -65,6 +65,20 @@ logging:
 toolActivity:
   mappings: {} # e.g. "custom_search_*": { category: web-search, provider: Custom }
 commands: []
+# Optional explicit project policy. Empty lists grant nothing.
+permissions:
+  files:
+    allowRead: [] # e.g. [".env", ".env.testing"]
+    allowWrite: [] # e.g. [".env.testing"]
+  commands:
+    allow: []
+    # - executable: php
+    #   argsPrefix: ["artisan"]
+    #   allowRemainingArgs: true
+    # - executable: composer
+    #   allowRemainingArgs: true
+    # - executable: vendor/bin/phpunit
+    #   allowRemainingArgs: true
 execution:
   sandbox:
     mode: auto # auto, required, or none

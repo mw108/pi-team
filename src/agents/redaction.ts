@@ -15,7 +15,7 @@ export function redactVisibleText(text: string) {
       .replace(/\b(Bearer\s+)\S+/gi, "$1[REDACTED]")
       .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, "[REDACTED]")
       .replace(
-        /\b([A-Za-z_][A-Za-z0-9_]*(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)|API_KEY|TOKEN|SECRET|PASSWORD)\s*[:=]\s*\S+/gi,
+        /\b([A-Za-z_][A-Za-z0-9_]*(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)|APP_KEY|API_KEY|TOKEN|SECRET|PASSWORD)\s*[:=]\s*\S+/gi,
         "$1=[REDACTED]",
       )
       .replace(/\b(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")

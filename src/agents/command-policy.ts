@@ -42,6 +42,7 @@ const forbiddenExecutables = new Set([
   "cmd",
   "cmd.exe",
   "eval",
+  "sudo",
 ]);
 
 export function executableName(executable: string): string {
@@ -58,5 +59,26 @@ export function hasUnsafeArgvToken(
 ): boolean {
   return [executable, ...args].some(
     (value) => /[\0\r\n]/.test(value) || /^(?:&&|\|\||;|\||&)$/u.test(value),
+  );
+}
+
+export interface StaticCommandRule {
+  executable: string;
+  argsPrefix: string[];
+  allowRemainingArgs: boolean;
+}
+
+export function staticCommandMatches(
+  rule: StaticCommandRule,
+  command: { executable: string; args: string[] },
+): boolean {
+  return (
+    !isForbiddenExecutable(command.executable) &&
+    !hasUnsafeArgvToken(command.executable, command.args) &&
+    rule.executable === command.executable &&
+    (rule.allowRemainingArgs
+      ? command.args.length >= rule.argsPrefix.length
+      : command.args.length === rule.argsPrefix.length) &&
+    rule.argsPrefix.every((arg, i) => command.args[i] === arg)
   );
 }

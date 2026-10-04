@@ -102,6 +102,15 @@ export function deriveAgentProgressState(
       attempt: live?.attempt ?? latest?.meta?.attempt,
       detail: "waiting for command approval",
     };
+  const pendingFile = state.pendingRuntimeFiles?.find(
+    (request) => request.agentId === role,
+  );
+  if (pendingFile)
+    return {
+      status: "waiting",
+      attempt: live?.attempt ?? latest?.meta?.attempt,
+      detail: `waiting for ${pendingFile.operation} access to ${pendingFile.path}`,
+    };
   if (
     role === "researcher" &&
     state.pendingResearchQuestions?.length &&
@@ -375,6 +384,10 @@ export function renderProgress(
   for (const request of state.pendingRuntimeCommands ?? [])
     lines.push(
       `◉ ${getAgentDisplayName(state.config, request.agentId)} · command approval required\n  ↳ ${formatCommandLine(request.command)}`,
+    );
+  for (const request of state.pendingRuntimeFiles ?? [])
+    lines.push(
+      `◉ Waiting for user approval: ${getAgentDisplayName(state.config, request.agentId)} requests ${request.operation} access to ${request.path}`,
     );
   if (state.pendingResearchQuestions?.length)
     lines.push(

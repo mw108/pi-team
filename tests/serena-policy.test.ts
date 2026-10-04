@@ -68,7 +68,9 @@ test("Serena file reads use the shared sensitive policy and resolved symlink tar
             cwd,
             cfg,
           ),
-        /classified as sensitive/,
+        relative_path.toLowerCase().startsWith(".pi/")
+          ? /private/
+          : /classified as sensitive/,
       );
   // Serena consumes relative_path. A spurious safe `path` must not override it.
   await assert.rejects(
