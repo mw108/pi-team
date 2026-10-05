@@ -84,6 +84,8 @@ import {
   classifyManualRetry,
   interruptedMutationRecovery,
   pendingFixRequirements,
+  classifyQualityGateBlocker,
+  clearQualityGateBlocker,
 } from "./recovery.ts";
 import {
   analyzeConfigDrift,
@@ -385,7 +387,11 @@ export class WorkflowEngine {
     if (state.manualRetry?.agent === role) return undefined;
     if (pendingFixRequirements(state)) return undefined;
     if (role === "reporter" && state.reportFailure) return undefined;
-    if (role === "pentester" && state.results.pentester?.status === "BLOCKED")
+    if (
+      classifyQualityGateBlocker(state)?.kind === "owned" &&
+      (role === "pentester" || role === "tester") &&
+      state.results[role]?.status === "BLOCKED"
+    )
       return undefined;
     const settled = this.activeAttempts.get(role);
     if (
@@ -692,7 +698,65 @@ export class WorkflowEngine {
         `A ${getAgentDisplayName(state.config, state.manualRetry.agent)} retry is pending. Use /team-retry ${state.manualRetry.agent} or /team-continue.`,
       );
     if (state.phase === "BLOCKED") {
+      if (
+        (role === "tester" || role === "pentester") &&
+        state.results[role]?.status === "BLOCKED" &&
+        this.sessions.list(state.id).length
+      )
+        throw new Error(
+          `Agent ${role} is already active; wait for it to settle.`,
+        );
       const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        (role === "tester" || role === "pentester") &&
+        state.results[role]?.status === "BLOCKED"
+      ) {
+        if (
+          plan.kind !== "completed-quality-gate-blocked" ||
+          plan.agentId !== role
+        )
+          throw new Error(
+            `${plan.reason} Next safe action: ${plan.actions.map((a) => a.command).join(" · ")}`,
+          );
+        if (
+          this.running ||
+          this.activeAttempts.size ||
+          this.sessions.list(state.id).length
+        )
+          throw new Error(
+            `Agent ${role} is already active; wait for it to settle.`,
+          );
+        const currentConfig = await loadConfig(this.cwd);
+        const drift = analyzeConfigDrift(state, currentConfig);
+        if (drift.blocking)
+          throw new Error(
+            `Configuration drift requires review.\n${driftSummary(drift)}`,
+          );
+        if (drift.changed) acceptConfigDrift(state, currentConfig, drift);
+        const ownership = clearQualityGateBlocker(state, role);
+        (state.results as Record<string, unknown>)[`previous_${role}`] =
+          state.results[role];
+        delete state.results[role];
+        this.invalidateDependents(state, role);
+        delete state.inFlight;
+        state.phase = ownership.phase;
+        state.manualRetry = { agent: role, phase: ownership.phase };
+        this.manualReruns.add(role);
+        record(
+          state,
+          "agent_retry_requested_by_user",
+          `${role} BLOCKED gate retry`,
+          {
+            agent: role,
+            attempt: ownership.attempt,
+            sourceAttempt: ownership.attempt,
+            sourceOutcome: "BLOCKED",
+            sourcePhase: ownership.phase,
+          },
+        );
+        await this.store.save(state);
+        return "prepared";
+      }
       if (
         plan.kind === "retry-agent" &&
         plan.agentId === role &&
@@ -861,11 +925,6 @@ export class WorkflowEngine {
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
-      } else if (
-        role === "pentester" &&
-        state.blocker?.startsWith("Pentest blocked:")
-      ) {
-        // An environmental block is a completed result, not an agent failure.
       } else if (!(
         (state.blocker?.startsWith("Insufficient Solver proposals") ||
           state.blocker?.startsWith("Solver quorum not reached")) &&

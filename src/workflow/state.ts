@@ -167,6 +167,8 @@ export const stateSchema = z.object({
             .optional(),
           count: z.number().int().nonnegative().optional(),
           sourcePhase: z.enum(phases).optional(),
+          sourceOutcome: z.literal("BLOCKED").optional(),
+          sourceAttempt: z.number().int().positive().optional(),
         })
         .optional(),
     }),
@@ -253,6 +255,14 @@ export const stateSchema = z.object({
     })
     .optional(),
   blocker: z.string().optional(),
+  blockerMeta: z
+    .object({
+      sourcePhase: z.enum(phases),
+      sourceAgent: z.enum(roles),
+      sourceAttempt: z.number().int().positive(),
+      kind: z.literal("quality_gate_blocked"),
+    })
+    .optional(),
   gateHashes: z.record(z.string()).optional(),
   testMutationCycles: z.number().int().min(0).default(0),
   priorImplementation: z
@@ -544,10 +554,16 @@ export function record(
     ...(meta ? { meta: redactStructured(meta) } : {}),
   });
 }
-export function block(state: WorkflowState, reason: string) {
+export function block(
+  state: WorkflowState,
+  reason: string,
+  provenance?: WorkflowState["blockerMeta"],
+) {
   record(state, "blocked", reason);
   state.phase = "BLOCKED";
   state.blocker = redactVisibleText(reason).slice(0, 4000);
+  if (provenance) state.blockerMeta = provenance;
+  else delete state.blockerMeta;
 }
 
 /** Sanitize free text before each new state write; operational argv stays intact. */

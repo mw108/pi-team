@@ -130,6 +130,8 @@ Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`.
 
 `/team-retry <agent-id>` reruns a specific agent with an existing attempt or result. `/team resume` restores or replays persisted interrupted work after Pi restarts, following its existing read-only replay rules. `/team-continue` moves from a safely recoverable BLOCKED transition to the next incomplete phase without rerunning completed work.
 
+A Tester or Pentester can finish its model run but return `BLOCKED`. This leaves an unresolved quality gate, not a successful gate or an agent execution failure. `/team-status` shows `◉` and the gate reason; `✓` indicates a successful gate. When the blocker belongs to the gate and no separate decision is pending, `/team-retry <agent-id>` works even after Pi restarts. It archives the blocked result, preserves completed upstream gates and attempt history, and reruns the blocked gate. `/team-continue` lists that retry command as an actionable recovery option. If blocker ownership is ambiguous or a separate blocker exists, retry leaves the blocker intact.
+
 For a pending `FIX_REQUIREMENTS` question, `/team-status` shows the source agent and both choices: `/team resume <workflow-id>` answers the question and restarts from ORCHESTRATE; `/team-retry <source-agent> override` cancels that unanswered question and retries the source phase with existing requirements and upstream results. `keep` and `discard` are only for interrupted repository mutation recovery. `override` does not change repository files or apply to research clarification and tool approvals. The `questionCount` counter counts answered questions, so an unanswered question canceled by override does not change it.
 
 ## Doom-loop detection

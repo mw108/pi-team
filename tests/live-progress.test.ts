@@ -111,9 +111,9 @@ test("blocked widget drops completed history before the blocker under a short bu
   s.phase = "BLOCKED";
   s.blocker = "Pentest blocked: No local origin is authorized.";
   const live = renderLiveProgress(s, undefined, 6).join("\n");
-  assert.match(live, /✗ Pen Tester/);
+  assert.match(live, /◉ Pen Tester/);
   assert.match(live, /No local origin is authorized/);
-  assert.match(live, /\/team-retry pentester/);
+  assert.doesNotMatch(live, /\/team-retry pentester/);
   assert.doesNotMatch(live, /Orchestrator|Researcher|Code Reviewer/);
-  assert.match(renderProgress(s).join("\n"), /✗ Pen Tester/);
+  assert.match(renderProgress(s).join("\n"), /◉ Pen Tester/);
 });

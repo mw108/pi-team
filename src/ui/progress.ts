@@ -8,7 +8,10 @@ import { solverIds } from "../agents/schemas.ts";
 import { formatCommandLine } from "../agents/command-observability.ts";
 import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
-import { pendingFixRequirements } from "../workflow/recovery.ts";
+import {
+  pendingFixRequirements,
+  classifyQualityGateBlocker,
+} from "../workflow/recovery.ts";
 const symbols = {
   pending: "○",
   running: "●",
@@ -172,11 +175,16 @@ export function deriveAgentProgressState(
   )
     return { status: "completed", attempt: latest.meta?.attempt };
   if (
-    role === "pentester" &&
+    currentResult &&
     state.phase === "BLOCKED" &&
-    state.results.pentester?.status === "BLOCKED"
+    (role === "tester" || role === "pentester") &&
+    state.results[role]?.status === "BLOCKED"
   )
-    return { status: "failed", attempt: latest?.meta?.attempt };
+    return {
+      status: "waiting",
+      attempt: latest?.meta?.attempt,
+      detail: `BLOCKED: ${role === "tester" ? (state.results.tester?.reason ?? "Required validation could not run") : (state.results.pentester?.blocker?.message ?? "Required testing incomplete")}`,
+    };
   if (currentResult)
     return { status: "completed", attempt: latest?.meta?.attempt };
   if (latest?.event === "agent_attempt_started" && lifecycle > invalidation)
@@ -493,23 +501,27 @@ export function renderLiveProgress(
   if (state.phase === "BLOCKED") {
     const pentest = state.results.pentester;
     const pentestBlocked = pentest?.status === "BLOCKED";
-    const blockedRole: Role | undefined = pentestBlocked
-      ? "pentester"
-      : state.history.findLast(
-          (event) => event.event === "agent_attempt_failed",
-        )?.meta?.agent;
+    const gateBlocker = classifyQualityGateBlocker(state);
+    const blockedRole: Role | undefined =
+      gateBlocker?.kind === "owned"
+        ? gateBlocker.agent
+        : state.history.findLast(
+            (event) => event.event === "agent_attempt_failed",
+          )?.meta?.agent;
     const blockedRow = blockedRole
       ? displayAgent(blockedRole, state, runtime)[0].replace(
           /^[^ ]+/,
-          symbols.failed,
+          gateBlocker?.kind === "owned" ? symbols.waiting : symbols.failed,
         )
       : undefined;
-    const waitingLines = active.flatMap((role) => [
-      ...displayAgent(role, state, runtime),
-      ...(state.pendingRuntimeCommands ?? [])
-        .filter((request) => request.agentId === role)
-        .map((request) => `  ↳ ${formatCommandLine(request.command)}`),
-    ]);
+    const waitingLines = active
+      .filter((role) => role !== blockedRole)
+      .flatMap((role) => [
+        ...displayAgent(role, state, runtime),
+        ...(state.pendingRuntimeCommands ?? [])
+          .filter((request) => request.agentId === role)
+          .map((request) => `  ↳ ${formatCommandLine(request.command)}`),
+      ]);
     const focused = [
       header,
       ...waitingLines,
@@ -522,7 +534,9 @@ export function renderLiveProgress(
       ...(pentestBlocked && pentest.blocker?.remediation
         ? [pentest.blocker.remediation]
         : []),
-      ...(pentestBlocked ? ["Then: /team-retry pentester"] : []),
+      ...(gateBlocker?.kind === "owned"
+        ? [`Then: /team-retry ${gateBlocker.agent}`]
+        : []),
       "/team-status for full workflow",
     ];
     const history = completed

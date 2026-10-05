@@ -208,9 +208,115 @@ export type RecoveryAction = {
     | "abort";
   command: string;
 };
+export type QualityGateBlocker =
+  | {
+      kind: "owned";
+      agent: "tester" | "pentester";
+      phase: "TEST" | "PENTEST";
+      attempt: number;
+    }
+  | { kind: "ambiguous"; reason: string };
+
+/** Verify result, blocker, and completed attempt together; legacy text alone is insufficient. */
+export function classifyQualityGateBlocker(
+  state: WorkflowState,
+): QualityGateBlocker | undefined {
+  if (state.phase !== "BLOCKED" || !state.blocker) return undefined;
+  const candidates = (["tester", "pentester"] as const).filter(
+    (agent) => state.results[agent]?.status === "BLOCKED",
+  );
+  if (!candidates.length) return undefined;
+  if (candidates.length !== 1)
+    return {
+      kind: "ambiguous",
+      reason: "Multiple blocked quality gate results exist.",
+    };
+  const agent = candidates[0];
+  const phase = agent === "tester" ? "TEST" : "PENTEST";
+  const expected =
+    agent === "tester"
+      ? `Testing blocked: ${state.results.tester?.reason ?? "Required validation could not run"}`
+      : `Pentest blocked: ${state.results.pentester?.blocker?.message ?? ""}`;
+  const meta = state.blockerMeta;
+  const ambiguous = (reason: string): QualityGateBlocker => ({
+    kind: "ambiguous",
+    reason,
+  });
+  if (!meta && state.blocker !== expected)
+    return ambiguous("Current blocker does not match the blocked gate result.");
+  const blockedIndex = state.history.findLastIndex(
+    (event) => event.event === "blocked",
+  );
+  const blocked = state.history[blockedIndex];
+  if (blocked?.phase !== phase || blocked.detail !== state.blocker)
+    return ambiguous("Blocking transition cannot be attributed to the gate.");
+  const startedIndex = state.history.findLastIndex(
+    (event) =>
+      event.event === "agent_attempt_started" && event.meta?.agent === agent,
+  );
+  const started = state.history[startedIndex];
+  const attempt = started?.meta?.attempt;
+  const terminalIndex = state.history.findLastIndex(
+    (event) =>
+      (event.event === "agent_attempt_completed" ||
+        event.event === "agent_attempt_failed") &&
+      event.meta?.agent === agent,
+  );
+  const terminal = state.history[terminalIndex];
+  if (
+    !attempt ||
+    terminal?.event !== "agent_attempt_completed" ||
+    terminal.meta?.attempt !== attempt ||
+    startedIndex >= terminalIndex ||
+    terminalIndex >= blockedIndex
+  )
+    return ambiguous("Latest gate attempt was not completed successfully.");
+  const completionIndex = state.history.findLastIndex(
+    (event) => event.event === "agent_completed" && event.detail === agent,
+  );
+  if (
+    completionIndex <= terminalIndex ||
+    completionIndex >= blockedIndex ||
+    state.history
+      .slice(completionIndex + 1, blockedIndex)
+      .some(
+        (event) =>
+          event.event === "agent_attempt_started" &&
+          event.meta?.agent === agent,
+      )
+  )
+    return ambiguous("Gate completion is not tied to the blocking transition.");
+  if (
+    meta &&
+    (meta.kind !== "quality_gate_blocked" ||
+      meta.sourceAgent !== agent ||
+      meta.sourcePhase !== phase ||
+      meta.sourceAttempt !== attempt)
+  )
+    return ambiguous(
+      "Structured blocker provenance belongs to another attempt or agent.",
+    );
+  return { kind: "owned", agent, phase, attempt };
+}
+
+export function clearQualityGateBlocker(
+  state: WorkflowState,
+  agent: Role,
+): QualityGateBlocker & { kind: "owned" } {
+  const ownership = classifyQualityGateBlocker(state);
+  if (!ownership || ownership.kind !== "owned" || ownership.agent !== agent)
+    throw new Error(
+      `Cannot clear unrelated or ambiguous blocker: ${ownership?.kind === "ambiguous" ? ownership.reason : (state.blocker ?? "unknown blocker")}`,
+    );
+  delete state.blocker;
+  delete state.blockerMeta;
+  return ownership;
+}
+
 type BaseRecoveryPlan =
   | { kind: "continue"; nextPhase: Phase; agentId: Role; reason: string }
   | { kind: "retry-agent"; agentId: Role; reason: string }
+  | { kind: "completed-quality-gate-blocked"; agentId: Role; reason: string }
   | { kind: "unconsumed-manual-retry"; agentId: Role; reason: string }
   | { kind: "interrupted-mutation"; agentId: Role; reason: string }
   | { kind: "waiting-user" | "unsafe" | "none"; reason: string };
@@ -450,16 +556,38 @@ async function planWorkflowRecovery(
     return unsafe(
       `Interrupted ${state.inFlight.phase}; inspect repository effects before continuing.`,
     );
-  if (
-    state.blocker?.startsWith("Pentest blocked:") &&
-    state.results.pentester?.status === "BLOCKED"
-  )
+  const gateBlocker = classifyQualityGateBlocker(state);
+  if (gateBlocker?.kind === "ambiguous")
+    return unsafe(
+      `Blocked quality gate provenance is ambiguous: ${gateBlocker.reason}`,
+    );
+  if (gateBlocker?.kind === "owned") {
+    if (state.commit || (await head(cwd)) !== state.baseline.head)
+      return unsafe(
+        "Repository HEAD changed; blocked gate cannot be retried safely.",
+      );
+    if (state.gateHashes) {
+      try {
+        if (
+          (await unexpectedWorkflowPaths(state)).length ||
+          JSON.stringify(await gateSnapshot(state)) !==
+            JSON.stringify(state.gateHashes)
+        )
+          return unsafe(
+            "Repository changed after a quality gate; blocked gate cannot be retried safely.",
+          );
+      } catch (error) {
+        return unsafe(
+          `Cannot verify repository before retry: ${getErrorMessage(error)}`,
+        );
+      }
+    }
     return {
-      kind: "retry-agent",
-      agentId: "pentester",
-      reason:
-        "Restore the required Pentest capability, then retry the Pentester. Upstream results remain valid.",
+      kind: "completed-quality-gate-blocked",
+      agentId: gateBlocker.agent,
+      reason: `${gateBlocker.agent} run ${gateBlocker.attempt} completed with a BLOCKED gate result. Retry the gate; upstream results remain valid.`,
     };
+  }
   if (
     state.blocker?.startsWith("Command approval pending for ") ||
     state.blocker?.startsWith("File approval pending for ")
@@ -745,7 +873,10 @@ export async function getWorkflowRecoveryPlan(
       { kind: "retry", command: `/team-retry ${plan.agentId}` },
       { kind: "continue", command: "/team-continue" },
     ];
-  else if (plan.kind === "retry-agent")
+  else if (
+    plan.kind === "retry-agent" ||
+    plan.kind === "completed-quality-gate-blocked"
+  )
     actions = [{ kind: "retry", command: `/team-retry ${plan.agentId}` }];
   else if (plan.kind === "interrupted-mutation")
     actions = [

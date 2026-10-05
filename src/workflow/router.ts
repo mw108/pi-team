@@ -164,7 +164,23 @@ export function transition(s: WorkflowState) {
       s.results.pentester = result;
       if (result.status === "BLOCKED") {
         s.pentestCycle = Math.max(0, s.pentestCycle - 1);
-        block(s, `Pentest blocked: ${result.blocker!.message}`);
+        const attempt = s.history.findLast(
+          (event) =>
+            event.event === "agent_attempt_started" &&
+            event.meta?.agent === "pentester",
+        )?.meta?.attempt;
+        block(
+          s,
+          `Pentest blocked: ${result.blocker!.message}`,
+          attempt
+            ? {
+                kind: "quality_gate_blocked",
+                sourceAgent: "pentester",
+                sourcePhase: "PENTEST",
+                sourceAttempt: attempt,
+              }
+            : undefined,
+        );
       } else s.phase = "SECURITY_REVIEW";
       break;
     }
@@ -212,9 +228,22 @@ export function transition(s: WorkflowState) {
       const r = s.results.tester;
       if (!r) throw new Error("Missing Tester result");
       if (r.status === "BLOCKED") {
+        const attempt = s.history.findLast(
+          (event) =>
+            event.event === "agent_attempt_started" &&
+            event.meta?.agent === "tester",
+        )?.meta?.attempt;
         block(
           s,
           `Testing blocked: ${r.reason ?? "Required validation could not run"}`,
+          attempt
+            ? {
+                kind: "quality_gate_blocked",
+                sourceAgent: "tester",
+                sourcePhase: "TEST",
+                sourceAttempt: attempt,
+              }
+            : undefined,
         );
         break;
       }

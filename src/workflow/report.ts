@@ -332,11 +332,16 @@ export function renderBlocked(
     : undefined;
   const completed = s.history
     .filter((entry) => entry.event === "agent_completed")
-    .map((entry) =>
-      roles.includes(entry.detail as Role)
-        ? getAgentDisplayName(s.config, entry.detail as Role)
-        : entry.detail,
-    );
+    .map((entry) => {
+      const agent = entry.detail as Role;
+      const blocked =
+        (agent === "tester" || agent === "pentester") &&
+        s.results[agent]?.status === "BLOCKED";
+      const label = roles.includes(agent)
+        ? getAgentDisplayName(s.config, agent)
+        : entry.detail;
+      return `${blocked ? "◉" : "✓"} ${label}${blocked ? " · BLOCKED" : ""}`;
+    });
   const diagnostics = s.history.findLast(
     (entry) =>
       entry.phase === stopped &&
@@ -381,9 +386,7 @@ export function renderBlocked(
       reason,
       "",
       "Completed",
-      ...(completed.length
-        ? unique(completed).map((item) => `✓ ${item}`)
-        : ["None recorded."]),
+      ...(completed.length ? unique(completed) : ["None recorded."]),
       "",
       "Repository changes",
       s.commit
