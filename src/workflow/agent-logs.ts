@@ -11,6 +11,7 @@ import { getActiveSolverIds } from "../config/solvers.ts";
 import { solverIds } from "../agents/schemas.ts";
 import { formatApprovedCommand } from "../ui/activity.ts";
 import { redactStructured } from "../agents/redaction.ts";
+import { redactRawToolArguments } from "../agents/provider-tool-calls.ts";
 
 export { redactVisibleText } from "../agents/redaction.ts";
 
@@ -24,7 +25,18 @@ export class AttemptLogger {
   private queue = Promise.resolve();
   constructor(readonly path: string) {}
   append(event: LogEvent) {
-    const line = `${JSON.stringify(redactStructured({ ...event, at: event.at ?? new Date().toISOString() }))}\n`;
+    const safe: LogEvent = redactStructured({
+      ...event,
+      at: event.at ?? new Date().toISOString(),
+    });
+    if (
+      event.type === "provider_tool_call_raw" &&
+      typeof event.rawArguments === "string"
+    )
+      safe.rawArguments = redactRawToolArguments(
+        event.rawArguments.slice(0, 16384),
+      );
+    const line = `${JSON.stringify(safe)}\n`;
     this.queue = this.queue
       .then(async () => {
         const file = await open(
@@ -117,7 +129,16 @@ export class AgentLogStore {
     const lines = raw.split("\n").filter(Boolean);
     return lines.flatMap((line, index) => {
       try {
-        return [redactStructured(JSON.parse(line) as LogEvent)];
+        const event = JSON.parse(line) as LogEvent;
+        const safe = redactStructured(event);
+        if (
+          event.type === "provider_tool_call_raw" &&
+          typeof event.rawArguments === "string"
+        )
+          safe.rawArguments = redactRawToolArguments(
+            event.rawArguments.slice(0, 16384),
+          );
+        return [safe];
       } catch {
         if (index === lines.length - 1 && !raw.endsWith("\n")) return [];
         throw new Error("Agent log contains an invalid JSONL record");
@@ -319,6 +340,10 @@ export class AgentLogStore {
                                                                             ? "completed"
                                                                             : undefined;
       if (label) lines.push(`${time} ${label}`);
+      if (event.type === "provider_tool_call_raw")
+        lines.push(
+          `${time} provider request ${event.providerRequest} raw tool ${event.tool ?? event.toolCallIndex}: ${event.rawArguments} (${event.parseStatus})`,
+        );
       if (event.type === "provider_request_failure") {
         lines.push(...errorLines(event.error));
         const configuredTimeout = (

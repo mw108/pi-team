@@ -287,6 +287,7 @@ export class PiRunner implements AgentRunner {
           }
         : undefined,
       normalizedResponse,
+      config.logging.agentLogs.level,
     );
     const paths: string[] = [],
       factories: any[] = [];

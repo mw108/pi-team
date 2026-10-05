@@ -228,6 +228,34 @@ test("summary JSONL correlates model arguments with separate tool execution inpu
       const providerEvent = params[9];
       const normalizedResponse = params[14];
       providerEvent?.({
+        type: "provider_tool_call_raw",
+        providerRequest: 1,
+        provider: "local",
+        model: "fixture",
+        api: "openai-completions",
+        networkRetry: 0,
+        requestStartedAt: new Date().toISOString(),
+        toolCallIndex: 0,
+        toolCallId: "empty",
+        tool: "team_command",
+        rawArguments: "{}",
+        parseStatus: "ok",
+      });
+      providerEvent?.({
+        type: "provider_tool_call_raw",
+        providerRequest: 1,
+        provider: "local",
+        model: "fixture",
+        api: "openai-completions",
+        networkRetry: 0,
+        requestStartedAt: new Date().toISOString(),
+        toolCallIndex: 1,
+        toolCallId: "valid",
+        tool: "team_command",
+        rawArguments: JSON.stringify(original),
+        parseStatus: "ok",
+      });
+      providerEvent?.({
         type: "provider_request_end",
         providerRequest: 1,
         provider: "local",
@@ -272,6 +300,18 @@ test("summary JSONL correlates model arguments with separate tool execution inpu
   const state = await engine.start("Fixture", cfg);
   await engine.invoke("researcher", state);
   const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  const raw = events.filter((event) => event.type === "provider_tool_call_raw");
+  assert.deepEqual(
+    raw.map((event) => [
+      event.toolCallId,
+      event.providerRequest,
+      event.rawArguments,
+    ]),
+    [
+      ["empty", 1, "{}"],
+      ["valid", 1, JSON.stringify(original)],
+    ],
+  );
   const response = events.find((event) => event.type === "assistant_response")!;
   const content = response.content as Array<{ arguments?: unknown }>;
   assert.deepEqual(content[0].arguments, {});
@@ -291,6 +331,7 @@ test("summary JSONL correlates model arguments with separate tool execution inpu
     [1, 1],
   );
   assert.ok(events.indexOf(response) < events.indexOf(starts[0]));
+  assert.ok(events.indexOf(raw[0]) < events.indexOf(response));
   assert.ok(
     events.findIndex((event) => event.type === "provider_request_end") <
       events.indexOf(response),

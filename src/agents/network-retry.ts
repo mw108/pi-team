@@ -21,6 +21,11 @@ import type {
   ModelPreflightEvent,
   ModelPreflightUpdate,
 } from "./model-preflight.ts";
+import {
+  RawToolCallCollector,
+  type RawToolCallEvent,
+  type ToolCallLogLevel,
+} from "./provider-tool-calls.ts";
 
 export interface ResolvedNetworkRetry {
   maxRetries: number; // 0 means unlimited.
@@ -62,6 +67,7 @@ export type ProviderRequestEvent = {
     | "provider_request_end"
     | "provider_request_failure"
     | "provider_progress"
+    | "provider_tool_call_raw"
     | "tool_call_burst_stream_cutoff";
   providerRequest: number;
   provider: string;
@@ -88,7 +94,7 @@ export type ProviderRequestEvent = {
     maxRetries?: number;
     httpIdleTimeoutMs?: { value: number; source: string };
   };
-};
+} & Partial<Omit<RawToolCallEvent, "type">>;
 
 export type ProviderProgressState =
   "waiting" | "generating" | "reasoning" | "tool_calling";
@@ -286,6 +292,7 @@ export function configureNetworkRetry(
     message: AssistantMessage,
     providerRequest: number,
   ) => void,
+  rawToolCallLevel: ToolCallLogLevel = "summary",
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -335,6 +342,7 @@ export function configureNetworkRetry(
           networkRetry: retry,
           requestStartedAt,
         };
+        const rawToolCalls = new RawToolCallCollector(rawToolCallLevel);
         const progress: ProviderLiveProgress = {
           providerRequest,
           startedAt: requestStarted,
@@ -414,6 +422,11 @@ export function configureNetworkRetry(
             try {
               // This hook is supported by Pi's openai-completions adapter.
               // It also sees usage-only chunks that produce no normalized event.
+              if (
+                rawToolCallLevel !== "off" &&
+                streamModel.api === "openai-completions"
+              )
+                rawToolCalls.observe(data);
               const at = now();
               progress.firstActivityAt ??= at;
               progress.lastActivityAt = at;
@@ -532,6 +545,21 @@ export function configureNetworkRetry(
         }
         const terminal = events.at(-1);
         const failed = terminal?.type === "error";
+        const rawIdentity = {
+          ...identity,
+          provider: identity.provider.slice(0, 128),
+          model: identity.model.slice(0, 256),
+          api: identity.api.slice(0, 128),
+        };
+        if (!failed && !controlledCutoff && terminal?.type === "done") {
+          for (const call of rawToolCalls.events(
+            terminal.message.rawStopReason,
+          ))
+            observeRequest?.({ ...rawIdentity, ...call });
+        } else if (rawToolCallLevel !== "summary") {
+          for (const call of rawToolCalls.events(undefined, true))
+            observeRequest?.({ ...rawIdentity, ...call });
+        }
         const requestDurationMs = now() - requestStarted;
         const timing = {
           requestDurationMs,
