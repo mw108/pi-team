@@ -264,7 +264,8 @@ export const securitySchema = z.object({
   summary: text,
 });
 export const testSchema = z.object({
-  status: z.enum(["PASS", "FAIL"]),
+  status: z.enum(["PASS", "FAIL", "BLOCKED"]),
+  reason: z.string().optional(),
   commands: z.array(
     z.object({
       id: text,

@@ -136,7 +136,7 @@ test("legacy startup command approval resumes without prompting and retains exac
   assert.equal(s.approvedCommands.length, 1);
   assert.equal(s.pendingApproval, undefined);
 });
-test("missing validation configuration fails early without running implementation", async () => {
+test("missing discovered commands do not block Tester runtime approval", async () => {
   const cwd = await repository(),
     cfg = config();
   cfg.commands = [];
@@ -144,12 +144,8 @@ test("missing validation configuration fails early without running implementatio
     engine = new WorkflowEngine(cwd, runner, ui),
     s = await engine.start("Fix", cfg);
   await engine.run(s);
-  assert.equal(s.phase, "BLOCKED");
-  assert.match(
-    s.blocker ?? "",
-    /No validation commands discovered or configured/,
-  );
-  assert.equal(runner.counts.implementor, undefined);
+  assert.ok((runner.counts.implementor ?? 0) >= 1);
+  assert.ok((runner.counts.tester ?? 0) >= 1);
 });
 test("persisted approved/configured ID collisions fail closed", async () => {
   const cwd = await discoveredFixture(),

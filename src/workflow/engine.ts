@@ -70,6 +70,7 @@ import {
   type ApprovalRequest,
 } from "./state.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import { recordVerifiedCommandResult } from "./verified-commands.ts";
 import {
   getActiveSolverIds,
   getRequiredSuccessfulSolverCount,
@@ -92,7 +93,6 @@ import { getErrorMessage } from "../agents/error-message.ts";
 import { toolCallSummary } from "../agents/tool-summary.ts";
 import { commandSummary } from "../agents/command-observability.ts";
 import { approvedCommandsForRole } from "../agents/commands.ts";
-import { allowedCommandCategories } from "../agents/command-policy.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -1547,6 +1547,25 @@ export class WorkflowEngine {
                 attempt: attemptNumber,
                 ...recovery,
               }),
+            async (command, commandEvidence) => {
+              const verified = await recordVerifiedCommandResult(
+                s,
+                command,
+                commandEvidence,
+                role,
+                attemptNumber,
+              );
+              if (!verified) return;
+              authoritative.verifiedCommandResults.push(verified);
+              if (s !== authoritative) s.verifiedCommandResults.push(verified);
+              await this.store.save(authoritative);
+              logged?.logger.append({
+                type: "verified_command_result_recorded",
+                commandId: command.id,
+                exitCode: verified.exitCode,
+                executionId: verified.executionId,
+              });
+            },
             (operation, path, fileSignal) =>
               this.commandApprovals.approveFile(
                 authoritative,
@@ -2326,17 +2345,6 @@ export class WorkflowEngine {
                   ) === i,
               );
               s.commandApprovalComplete = true;
-              if (
-                !s.config.permissions.commands.allow.length &&
-                !effectiveConfig(s).commands.some((c) =>
-                  allowedCommandCategories("tester").includes(c.purpose),
-                ) &&
-                s.config.qualityGates.testing.enabled
-              )
-                block(
-                  s,
-                  "No validation commands approved; configure trusted commands and start a new workflow",
-                );
             } else if (request.kind === "dirtyPaths") {
               for (const path of selected) {
                 assertRelative(path);
@@ -2554,22 +2562,6 @@ export class WorkflowEngine {
         if (s.phase !== "ORCHESTRATE" && !s.commandApprovalComplete) {
           s.discoveredCommands = await discoverCommands(this.cwd);
           s.commandApprovalComplete = true;
-          if (
-            s.config.qualityGates.testing.enabled &&
-            !s.config.permissions.commands.allow.length &&
-            ![
-              ...effectiveConfig(s).commands,
-              ...s.discoveredCommands.map((item) => item.command),
-            ].some((command) =>
-              allowedCommandCategories("tester").includes(command.purpose),
-            )
-          ) {
-            block(
-              s,
-              "No validation commands discovered or configured; configure trusted argv commands and start a new workflow",
-            );
-            break;
-          }
         }
         if (s.phase === "IMPLEMENT") {
           const contract = contractSchema.parse(s.results.reviewer);

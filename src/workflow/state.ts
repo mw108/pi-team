@@ -14,6 +14,7 @@ import {
   similarCommandRuleSchema,
 } from "../agents/runtime-commands.ts";
 import { posix } from "node:path";
+import { verifiedCommandResultSchema } from "./verified-commands.ts";
 import {
   redactVisibleText,
   redactStructured,
@@ -188,6 +189,7 @@ export const stateSchema = z.object({
   runtimeCommandApprovals: z
     .array(z.object({ role: z.enum(roles), command: commandSchema }))
     .default([]),
+  verifiedCommandResults: z.array(verifiedCommandResultSchema).default([]),
   similarCommandRules: z.array(similarCommandRuleSchema).default([]),
   pendingRuntimeCommands: z
     .array(
@@ -449,6 +451,12 @@ export function validateState(value: unknown): WorkflowState {
     if (command.id !== expected.id)
       throw new Error("Runtime role approval identity mismatch");
   }
+  for (const result of state.verifiedCommandResults)
+    if (
+      result.commandIdentity !==
+      JSON.stringify([result.command.executable, result.command.args])
+    )
+      throw new Error("Verified command result identity mismatch");
   for (const rule of state.similarCommandRules)
     normalizedRuntimeCommand(
       {
@@ -510,6 +518,7 @@ export function newState(
     approvedCommands: [],
     runtimeApprovedCommandIds: [],
     runtimeCommandApprovals: [],
+    verifiedCommandResults: [],
     similarCommandRules: [],
     pendingRuntimeCommands: [],
     runtimeFileApprovals: [],

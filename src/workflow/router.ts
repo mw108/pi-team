@@ -211,6 +211,13 @@ export function transition(s: WorkflowState) {
     case "TEST": {
       const r = s.results.tester;
       if (!r) throw new Error("Missing Tester result");
+      if (r.status === "BLOCKED") {
+        block(
+          s,
+          `Testing blocked: ${r.reason ?? "Required validation could not run"}`,
+        );
+        break;
+      }
       if (
         r.status === "PASS" &&
         r.commands.length &&

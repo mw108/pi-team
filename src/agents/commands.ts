@@ -25,6 +25,10 @@ export type RuntimeCommandApprover = (
   request: RuntimeCommandRequest,
   signal?: AbortSignal,
 ) => Promise<"allow" | "deny" | "pending">;
+export type CommandResultObserver = (
+  command: Command,
+  evidence: CommandEvidence,
+) => Promise<void>;
 export interface CommandEvidence {
   id: string;
   exitCode: number;
@@ -32,7 +36,9 @@ export interface CommandEvidence {
   stdout?: string;
   stderr?: string;
   timedOut?: boolean;
+  aborted?: boolean;
   durationMs?: number;
+  completedAt?: string;
   sandbox: SandboxDetails;
 }
 export async function execute(
@@ -112,7 +118,9 @@ export async function execute(
           stdout,
           stderr,
           timedOut,
+          aborted: signal?.aborted ?? false,
           durationMs: Math.max(0, Date.now() - startedAt),
+          completedAt: new Date().toISOString(),
           sandbox: prepared.sandbox,
         });
       });
@@ -128,6 +136,8 @@ export function commandTool(
   evidence: CommandEvidence[],
   runtimeApproval?: RuntimeCommandApprover,
   currentCommands?: () => Command[],
+  onResult?: CommandResultObserver,
+  onDenial?: (status: "denied" | "pending") => void,
 ): ToolDefinition {
   const allowed = approvedCommandsForRole(role, config);
   return {
@@ -176,6 +186,7 @@ export function commandTool(
             signal,
           );
           if (decision !== "allow" || signal?.aborted) {
+            onDenial?.(decision === "deny" ? "denied" : "pending");
             const denied = {
               status: decision === "deny" ? "denied" : "pending",
               code:
@@ -199,6 +210,7 @@ export function commandTool(
         config.execution.sandbox,
       );
       evidence.push(result);
+      await onResult?.(command, result);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         details: result,
