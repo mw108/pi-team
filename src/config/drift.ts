@@ -28,6 +28,7 @@ const runtimeWorkflow = new Set([
   "doomLoop",
 ]);
 const runtimeAgent = new Set([
+  "thinking",
   "temperature",
   "timeoutMs",
   "requestTimeoutMs",

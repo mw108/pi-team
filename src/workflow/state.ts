@@ -80,6 +80,7 @@ export const phases = [
   "WAITING_USER",
   "BLOCKED",
   "DONE",
+  "ABORTED",
 ] as const;
 export type Phase = (typeof phases)[number];
 export const pendingQuestionSchema = questionSchema.extend({

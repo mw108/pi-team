@@ -357,17 +357,19 @@ export function renderBlocked(
             ? `/team-retry ${role}`
             : "Use /team-status and /team-log for details.";
   const reason =
-    role && s.blocker
-      ? s.blocker
-          .replaceAll(
-            `Agent ${role}`,
-            `Agent ${getAgentDisplayName(s.config, role)} (${role})`,
-          )
-          .replace(
-            `Agent execution failed: ${role}:`,
-            `Agent execution failed: ${getAgentDisplayName(s.config, role)} (${role}):`,
-          )
-      : (s.blocker ?? "Unknown blocker");
+    recovery?.kind === "unconsumed-manual-retry"
+      ? recovery.reason
+      : role && s.blocker
+        ? s.blocker
+            .replaceAll(
+              `Agent ${role}`,
+              `Agent ${getAgentDisplayName(s.config, role)} (${role})`,
+            )
+            .replace(
+              `Agent execution failed: ${role}:`,
+              `Agent execution failed: ${getAgentDisplayName(s.config, role)} (${role}):`,
+            )
+        : (s.blocker ?? "Unknown blocker");
   return redactVisibleText(
     [
       "Team BLOCKED",

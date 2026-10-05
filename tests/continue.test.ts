@@ -7,6 +7,7 @@ import { WorkflowEngine } from "../src/workflow/engine.ts";
 import teamExtension from "../src/index.ts";
 import {
   block,
+  record,
   type Phase,
   type WorkflowState,
 } from "../src/workflow/state.ts";
@@ -21,6 +22,321 @@ import { analyzeConfigDrift } from "../src/config/drift.ts";
 import { loadConfig } from "../src/config/loader.ts";
 import { fix } from "../src/workflow/router.ts";
 import { isLimitBlockerStillActive } from "../src/workflow/limit-blocker.ts";
+import { git } from "../src/workflow/git.ts";
+
+async function pendingCodeReviewerRetry() {
+  const fixture = await blockedAt("CODE_REVIEW", [
+    "codeReviewer",
+    "pentester",
+    "securityReviewer",
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  const { state, engine } = fixture;
+  state.agentFailures = 1;
+  record(state, "agent_attempt_started", "codeReviewer run 4 started", {
+    agent: "codeReviewer",
+    attempt: 4,
+    retryNumber: 2,
+  });
+  record(state, "agent_attempt_failed", "codeReviewer run 4: network error", {
+    agent: "codeReviewer",
+    attempt: 4,
+    retryNumber: 2,
+    reason: "network",
+  });
+  record(state, "agent_retry_requested_by_user", "codeReviewer manual retry", {
+    agent: "codeReviewer",
+    attempt: 4,
+  });
+  state.manualRetry = { agent: "codeReviewer", phase: "CODE_REVIEW" };
+  state.blocker =
+    "Project team changed after implementation; inspect repository effects and start a new workflow.";
+  await engine.store.save(state);
+  return fixture;
+}
+
+for (const command of ["retry", "continue"] as const)
+  test(`uploaded Code Reviewer state resumes run 5 through ${command} after restart`, async () => {
+    const { cwd, state } = await pendingCodeReviewerRetry();
+    const plan = await getWorkflowRecoveryPlan(state, cwd);
+    assert.equal(plan.kind, "unconsumed-manual-retry");
+    assert.deepEqual(
+      plan.actions.map((action) => action.command),
+      ["/team-retry codeReviewer", "/team-continue", "/team-abort"],
+    );
+    assert.match(renderBlocked(state, plan), /\/team-retry codeReviewer/);
+    assert.doesNotMatch(plan.reason, /incomplete attempt/);
+    const runner = new FixtureRunner();
+    const restarted = new WorkflowEngine(cwd, runner, ui);
+    const loaded = await restarted.store.load(state.id);
+    const requestsBefore = loaded.history.filter(
+      (event) => event.event === "agent_retry_requested_by_user",
+    ).length;
+    const failuresBefore = loaded.agentFailures;
+    if (command === "retry") {
+      assert.equal(
+        await restarted.retryAgent(loaded, "codeReviewer"),
+        "prepared",
+      );
+      assert.equal(loaded.agentFailures, failuresBefore);
+      assert.equal(
+        loaded.history.filter(
+          (event) => event.event === "agent_retry_requested_by_user",
+        ).length,
+        requestsBefore,
+      );
+      await restarted.run(loaded);
+    } else await restarted.continueBlocked(loaded);
+    const starts = loaded.history.filter(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "codeReviewer",
+    );
+    assert.equal(starts.at(-1)?.meta?.attempt, 5);
+    assert.equal(starts.at(-1)?.meta?.trigger, "manual_retry");
+    assert.equal(loaded.manualRetry, undefined);
+    assert.equal(
+      loaded.history.filter(
+        (event) => event.event === "agent_retry_requested_by_user",
+      ).length,
+      requestsBefore,
+    );
+    assert.equal(loaded.agentFailures, failuresBefore);
+    assert.ok(loaded.results.implementor);
+    assert.ok(loaded.results.codeReviewer);
+  });
+
+test("wrong agent cannot consume a pending Code Reviewer retry", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  await assert.rejects(
+    engine.retryAgent(state, "implementor"),
+    /\/team-retry codeReviewer/,
+  );
+  assert.deepEqual(state.manualRetry, {
+    agent: "codeReviewer",
+    phase: "CODE_REVIEW",
+  });
+});
+
+test("runtime drift between retry request and start remains resumable", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  await editConfig(cwd, (value) => {
+    value.workflow.requestTimeoutMs = 123456;
+    value.agents.implementor.thinking = "high";
+  });
+  const drift = analyzeConfigDrift(state, await loadConfig(cwd));
+  assert.equal(drift.blocking, false);
+  assert.deepEqual(drift.runtimeChanges, [
+    "agents.implementor.thinking",
+    "workflow.requestTimeoutMs",
+  ]);
+  assert.equal(
+    (await getWorkflowRecoveryPlan(state, cwd)).kind,
+    "unconsumed-manual-retry",
+  );
+  const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const loaded = await restarted.store.load(state.id);
+  await restarted.continueBlocked(loaded);
+  assert.equal(
+    loaded.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "codeReviewer",
+    )?.meta?.attempt,
+    5,
+  );
+  assert.equal(loaded.phase, "DONE");
+});
+
+test("interrupted read-only Code Reviewer run retries without repository recovery", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  delete state.manualRetry;
+  state.history = state.history.filter(
+    (event) =>
+      !(
+        event.event === "agent_attempt_failed" &&
+        event.meta?.agent === "codeReviewer"
+      ) &&
+      !(
+        event.event === "agent_retry_requested_by_user" &&
+        event.meta?.agent === "codeReviewer"
+      ),
+  );
+  state.inFlight = { phase: "CODE_REVIEW", roles: ["codeReviewer"] };
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  await engine.store.save(state);
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "retry-agent");
+  assert.equal(plan.actions[0].command, "/team-retry codeReviewer");
+  assert.equal(await engine.retryAgent(state, "codeReviewer"), "prepared");
+  await engine.run(state);
+  assert.equal(
+    state.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "codeReviewer",
+    )?.meta?.attempt,
+    5,
+  );
+  assert.ok(state.results.implementor);
+});
+
+test("retry attempt started before a crash is a separate read-only interruption", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  state.phase = "CODE_REVIEW";
+  delete state.blocker;
+  state.inFlight = { phase: "CODE_REVIEW", roles: ["codeReviewer"] };
+  record(state, "agent_attempt_started", "codeReviewer run 5 started", {
+    agent: "codeReviewer",
+    attempt: 5,
+    trigger: "manual_retry",
+    retryNumber: 3,
+  });
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  await engine.store.save(state);
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.kind, "retry-agent");
+  assert.equal(plan.actions[0].command, "/team-retry codeReviewer");
+  assert.equal(await engine.retryAgent(state, "codeReviewer"), "prepared");
+  await engine.run(state);
+  assert.equal(
+    state.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "codeReviewer",
+    )?.meta?.attempt,
+    6,
+  );
+  assert.equal(state.manualRetry, undefined);
+});
+
+test("persisted abort terminates a queued retry without changing repository files", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  const before = await git(cwd, ["status", "--short"]);
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  await assert.rejects(
+    engine.abortPersisted(state, "implementor"),
+    /Pending retry belongs to codeReviewer/,
+  );
+  await engine.abortPersisted(state, "codeReviewer");
+  assert.equal(state.phase, "ABORTED");
+  assert.equal(state.manualRetry, undefined);
+  assert.equal(await git(cwd, ["status", "--short"]), before);
+  assert.equal((await getWorkflowRecoveryPlan(state, cwd)).actions.length, 0);
+});
+
+test("semantic drift after implementation does not offer Resume", async () => {
+  const { cwd, state, engine } = await pendingCodeReviewerRetry();
+  delete state.manualRetry;
+  delete state.blocker;
+  state.phase = "CODE_REVIEW";
+  await engine.store.save(state);
+  await editConfig(cwd, (value) => {
+    value.qualityGates.codeReview.enabled = false;
+  });
+  await engine.run(state);
+  assert.equal(state.phase, "WAITING_USER");
+  assert.equal(state.pendingApproval?.kind, "configDrift");
+  assert.deepEqual(
+    state.pendingApproval?.options.map((option) => option.value),
+    ["abort"],
+  );
+  assert.match(
+    state.pendingApproval?.prompt ?? "",
+    /Resume is unavailable after implementation/,
+  );
+});
+
+test("recovery planner always exposes an executable action for persisted nonterminal states", async () => {
+  const { cwd, state } = await pendingCodeReviewerRetry();
+  const cases: [string, (copy: WorkflowState) => void][] = [
+    ["unconsumed retry", () => {}],
+    [
+      "ordinary blocked",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.blocker = "Agent execution failed: codeReviewer: network error";
+      },
+    ],
+    [
+      "read-only interrupted",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.inFlight = { phase: "CODE_REVIEW", roles: ["codeReviewer"] };
+        copy.history = copy.history.filter(
+          (event) =>
+            !(
+              event.event === "agent_attempt_failed" &&
+              event.meta?.agent === "codeReviewer"
+            ),
+        );
+      },
+    ],
+    [
+      "mutating interrupted",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.inFlight = { phase: "IMPLEMENT", roles: ["implementor"] };
+      },
+    ],
+    [
+      "research question",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.phase = "WAITING_USER";
+        copy.pendingResearchQuestions = ["What is required?"];
+      },
+    ],
+    [
+      "command approval",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.phase = "WAITING_USER";
+        copy.pendingApproval = {
+          kind: "runtimeCommand",
+          title: "Approve",
+          prompt: "Approve?",
+          options: [],
+        };
+      },
+    ],
+    [
+      "file approval",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.phase = "WAITING_USER";
+        copy.pendingApproval = {
+          kind: "runtimeFile",
+          title: "Approve",
+          prompt: "Approve?",
+          options: [],
+        };
+      },
+    ],
+    [
+      "FIX_REQUIREMENTS decision",
+      (copy) => {
+        delete copy.manualRetry;
+        copy.phase = "WAITING_USER";
+        copy.pendingQuestion = {
+          type: "QUESTION_REQUEST",
+          question: "Clarify?",
+          reason: "Needed",
+          blocking: true,
+        };
+      },
+    ],
+  ];
+  for (const [name, change] of cases) {
+    const copy = structuredClone(state);
+    change(copy);
+    const plan = await getWorkflowRecoveryPlan(copy, cwd);
+    assert.ok(plan.actions.length, `${name}: ${plan.reason}`);
+  }
+});
 
 const ui = { progress: () => {}, ask: async () => undefined };
 async function completed(commit = false, pentest = false) {

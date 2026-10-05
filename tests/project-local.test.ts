@@ -365,7 +365,7 @@ test("config and prompt hashes persist; future prompt drift is accepted", async 
   );
   assert.equal((await engine.store.load(s.id)).phase, "DONE");
 });
-test("drift after implementation blocks automation even if new instructions are approved", async () => {
+test("drift after implementation omits Resume and preserves repository", async () => {
   const cwd = await repository(),
     cfg = config();
   const runner = new FixtureRunner(async (role, s) => {
@@ -377,12 +377,19 @@ test("drift after implementation blocks automation even if new instructions are 
   });
   const engine = new WorkflowEngine(cwd, runner, {
       ...ui,
-      approve: async () => ["resume"],
+      approve: async (request) => {
+        if (request.kind === "configDrift")
+          assert.deepEqual(
+            request.options.map((option) => option.value),
+            ["abort"],
+          );
+        return ["abort"];
+      },
     }),
     s = await engine.start("Fix", cfg),
     before = await head(cwd);
   await engine.run(s);
   assert.equal(s.phase, "BLOCKED");
-  assert.match(s.blocker ?? "", /changed after implementation/);
+  assert.match(s.blocker ?? "", /Configuration drift was not approved/);
   assert.equal(await head(cwd), before);
 });

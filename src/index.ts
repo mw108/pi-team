@@ -47,6 +47,8 @@ async function completionText(state: WorkflowState) {
 }
 async function finalText(state: WorkflowState) {
   if (state.phase === "DONE") return completionText(state);
+  if (state.phase === "ABORTED")
+    return "Team workflow aborted; repository changes preserved.";
   if (state.pendingRuntimeCommands?.length)
     return `Waiting for command approval (${state.pendingRuntimeCommands.length} request${state.pendingRuntimeCommands.length === 1 ? "" : "s"}). Run /team resume ${state.id} to review.`;
   if (state.phase === "BLOCKED")
@@ -190,12 +192,13 @@ export default function teamExtension(pi: ExtensionAPI) {
   });
   pi.registerCommand("team-abort", {
     description:
-      "Stop one running agent without replacement: /team-abort <agent-id>",
+      "Stop a running agent or abort a persisted workflow: /team-abort [agent-id]",
     handler: async (args, ctx) => {
       try {
-        const role = target(args, "team-abort");
+        const role = args.trim() ? target(args, "team-abort") : undefined;
         const root = await projectRoot(ctx.cwd);
         if (
+          role &&
           active?.state &&
           active.state.cwd === root &&
           active.engine &&
@@ -208,16 +211,17 @@ export default function teamExtension(pi: ExtensionAPI) {
           );
         } else {
           const state = await new StateStore(root).latest();
-          if (!state || interruptedMutationRecovery(state)?.agent !== role)
-            throw new Error(
-              `Agent "${role}" (${role}) is not currently running.`,
-            );
-          await new WorkflowEngine(root, new PiRunner(), {
+          if (!state || active)
+            throw new Error("No inactive team workflow to abort.");
+          const engine = new WorkflowEngine(root, new PiRunner(), {
             progress: () => {},
             ask: async () => undefined,
-          }).abortInterruptedRecovery(state, role);
+          });
+          if (role && interruptedMutationRecovery(state)?.agent === role)
+            await engine.abortInterruptedRecovery(state, role);
+          else await engine.abortPersisted(state, role);
           ctx.ui.notify(
-            `${getAgentDisplayName(state.config, role)} (${role}) recovery aborted; repository changes preserved.`,
+            `Team workflow ${state.phase === "ABORTED" ? "aborted" : "recovery aborted"}; repository changes preserved.`,
             "info",
           );
         }
@@ -349,7 +353,12 @@ export default function teamExtension(pi: ExtensionAPI) {
         const state = await new StateStore(root).latest();
         if (!state) throw new Error("No team workflow in this repository.");
         const plan = await getWorkflowRecoveryPlan(state, root);
-        if (plan.kind !== "continue") throw new Error(plan.reason);
+        if (plan.kind !== "continue" && plan.kind !== "unconsumed-manual-retry")
+          throw new Error(
+            plan.reason === "Workflow is already running."
+              ? plan.reason
+              : `${plan.reason} Next safe action: ${recoveryAction(plan)}`,
+          );
         await ctx.waitForIdle();
         runtime = new ProgressRuntime(() => {
           if (runtime?.state) progress(ctx, runtime.state, runtime);
@@ -406,7 +415,10 @@ export default function teamExtension(pi: ExtensionAPI) {
             : (live?.state ?? (await store.latest()));
         if (state) {
           const recovery =
-            state.phase === "BLOCKED"
+            state.phase === "BLOCKED" ||
+            state.phase === "WAITING_USER" ||
+            state.manualRetry ||
+            state.inFlight
               ? await getWorkflowRecoveryPlan(
                   state,
                   root,
@@ -418,7 +430,18 @@ export default function teamExtension(pi: ExtensionAPI) {
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
             redactVisibleText(
-              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${recovery ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}` : ""}\nCommands: /team-steer <agent-id> <message> · /team-abort <agent-id> · /team-retry <agent-id> [keep|discard|override] · /team-continue`,
+              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${
+                recovery
+                  ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}${
+                      recovery.actions.length > 1
+                        ? `\nAlso available: ${recovery.actions
+                            .slice(1)
+                            .map((action) => action.command)
+                            .join(" · ")}`
+                        : ""
+                    }`
+                  : ""
+              }\nCommands: /team-steer <agent-id> <message> · /team-abort [agent-id] · /team-retry <agent-id> [keep|discard|override] · /team-continue`,
             ),
             "info",
           );

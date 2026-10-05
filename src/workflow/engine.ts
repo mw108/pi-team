@@ -79,6 +79,7 @@ import {
 import { solverIds } from "../agents/schemas.ts";
 import {
   getWorkflowRecoveryPlan,
+  classifyManualRetry,
   interruptedMutationRecovery,
   pendingFixRequirements,
 } from "./recovery.ts";
@@ -340,7 +341,42 @@ export class WorkflowEngine {
       await unlock();
     }
   }
+  async abortPersisted(state: WorkflowState, role?: Role) {
+    const unlock = await this.store.lock();
+    try {
+      const latest = await this.store.latest();
+      if (!latest || latest.id !== state.id)
+        throw new Error("Workflow mismatch for abort.");
+      if (latest.phase === "DONE" || latest.phase === "ABORTED")
+        throw new Error("Workflow is already terminal.");
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length
+      )
+        throw new Error("Workflow is currently active.");
+      if (role && latest.manualRetry && latest.manualRetry.agent !== role)
+        throw new Error(
+          `Pending retry belongs to ${latest.manualRetry.agent}; use /team-abort ${latest.manualRetry.agent} or /team-abort.`,
+        );
+      for (const key of Object.keys(state))
+        delete (state as Record<string, unknown>)[key];
+      Object.assign(state, latest);
+      delete state.manualRetry;
+      delete state.inFlight;
+      delete state.pendingApproval;
+      delete state.pendingQuestion;
+      delete state.pendingResearchQuestions;
+      delete state.driftCandidate;
+      state.phase = "ABORTED";
+      record(state, "workflow_aborted", role ?? "workflow");
+      await this.store.save(state);
+    } finally {
+      await unlock();
+    }
+  }
   retryConfirmation(state: WorkflowState, role: Role) {
+    if (state.manualRetry?.agent === role) return undefined;
     if (pendingFixRequirements(state)) return undefined;
     if (role === "reporter" && state.reportFailure) return undefined;
     if (role === "pentester" && state.results.pentester?.status === "BLOCKED")
@@ -601,10 +637,83 @@ export class WorkflowEngine {
     }
     if (this.retryRequests.has(role))
       throw new Error(`Agent ${label} (${role}) is already restarting.`);
+    if (state.manualRetry?.agent === role) {
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length
+      )
+        throw new Error(
+          `Agent ${role} is already active; wait for it to settle.`,
+        );
+      const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        plan.kind === "retry-agent" &&
+        plan.agentId === role &&
+        !mutatingRoles.includes(role)
+      ) {
+        delete state.manualRetry;
+        delete state.inFlight;
+        const targetPhase = (Object.keys(phaseRoles) as Phase[]).find((phase) =>
+          getPhaseRoles(state, phase)?.includes(role),
+        );
+        if (!targetPhase) throw new Error(`Unknown agent ${role}`);
+        state.phase = targetPhase;
+        delete state.blocker;
+        state.manualRetry = { agent: role, phase: targetPhase };
+        this.manualReruns.add(role);
+        record(
+          state,
+          "agent_retry_requested_by_user",
+          `${role} interrupted retry restarted`,
+          {
+            agent: role,
+            attempt: this.nextAttempt(state, role) - 1,
+          },
+        );
+        await this.store.save(state);
+        return "prepared";
+      }
+      if (plan.kind !== "unconsumed-manual-retry" || plan.agentId !== role)
+        throw new Error(
+          `A pending manual retry for ${role} cannot be resumed: ${plan.reason} Next safe action: ${plan.actions.map((a) => a.command).join(" · ")}`,
+        );
+      await this.resumePendingRetryLocked(state, role);
+      return "prepared";
+    }
     if (state.manualRetry)
       throw new Error(
-        `Agent ${getAgentDisplayName(state.config, state.manualRetry.agent)} (${state.manualRetry.agent}) already has a pending manual retry.`,
+        `A ${getAgentDisplayName(state.config, state.manualRetry.agent)} retry is pending. Use /team-retry ${state.manualRetry.agent} or /team-continue.`,
       );
+    if (state.phase === "BLOCKED") {
+      const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        plan.kind === "retry-agent" &&
+        plan.agentId === role &&
+        !state.blocker?.startsWith("Agent execution failed:")
+      ) {
+        const targetPhase = (Object.keys(phaseRoles) as Phase[]).find((phase) =>
+          getPhaseRoles(state, phase)?.includes(role),
+        );
+        if (!targetPhase) throw new Error(`Unknown agent ${role}`);
+        delete state.inFlight;
+        state.phase = targetPhase;
+        delete state.blocker;
+        state.manualRetry = { agent: role, phase: targetPhase };
+        this.manualReruns.add(role);
+        record(
+          state,
+          "agent_retry_requested_by_user",
+          `${role} interrupted read-only retry`,
+          {
+            agent: role,
+            attempt: this.nextAttempt(state, role) - 1,
+          },
+        );
+        await this.store.save(state);
+        return "prepared";
+      }
+    }
     if (this.retryConfirmation(state, role) && !confirmed)
       throw new Error(
         `Retrying completed ${label} (${role}) requires confirmation.`,
@@ -690,6 +799,25 @@ export class WorkflowEngine {
     this.prepareManualRetry(state, role, targetPhase);
     await this.store.save(state);
     return "prepared";
+  }
+  private async resumePendingRetryLocked(state: WorkflowState, role: Role) {
+    const intent = classifyManualRetry(state);
+    if (intent.kind !== "unconsumed" || intent.agent !== role)
+      throw new Error(`No unconsumed retry for ${role}.`);
+    state.phase = intent.phase;
+    delete state.blocker;
+    delete state.inFlight;
+    this.manualReruns.add(role);
+    record(
+      state,
+      "manual_retry_resumed",
+      `${role} run ${intent.sourceAttempt + 1}`,
+      {
+        agent: role,
+        attempt: intent.sourceAttempt + 1,
+      },
+    );
+    await this.store.save(state);
   }
   private prepareManualRetry(state: WorkflowState, role: Role, phase: Phase) {
     const label = getAgentDisplayName(state.config, role);
@@ -1090,6 +1218,13 @@ export class WorkflowEngine {
             trigger,
           },
         );
+        if (
+          trigger === "manual_retry" &&
+          authoritative.manualRetry?.agent === role
+        ) {
+          delete authoritative.manualRetry;
+          await this.store.save(authoritative);
+        }
         const result = parseResult(
           role,
           await this.runner.run(
@@ -1819,10 +1954,18 @@ export class WorkflowEngine {
         this.cwd,
         this.running || this.activeAttempts.size > 0,
       );
-      if (plan.kind !== "continue") throw new Error(plan.reason);
+      if (plan.kind !== "continue" && plan.kind !== "unconsumed-manual-retry")
+        throw new Error(
+          `${plan.reason} Next safe action: ${plan.actions.map((a) => a.command).join(" · ")}`,
+        );
       for (const key of Object.keys(s))
         delete (s as Record<string, unknown>)[key];
       Object.assign(s, latest);
+      if (plan.kind === "unconsumed-manual-retry") {
+        await this.resumePendingRetryLocked(s, plan.agentId);
+        handedToRun = true;
+        return await this.run(s, signal, unlock);
+      }
       if (s.blocker === "Local fix cycle limit reached") s.localFixCycle++;
       if (s.blocker?.startsWith("Research clarification limit reached")) {
         const questions = [
@@ -2014,7 +2157,7 @@ export class WorkflowEngine {
         record(s, "legacy_command_approval_skipped");
         await this.store.save(s);
       }
-      while (!["DONE", "BLOCKED"].includes(s.phase)) {
+      while (!["DONE", "BLOCKED", "ABORTED"].includes(s.phase)) {
         if (signal?.aborted) {
           record(s, "interrupted");
           await this.store.save(s);
@@ -2063,6 +2206,12 @@ export class WorkflowEngine {
             break;
           }
           if (drift.blocking) {
+            const postImplementation = Boolean(
+              s.results.implementor || s.commitIntent || s.commit,
+            );
+            const cycleLimit =
+              Object.keys(s.results).length > 0 &&
+              s.fullCycle >= s.config.workflow.maxFullCycles;
             s.driftCandidate = {
               configPath: current.path,
               configHash: current.configHash,
@@ -2072,14 +2221,18 @@ export class WorkflowEngine {
             s.pendingApproval = {
               kind: "configDrift",
               title: "Project team definition changed",
-              prompt: `Configuration drift detected.\n${driftSummary(drift)}\nAbort is the safe default. Resuming restarts reasoning with the new team definition and original cycle limits; after implementation it is unavailable.`,
+              prompt: `Configuration drift detected.\n${driftSummary(drift)}\n${postImplementation ? "Resume is unavailable after implementation because the existing work was based on the previous team definition." : cycleLimit ? "Resume is unavailable because the full design cycle limit has been reached." : "Resuming restarts reasoning with the new team definition and original cycle limits."}`,
               options: [
-                {
-                  value: "resume",
-                  label: "Resume with new config",
-                  description:
-                    "Restart reasoning before implementation with refreshed project prompts and config",
-                },
+                ...(!postImplementation && !cycleLimit
+                  ? [
+                      {
+                        value: "resume",
+                        label: "Resume with new config",
+                        description:
+                          "Restart reasoning before implementation with refreshed project prompts and config",
+                      },
+                    ]
+                  : []),
                 {
                   value: "abort",
                   label: "Abort this workflow",
@@ -2087,6 +2240,7 @@ export class WorkflowEngine {
                 },
               ],
             };
+            s.resumePhase = s.phase;
             s.phase = "WAITING_USER";
             record(s, "configuration_drift", changed.join(", "));
             await this.store.save(s);
@@ -2278,6 +2432,7 @@ export class WorkflowEngine {
               } else {
                 const candidate = s.driftCandidate,
                   current = await loadConfig(this.cwd);
+                const analysis = analyzeConfigDrift(s, current);
                 if (
                   !candidate ||
                   candidate.configPath !== current.path ||
@@ -2289,7 +2444,10 @@ export class WorkflowEngine {
                     s,
                     "Team definition changed again during approval; inspect and start a new workflow.",
                   );
-                else if (s.results.implementor || s.commitIntent || s.commit)
+                else if (!analysis.blocking) {
+                  acceptConfigDrift(s, current, analysis);
+                  s.phase = s.resumePhase ?? s.manualRetry?.phase ?? "RESEARCH";
+                } else if (s.results.implementor || s.commitIntent || s.commit)
                   block(
                     s,
                     "Project team changed after implementation; inspect repository effects and start a new workflow.",
@@ -2316,6 +2474,7 @@ export class WorkflowEngine {
                   s.agentPromptHashes = current.agentPromptHashes;
                   s.phase = "ORCHESTRATE";
                   delete s.pendingQuestion;
+                  delete s.manualRetry;
                   delete s.pendingResearchQuestions;
                   delete s.researchClarificationPending;
                   delete s.resumePhase;
@@ -2568,7 +2727,10 @@ export class WorkflowEngine {
             contractPaths(contract),
           );
         }
-        const manualAtStart = new Set(this.manualReruns);
+        const manualAtStart = new Set<Role>([
+          ...this.manualReruns,
+          ...(s.manualRetry ? [s.manualRetry.agent] : []),
+        ]);
         this.manualReruns.clear();
         s.inFlight = { phase: s.phase, roles: runRoles };
         record(s, "phase_started", runRoles.join(", "));
@@ -2649,7 +2811,7 @@ export class WorkflowEngine {
                 }
               : result;
           } else {
-            if (s.manualRetry?.agent === role && !this.manualReruns.has(role)) {
+            if (manualAtStart.has(role)) {
               this.invalidateDependents(s, role);
               delete s.manualRetry;
             }
@@ -2726,7 +2888,7 @@ export class WorkflowEngine {
           const valid = getActiveSolverIds(s.config).filter(
             (role) => !!s.results[role],
           ).length;
-          if (valid >= required && !s.manualRetry) {
+          if (valid >= required && !manualAtStart.size) {
             record(
               s,
               "solver_quorum_satisfied",

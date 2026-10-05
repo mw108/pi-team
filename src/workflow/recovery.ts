@@ -107,11 +107,116 @@ const mutating = new Set<Role>([
   "tester",
   "commitAgent",
 ]);
-export type WorkflowRecoveryPlan =
+export type ManualRetryState =
+  | { kind: "none" }
+  | { kind: "unconsumed"; agent: Role; phase: Phase; sourceAttempt: number }
+  | { kind: "active" | "consumed"; agent: Role; phase: Phase; attempt: number }
+  | { kind: "ambiguous"; agent: Role; phase: Phase; reason: string };
+
+/** Infer legacy retry intent from recorded lifecycle, without rewriting history. */
+export function classifyManualRetry(
+  state: WorkflowState,
+  liveAgents: ReadonlySet<Role> = new Set(),
+): ManualRetryState {
+  const intent = state.manualRetry;
+  if (!intent) return { kind: "none" };
+  const { agent, phase } = intent;
+  const ambiguous = (reason: string): ManualRetryState => ({
+    kind: "ambiguous",
+    agent,
+    phase,
+    reason,
+  });
+  const requestIndex = state.history.findLastIndex(
+    (event) =>
+      event.event === "agent_retry_requested_by_user" &&
+      event.meta?.agent === agent,
+  );
+  if (requestIndex < 0) return ambiguous("Retry request has no history event.");
+  const request = state.history[requestIndex];
+  const sourceAttempt = request.meta?.attempt;
+  if (!sourceAttempt) return ambiguous("Retry request has no source attempt.");
+  const starts = state.history.filter(
+    (event) =>
+      event.event === "agent_attempt_started" && event.meta?.agent === agent,
+  );
+  const sourceStarts = starts.filter(
+    (event) => event.meta?.attempt === sourceAttempt,
+  );
+  const terminals = state.history.filter(
+    (event) =>
+      (event.event === "agent_attempt_completed" ||
+        event.event === "agent_attempt_failed") &&
+      event.meta?.agent === agent &&
+      event.meta.attempt === sourceAttempt,
+  );
+  if (sourceStarts.length !== 1 || terminals.length !== 1)
+    return ambiguous("Source attempt lifecycle is incomplete or ambiguous.");
+  if (
+    state.history.indexOf(sourceStarts[0]) >=
+      state.history.indexOf(terminals[0]) ||
+    state.history.indexOf(sourceStarts[0]) >= requestIndex
+  )
+    return ambiguous("Retry request does not follow the source attempt start.");
+  if (
+    state.history
+      .slice(state.history.indexOf(sourceStarts[0]) + 1, requestIndex + 1)
+      .filter(
+        (event) =>
+          event.event === "agent_retry_requested_by_user" &&
+          event.meta?.agent === agent,
+      ).length !== 1
+  )
+    return ambiguous("Multiple retry requests target the same source attempt.");
+  const newer = state.history
+    .slice(requestIndex + 1)
+    .filter(
+      (event) =>
+        event.event === "agent_attempt_started" && event.meta?.agent === agent,
+    );
+  if (
+    newer.length > 1 ||
+    (newer.length && newer[0].meta?.attempt !== sourceAttempt + 1)
+  )
+    return ambiguous("Retry attempt numbering is ambiguous.");
+  if (
+    newer.length &&
+    newer[0].meta?.trigger &&
+    newer[0].meta.trigger !== "manual_retry"
+  )
+    return ambiguous("Newer attempt was not attributed to the pending retry.");
+  if (newer.length)
+    return {
+      kind: liveAgents.has(agent) ? "active" : "consumed",
+      agent,
+      phase,
+      attempt: newer[0].meta!.attempt,
+    };
+  if (liveAgents.has(agent))
+    return ambiguous("Agent is live before retry start was recorded.");
+  return { kind: "unconsumed", agent, phase, sourceAttempt };
+}
+
+export type RecoveryAction = {
+  kind:
+    | "continue"
+    | "retry"
+    | "retry_keep"
+    | "retry_discard"
+    | "retry_override"
+    | "resume"
+    | "abort";
+  command: string;
+};
+type BaseRecoveryPlan =
   | { kind: "continue"; nextPhase: Phase; agentId: Role; reason: string }
   | { kind: "retry-agent"; agentId: Role; reason: string }
+  | { kind: "unconsumed-manual-retry"; agentId: Role; reason: string }
   | { kind: "interrupted-mutation"; agentId: Role; reason: string }
   | { kind: "waiting-user" | "unsafe" | "none"; reason: string };
+export type WorkflowRecoveryPlan = BaseRecoveryPlan & {
+  actions: RecoveryAction[];
+};
 
 export function interruptedMutationRecovery(state: WorkflowState) {
   if (state.phase !== "BLOCKED") return undefined;
@@ -186,6 +291,7 @@ export function interruptedMutationRecovery(state: WorkflowState) {
 }
 
 export function recoveryAction(plan: WorkflowRecoveryPlan): string {
+  if (plan.actions.length) return plan.actions[0].command;
   if (plan.kind === "continue") return "/team-continue";
   if (plan.kind === "retry-agent") return `/team-retry ${plan.agentId}`;
   if (plan.kind === "interrupted-mutation")
@@ -195,12 +301,12 @@ export function recoveryAction(plan: WorkflowRecoveryPlan): string {
   return plan.reason;
 }
 
-export async function getWorkflowRecoveryPlan(
+async function planWorkflowRecovery(
   state: WorkflowState,
   cwd: string,
   active = false,
-): Promise<WorkflowRecoveryPlan> {
-  const unsafe = (reason: string): WorkflowRecoveryPlan => ({
+): Promise<BaseRecoveryPlan> {
+  const unsafe = (reason: string): BaseRecoveryPlan => ({
     kind: "unsafe",
     reason,
   });
@@ -222,7 +328,10 @@ export async function getWorkflowRecoveryPlan(
     };
   if (state.phase === "DONE")
     return { kind: "none", reason: "Workflow is already DONE." };
-  if (state.phase !== "BLOCKED") return unsafe("Workflow is already running.");
+  if (state.phase === "ABORTED")
+    return { kind: "none", reason: "Workflow is already ABORTED." };
+  if (state.phase !== "BLOCKED" && !state.inFlight && !state.manualRetry)
+    return unsafe("Workflow is already running.");
   if (state.driftCandidate)
     return unsafe("Configuration drift requires user review.");
   if (
@@ -257,6 +366,85 @@ export async function getWorkflowRecoveryPlan(
       agentId: interrupted.agent,
       reason: `Recovery required: Implementor was interrupted during a mutating run.\nRepository: ${safe} safe to discard; ${ambiguous} ambiguous.\n${ambiguous ? `Inspect ambiguous paths: ${classification.ambiguous.join(", ")}\n` : recommendDiscard ? "Recommended: /team-retry implementor discard\n" : ""}Options: /team-retry implementor keep · /team-retry implementor discard · /team-abort implementor\nPlease inspect repository changes before retrying.`,
     };
+  }
+  const manual = classifyManualRetry(state);
+  if (manual.kind === "unconsumed" && !state.inFlight) {
+    if (state.commit || (await head(cwd)) !== state.baseline.head)
+      return unsafe(
+        "Repository HEAD changed; pending retry cannot start safely.",
+      );
+    if (
+      state.gateHashes &&
+      ["CODE_REVIEW", "PENTEST", "SECURITY_REVIEW", "TEST", "COMMIT"].includes(
+        manual.phase,
+      )
+    ) {
+      try {
+        if (
+          (await unexpectedWorkflowPaths(state)).length ||
+          JSON.stringify(await gateSnapshot(state)) !==
+            JSON.stringify(state.gateHashes)
+        )
+          return unsafe(
+            "Repository changed after a quality gate; pending retry cannot start safely.",
+          );
+      } catch (error) {
+        return unsafe(
+          `Cannot verify repository before retry: ${getErrorMessage(error)}`,
+        );
+      }
+    }
+    return {
+      kind: "unconsumed-manual-retry",
+      agentId: manual.agent,
+      reason: `A ${manual.agent} retry was requested but did not start. Run ${manual.sourceAttempt} ended; the pending retry will start as run ${manual.sourceAttempt + 1}.`,
+    };
+  }
+  if (manual.kind === "consumed" && !mutating.has(manual.agent)) {
+    const terminals = state.history.filter(
+      (event) =>
+        (event.event === "agent_attempt_completed" ||
+          event.event === "agent_attempt_failed") &&
+        event.meta?.agent === manual.agent &&
+        event.meta.attempt === manual.attempt,
+    );
+    if (terminals.length <= 1 && !state.results[manual.agent])
+      return {
+        kind: "retry-agent",
+        agentId: manual.agent,
+        reason: terminals.length
+          ? `${manual.agent} retry run ${manual.attempt} ended without a result. Retry it explicitly.`
+          : `${manual.agent} retry run ${manual.attempt} was interrupted. Retry this read-only agent explicitly.`,
+      };
+  }
+  if (
+    manual.kind === "ambiguous" ||
+    manual.kind === "consumed" ||
+    manual.kind === "active"
+  )
+    return unsafe(
+      `Pending ${state.manualRetry?.agent} retry needs explicit recovery: ${manual.kind === "ambiguous" ? manual.reason : "a newer attempt already started"}.`,
+    );
+  if (state.inFlight && state.inFlight.roles.length === 1) {
+    const role = state.inFlight.roles[0];
+    const started = state.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" && event.meta?.agent === role,
+    );
+    const attempt = started?.meta?.attempt;
+    const terminal = state.history.some(
+      (event) =>
+        (event.event === "agent_attempt_completed" ||
+          event.event === "agent_attempt_failed") &&
+        event.meta?.agent === role &&
+        event.meta.attempt === attempt,
+    );
+    if (!mutating.has(role) && attempt && !terminal)
+      return {
+        kind: "retry-agent",
+        agentId: role,
+        reason: `${role} run ${attempt} was interrupted before a terminal event. Retry this read-only agent.`,
+      };
   }
   if (state.inFlight)
     return unsafe(
@@ -420,15 +608,27 @@ export async function getWorkflowRecoveryPlan(
       return unsafe(
         `${started} started without a successful result; inspect repository changes before retrying.`,
       );
-    if (staleLimit && state.blocker === "Agent failure limit reached")
-      return {
-        kind: "retry-agent",
-        agentId: started,
-        reason: `Previous agent failure limit no longer applies; retry ${started}.`,
-      };
-    return unsafe(
-      `${started} already has an incomplete attempt; inspect workflow history before recovery.`,
+    const attempt = state.history.findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === started,
+    )?.meta?.attempt;
+    const terminals = state.history.filter(
+      (event) =>
+        (event.event === "agent_attempt_completed" ||
+          event.event === "agent_attempt_failed") &&
+        event.meta?.agent === started &&
+        event.meta.attempt === attempt,
     );
+    if (terminals.length > 1 || !attempt)
+      return unsafe(`${started} attempt lifecycle is ambiguous.`);
+    return {
+      kind: "retry-agent",
+      agentId: started,
+      reason: terminals.length
+        ? `${started} run ${attempt} ended without a successful result. Retry it explicitly.`
+        : `${started} run ${attempt} was interrupted. This agent cannot modify the repository and can be retried.`,
+    };
   }
   if (
     phase === "IMPLEMENT" &&
@@ -523,4 +723,42 @@ export async function getWorkflowRecoveryPlan(
       ? `Previous ${state.blocker} no longer applies. Continue at ${phase}.`
       : `Continue at ${phase}.`,
   };
+}
+
+/** Decisions take priority over mutation recovery, queued retries, and normal continuation. */
+export async function getWorkflowRecoveryPlan(
+  state: WorkflowState,
+  cwd: string,
+  active = false,
+): Promise<WorkflowRecoveryPlan> {
+  const plan = await planWorkflowRecovery(state, cwd, active);
+  if (active)
+    return {
+      ...plan,
+      actions: [{ kind: "abort", command: "/team-stop" }],
+    } as WorkflowRecoveryPlan;
+  let actions: RecoveryAction[] = [];
+  if (plan.kind === "continue")
+    actions = [{ kind: "continue", command: "/team-continue" }];
+  else if (plan.kind === "unconsumed-manual-retry")
+    actions = [
+      { kind: "retry", command: `/team-retry ${plan.agentId}` },
+      { kind: "continue", command: "/team-continue" },
+    ];
+  else if (plan.kind === "retry-agent")
+    actions = [{ kind: "retry", command: `/team-retry ${plan.agentId}` }];
+  else if (plan.kind === "interrupted-mutation")
+    actions = [
+      { kind: "retry_keep", command: `/team-retry ${plan.agentId} keep` },
+      { kind: "retry_discard", command: `/team-retry ${plan.agentId} discard` },
+    ];
+  else if (plan.kind === "waiting-user")
+    actions = [{ kind: "resume", command: `/team resume ${state.id}` }];
+  if (
+    plan.kind !== "none" &&
+    state.phase !== "DONE" &&
+    state.phase !== "ABORTED"
+  )
+    actions.push({ kind: "abort", command: "/team-abort" });
+  return { ...plan, actions } as WorkflowRecoveryPlan;
 }
