@@ -13,6 +13,7 @@ import {
   type TeamDefinition,
 } from "../config/loader.ts";
 import type { AgentRunner } from "../agents/runner.ts";
+import { normalizedResponseForLog } from "../agents/normalized-response.ts";
 import type { ObservedFileMutation } from "../agents/mutation-attribution.ts";
 import { resolveRequestTimeout } from "../agents/request-timeout.ts";
 import {
@@ -1194,8 +1195,10 @@ export class WorkflowEngine {
           started: number;
           command?: ReturnType<typeof sanitizeCommandForLog>;
           authorization?: { source: string; decision: string };
+          providerRequest?: number;
         }
       >();
+      const modelToolRequests = new Map<string, number>();
       const networkHistoryWrites: Promise<void>[] = [];
       let providerRequests = 0;
       let failedRequest:
@@ -1319,6 +1322,9 @@ export class WorkflowEngine {
                 calls.set(key, {
                   name: safeName,
                   started: Date.now(),
+                  ...(modelToolRequests.has(key)
+                    ? { providerRequest: modelToolRequests.get(key) }
+                    : {}),
                   ...(command ? { command } : {}),
                   ...(authorization ? { authorization } : {}),
                 });
@@ -1327,6 +1333,10 @@ export class WorkflowEngine {
                   tool: safeName,
                   agent: role,
                   attempt: attemptNumber,
+                  ...(toolCallId ? { toolCallId } : {}),
+                  ...(modelToolRequests.has(key)
+                    ? { providerRequest: modelToolRequests.get(key) }
+                    : {}),
                   activity: activity.label,
                   ...(activity.provider ? { provider: activity.provider } : {}),
                   ...(summary ? { summary } : {}),
@@ -1361,6 +1371,10 @@ export class WorkflowEngine {
                     tool: call.name,
                     agent: role,
                     attempt: attemptNumber,
+                    ...(toolCallId ? { toolCallId } : {}),
+                    ...(call.providerRequest === undefined
+                      ? {}
+                      : { providerRequest: call.providerRequest }),
                     durationMs: Date.now() - call.started,
                     ...(!outcome ? { success: success ?? true } : {}),
                     ...(call.command
@@ -1378,6 +1392,7 @@ export class WorkflowEngine {
                     ...(safeOutcome ?? {}),
                   });
                   calls.delete(key);
+                  modelToolRequests.delete(key);
                 }
               }
               this.emitAgentEvent(
@@ -1642,6 +1657,23 @@ export class WorkflowEngine {
                 exitCode: verified.exitCode,
                 executionId: verified.executionId,
               });
+            },
+            (message, providerRequest) => {
+              if (!logged) return;
+              const level = s.config.logging.agentLogs.level;
+              const response = normalizedResponseForLog(
+                message,
+                providerRequest,
+                level === "off" ? "summary" : level,
+              );
+              logged.logger.append({
+                ...response,
+                agent: role,
+                attempt: attemptNumber,
+              });
+              for (const block of message.content)
+                if (block.type === "toolCall")
+                  modelToolRequests.set(block.id, providerRequest);
             },
             (operation, path, fileSignal) =>
               this.commandApprovals.approveFile(

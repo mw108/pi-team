@@ -1,7 +1,12 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessageEvent, Api, Model } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  AssistantMessageEvent,
+  Api,
+  Model,
+} from "@earendil-works/pi-ai";
 import type { Role } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
 import {
@@ -277,6 +282,10 @@ export function configureNetworkRetry(
   observePreflightProgress?: (update: ModelPreflightUpdate) => void,
   requestTimeout?: ResolvedRequestTimeout,
   streamGuard?: StreamToolCallGuard,
+  observeResponse?: (
+    message: AssistantMessage,
+    providerRequest: number,
+  ) => void,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
@@ -595,6 +604,13 @@ export function configureNetworkRetry(
               : classification?.classification
             : undefined;
         if (!category) {
+          if (terminal?.type === "done") {
+            try {
+              observeResponse?.(terminal.message, providerRequest);
+            } catch {
+              // Logging cannot interrupt a completed provider response.
+            }
+          }
           for (const event of events) result.push(event);
           result.end();
           if (retry > 0 && terminal?.type === "done")

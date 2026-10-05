@@ -8,6 +8,7 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { z } from "zod";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { pathToFileURL } from "node:url";
 import { agentDir } from "../config/loader.ts";
 import {
@@ -184,6 +185,10 @@ export interface AgentRunner {
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
     commandResult?: CommandResultObserver,
+    normalizedResponse?: (
+      message: AssistantMessage,
+      providerRequest: number,
+    ) => void,
     fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
   ): Promise<unknown>;
@@ -212,6 +217,10 @@ export class PiRunner implements AgentRunner {
     mutationObserver?: MutationObserver,
     commandResult?: CommandResultObserver,
     commandDenied?: (status: "denied" | "pending") => void,
+    normalizedResponse?: (
+      message: AssistantMessage,
+      providerRequest: number,
+    ) => void,
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
       selected = config.agents[role];
@@ -277,6 +286,7 @@ export class PiRunner implements AgentRunner {
               guardState.guard.streamCutoff(providerRequest, observed, limit),
           }
         : undefined,
+      normalizedResponse,
     );
     const paths: string[] = [],
       factories: any[] = [];
@@ -459,6 +469,10 @@ export class PiRunner implements AgentRunner {
     runtimeApproval?: RuntimeCommandApprover,
     outputRecovered?: (recovery: OutputRecovery) => void,
     commandResult?: CommandResultObserver,
+    normalizedResponse?: (
+      message: AssistantMessage,
+      providerRequest: number,
+    ) => void,
     fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
   ) {
@@ -564,6 +578,7 @@ export class PiRunner implements AgentRunner {
       (status) => {
         if (status === "denied") commandDenied = true;
       },
+      normalizedResponse,
     );
     entry.session = session;
     try {
