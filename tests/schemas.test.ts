@@ -10,6 +10,9 @@ import { PiRunner } from "../src/agents/runner.ts";
 import { newState } from "../src/workflow/state.ts";
 import { config, contract, output, repository } from "./helpers.ts";
 import { baseline } from "../src/workflow/git.ts";
+import { AgentOutputError } from "../src/agents/errors.ts";
+import { WorkflowEngine } from "../src/workflow/engine.ts";
+import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 test("structured results accept valid data and reject invalid routing", () => {
   const reviewed = parseResult("codeReviewer", {
     status: "APPROVED",
@@ -71,7 +74,7 @@ test("structured output scanner handles nesting and escaped string content", () 
   };
   assert.deepEqual(parseText("critic", JSON.stringify(critic) + "}"), critic);
 });
-test("structured output rejects other malformed content and preserves parse errors", () => {
+test("structured output rejects other malformed content with typed failures", () => {
   const valid = JSON.stringify(output("orchestrator"));
   for (const raw of [
     valid + valid,
@@ -80,16 +83,12 @@ test("structured output rejects other malformed content and preserves parse erro
     '{"requirements":["x"] "summary":"y"}',
     "Here is the JSON:\n" + valid,
   ]) {
-    let originalMessage = "";
-    try {
-      JSON.parse(raw);
-    } catch (error) {
-      originalMessage = (error as SyntaxError).message;
-    }
     assert.throws(
       () => parseText("orchestrator", raw),
       (error: unknown) =>
-        error instanceof SyntaxError && error.message === originalMessage,
+        error instanceof AgentOutputError &&
+        error.kind === "parse" &&
+        !/Unexpected token/.test(error.message),
     );
   }
   let recovered = false;
@@ -189,8 +188,50 @@ test("persistent malformed output fails after one correction", async () => {
       dispose: () => {},
       abort: async () => {},
     }) as any;
-  await assert.rejects(() => runner.run("orchestrator", s));
+  await assert.rejects(
+    () => runner.run("orchestrator", s),
+    (error: unknown) =>
+      error instanceof AgentOutputError && error.kind === "parse",
+  );
   assert.equal(prompts, 2);
+});
+test("malformed final output is counted once and logged with a redacted preview", async () => {
+  const cwd = await repository();
+  const runner = new PiRunner();
+  let prompts = 0;
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async () => {
+        prompts++;
+      },
+      getLastAssistantText: () =>
+        "<tool_call>--token=private-value</tool_call>",
+      setActiveToolsByName: () => {},
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress() {},
+    async ask() {
+      return undefined;
+    },
+  });
+  const state = await engine.start("Fix", config());
+  await assert.rejects(
+    engine.invoke("researcher", state),
+    (error: unknown) =>
+      error instanceof AgentOutputError &&
+      (error as AgentOutputError & { failures: number }).failures === 1 &&
+      !/Unexpected token/.test(error.message),
+  );
+  assert.equal(prompts, 2);
+  const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
+  const failure = events.find((event) => event.type === "provider_error")!;
+  assert.equal(failure.category, "agent_output");
+  assert.match(String(failure.rawFinalResponsePreview), /\[REDACTED\]/);
+  assert.doesNotMatch(JSON.stringify(events), /private-value/);
 });
 test("Tester executes real configured commands and cannot fabricate PASS", async () => {
   const cwd = await repository(),

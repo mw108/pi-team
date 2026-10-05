@@ -23,7 +23,7 @@ import {
   type ProviderRequestEvent,
   type NetworkRetryEvent,
 } from "../src/agents/network-retry.ts";
-import { AgentDoomLoopError } from "../src/agents/errors.ts";
+import { AgentDoomLoopError, AgentOutputError } from "../src/agents/errors.ts";
 import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { ProgressRuntime } from "../src/ui/runtime.ts";
 import { renderProgress } from "../src/ui/progress.ts";
@@ -1049,7 +1049,7 @@ test("aborted attempts cannot queue automatic steering", async () => {
   assert.equal(guard.interventions, 0);
 });
 
-test("invalid no-tools final result becomes a typed doom-loop failure", async () => {
+test("pseudo tool-call final result becomes a typed finalization failure", async () => {
   const cwd = await repository();
   const engine = new WorkflowEngine(
     cwd,
@@ -1091,7 +1091,7 @@ test("invalid no-tools final result becomes a typed doom-loop failure", async ()
         disabled++;
       },
       getLastAssistantText() {
-        return "invalid";
+        return "<tool_call><function=team_command></function></tool_call>";
       },
       extensionRunner: { async emit() {} },
       dispose() {},
@@ -1100,11 +1100,60 @@ test("invalid no-tools final result becomes a typed doom-loop failure", async ()
   await assert.rejects(
     runner.run("researcher", state),
     (error: unknown) =>
-      error instanceof AgentDoomLoopError && error.interventions === 2,
+      error instanceof AgentOutputError &&
+      error.kind === "finalization" &&
+      /team_command|tool call/.test(error.message) &&
+      !/Unexpected token/.test(error.message),
   );
   assert.equal(promptCount, 2);
   assert.equal(messages.length, 3);
   assert.ok(disabled >= 1);
+});
+
+test("repeated invalid team_command reports the concrete validation reason", async () => {
+  const events: GuardEvent[] = [];
+  const steers: string[] = [];
+  const guard = new ToolUseGuard(
+    options(),
+    80,
+    () => ({
+      async steer(message: string) {
+        steers.push(message);
+      },
+      setActiveToolsByName(_names: string[]) {},
+    }),
+    (event) => events.push(event),
+  );
+  for (let i = 0; i < 4; i++) {
+    await guard.start(`invalid-${i}`, "team_command", { args: ["test"] });
+    await guard.complete(
+      `invalid-${i}`,
+      false,
+      {
+        content: [
+          { type: "text", text: "Validation failed: missing executable" },
+        ],
+      },
+      true,
+    );
+  }
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "doom_loop_detected" &&
+        event.tool === "team_command" &&
+        /Repeated invalid team_command invocation: Validation failed: missing executable/.test(
+          event.diagnostic ?? "",
+        ),
+    ),
+  );
+  assert.ok(
+    steers.some((message) =>
+      /invalid team_command invocation \(validation\): Validation failed: missing executable/.test(
+        message,
+      ),
+    ),
+  );
 });
 
 test("runner cancellation clears queued steering before aborting the session", async () => {

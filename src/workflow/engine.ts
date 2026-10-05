@@ -91,13 +91,18 @@ import {
 } from "../config/drift.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 import { toolCallSummary } from "../agents/tool-summary.ts";
-import { commandSummary } from "../agents/command-observability.ts";
+import {
+  commandSummary,
+  sanitizeCommandForLog,
+  commandOutcomeForLog,
+} from "../agents/command-observability.ts";
 import { approvedCommandsForRole } from "../agents/commands.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
   AgentSupersededForRetryError,
   AgentDoomLoopError,
+  AgentOutputError,
   AgentTimeoutError,
   classifyFailure,
   explainFailure,
@@ -1182,7 +1187,15 @@ export class WorkflowEngine {
         retryNumber,
       });
       const started = Date.now();
-      const calls = new Map<string, { name: string; started: number }>();
+      const calls = new Map<
+        string,
+        {
+          name: string;
+          started: number;
+          command?: ReturnType<typeof sanitizeCommandForLog>;
+          authorization?: { source: string; decision: string };
+        }
+      >();
       const networkHistoryWrites: Promise<void>[] = [];
       let providerRequests = 0;
       let failedRequest:
@@ -1231,7 +1244,14 @@ export class WorkflowEngine {
             role,
             s,
             control.controller.signal,
-            (toolName, toolCallId, innerToolName, success, input) => {
+            (
+              toolName,
+              toolCallId,
+              innerToolName,
+              success,
+              input,
+              toolResult,
+            ) => {
               const key = toolCallId ?? "single";
               let command: ReturnType<typeof commandSummary> | undefined;
               if (toolName) {
@@ -1244,12 +1264,9 @@ export class WorkflowEngine {
                   toolName === "mcp" && innerToolName
                     ? innerToolName
                     : toolName;
-                calls.set(key, {
-                  name: /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(rawName)
-                    ? rawName
-                    : "unknown_tool",
-                  started: Date.now(),
-                });
+                const safeName = /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(rawName)
+                  ? rawName
+                  : "unknown_tool";
                 const inputSummary = toolCallSummary(rawName, input, s.cwd);
                 const commandId =
                   rawName === "team_command" &&
@@ -1283,22 +1300,82 @@ export class WorkflowEngine {
                   : commandId
                     ? commandSummary(commandId)
                     : undefined;
+                if (rawName === "team_command")
+                  command = sanitizeCommandForLog(input, approved);
                 const summary = command ?? inputSummary;
+                const authorization =
+                  rawName === "team_command" && approved
+                    ? {
+                        source: s.runtimeCommandApprovals.some(
+                          (item) =>
+                            item.role === role &&
+                            commandKey(item.command) === commandKey(approved),
+                        )
+                          ? "runtime"
+                          : "static",
+                        decision: "approved",
+                      }
+                    : undefined;
+                calls.set(key, {
+                  name: safeName,
+                  started: Date.now(),
+                  ...(command ? { command } : {}),
+                  ...(authorization ? { authorization } : {}),
+                });
                 logged?.logger.append({
                   type: "tool_start",
-                  tool: calls.get(key)!.name,
+                  tool: safeName,
+                  agent: role,
+                  attempt: attemptNumber,
                   activity: activity.label,
                   ...(activity.provider ? { provider: activity.provider } : {}),
                   ...(summary ? { summary } : {}),
+                  ...(command
+                    ? {
+                        commandId: command.commandId || null,
+                        command: {
+                          executable: command.executable ?? null,
+                          args: command.args ?? [],
+                        },
+                      }
+                    : {}),
+                  ...(authorization ? { authorization } : {}),
                 });
               } else {
                 const call = calls.get(key);
                 if (call) {
+                  const outcome =
+                    call.name === "team_command"
+                      ? commandOutcomeForLog(toolResult, success === false)
+                      : undefined;
+                  const safeOutcome =
+                    outcome && s.config.logging.agentLogs.level === "summary"
+                      ? Object.fromEntries(
+                          Object.entries(outcome).filter(
+                            ([field]) => field !== "sandbox",
+                          ),
+                        )
+                      : outcome;
                   logged?.logger.append({
                     type: "tool_end",
                     tool: call.name,
+                    agent: role,
+                    attempt: attemptNumber,
                     durationMs: Date.now() - call.started,
-                    success: success ?? true,
+                    ...(!outcome ? { success: success ?? true } : {}),
+                    ...(call.command
+                      ? {
+                          commandId: call.command.commandId || null,
+                          command: {
+                            executable: call.command.executable ?? null,
+                            args: call.command.args ?? [],
+                          },
+                        }
+                      : {}),
+                    ...(call.authorization
+                      ? { authorization: call.authorization }
+                      : {}),
+                    ...(safeOutcome ?? {}),
                   });
                   calls.delete(key);
                 }
@@ -1764,6 +1841,13 @@ export class WorkflowEngine {
           timeToFirstEventMs: failedRequest?.timeToFirstEventMs,
           timeSinceLastActivityMs: failedRequest?.timeSinceLastActivityMs,
           error,
+          ...(e instanceof AgentOutputError
+            ? {
+                outputFailureKind: e.kind,
+                rawFinalResponsePreview: e.rawFinalResponsePreview,
+                outputDiagnostic: e.diagnostic,
+              }
+            : {}),
           agentTimeoutMs: timeoutMs ?? null,
           agentTimeoutMode: timeoutMode,
           agentTimeoutElapsedMs: failedRequest?.agentTimeoutElapsedMs,

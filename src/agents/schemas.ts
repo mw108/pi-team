@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { posix } from "node:path";
 import { assertRelative } from "./permissions.ts";
+import { AgentOutputError } from "./errors.ts";
+import { redactVisibleText } from "./redaction.ts";
 
 export const roles = [
   "orchestrator",
@@ -398,6 +400,7 @@ export function parseText<R extends Role>(
   text: string,
   onRecovered?: (recovery: OutputRecovery) => void,
 ): AgentResult<R> {
+  const preview = redactVisibleText(text.slice(0, 2048));
   const trimmed = text
     .trim()
     .replace(/^```(?:json)?\s*/, "")
@@ -409,13 +412,36 @@ export function parseText<R extends Role>(
     const end = leadingJsonEnd(trimmed);
     const trailing = end === undefined ? "" : trimmed.slice(end);
     if (!trailing || !/^[\s}\]]+$/.test(trailing) || !/[}\]]/.test(trailing))
-      throw originalError;
+      throw new AgentOutputError(
+        "parse",
+        role,
+        preview,
+        false,
+        redactVisibleText(String(originalError).slice(0, 500)),
+      );
     try {
       value = JSON.parse(trimmed.slice(0, end));
     } catch {
-      throw originalError;
+      throw new AgentOutputError(
+        "parse",
+        role,
+        preview,
+        false,
+        redactVisibleText(String(originalError).slice(0, 500)),
+      );
     }
-    const result = parseResult(role, value);
+    let result: AgentResult<R>;
+    try {
+      result = parseResult(role, value);
+    } catch (error) {
+      throw new AgentOutputError(
+        "schema",
+        role,
+        preview,
+        false,
+        redactVisibleText(String(error).slice(0, 1000)),
+      );
+    }
     onRecovered?.({
       reason: "trailing_closing_delimiter",
       discardedLength: trailing.length,
@@ -423,5 +449,15 @@ export function parseText<R extends Role>(
     });
     return result;
   }
-  return parseResult(role, value);
+  try {
+    return parseResult(role, value);
+  } catch (error) {
+    throw new AgentOutputError(
+      "schema",
+      role,
+      preview,
+      false,
+      redactVisibleText(String(error).slice(0, 1000)),
+    );
+  }
 }

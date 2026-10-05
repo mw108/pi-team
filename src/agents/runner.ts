@@ -53,7 +53,7 @@ import {
 import { commandKey, effectiveConfig } from "./discovery.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
 import {
-  AgentDoomLoopError,
+  AgentOutputError,
   AgentTimeoutError,
   getAgentTimeoutMs,
 } from "./errors.ts";
@@ -91,6 +91,7 @@ export type ActivityObserver = (
   innerToolName?: string,
   success?: boolean,
   input?: unknown,
+  result?: unknown,
 ) => void;
 export type OutputObserver = (text: string) => void;
 export type RuntimeFileApprover = (
@@ -151,7 +152,14 @@ export function installToolExecutionAccounting(
         guardState.guard.toolsDisabledForFinalization;
     }
     await mutations?.end(event.toolCallId, event.isError);
-    activity?.(undefined, event.toolCallId, undefined, !event.isError);
+    activity?.(
+      undefined,
+      event.toolCallId,
+      undefined,
+      !event.isError,
+      undefined,
+      event.result,
+    );
   });
 }
 
@@ -656,12 +664,24 @@ export class PiRunner implements AgentRunner {
       if (last?.stopReason === "error" || last?.stopReason === "aborted")
         throw new Error(last.errorMessage ?? `Provider ${last.stopReason}`);
       let result: any;
+      const parseFinal = () => {
+        const text = session.getLastAssistantText() ?? "";
+        const trimmed = text.trimStart();
+        if (
+          guard.toolsDisabledForFinalization &&
+          !/^[{\[]/.test(trimmed) &&
+          /<tool_call\b|<function=|<\/tool_call>|<\/?tool_use\b/i.test(trimmed)
+        )
+          throw new AgentOutputError(
+            "finalization",
+            role,
+            redactVisibleText(text.slice(0, 2048)),
+            true,
+          );
+        return parseText(role, text, outputRecovered);
+      };
       try {
-        result = parseText(
-          role,
-          session.getLastAssistantText() ?? "",
-          outputRecovered,
-        );
+        result = parseFinal();
         if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
           await validateContractPaths(state.cwd, result);
       } catch (error) {
@@ -669,7 +689,7 @@ export class PiRunner implements AgentRunner {
         session.setActiveToolsByName([]);
         const required = (zodToJsonSchema(resultSchemas[role]) as any).required;
         await session.prompt(
-          `Your JSON DATA INSTANCE did not validate: ${String(error).slice(0, 3000)}. Correct it once, retaining factual evidence. Return a flat object with these fields: ${JSON.stringify(required)}. Do NOT return the schema itself or any wrapper object. Required instance schema: ${JSON.stringify(zodToJsonSchema(resultSchemas[role]))}. Do not perform further actions.`,
+          `Your previous final response did not match the required ${role} schema. Diagnostic: ${redactVisibleText(String(error instanceof AgentOutputError ? (error.diagnostic ?? error.message) : error).slice(0, 1000))}. Tools are now disabled. Return only the required JSON object with these fields: ${JSON.stringify(required)}. Do not use Markdown fences. Do not call tools or output <tool_call> markup. Do not include commentary before or after the JSON. If required work could not be completed, return the role's blocked or failure status where supported. Required instance schema: ${JSON.stringify(zodToJsonSchema(resultSchemas[role]))}.`,
           { expandPromptTemplates: false },
         );
         if (timedOut && timeoutMs !== undefined)
@@ -677,14 +697,8 @@ export class PiRunner implements AgentRunner {
         if (signal?.aborted)
           throw new Error("Agent interrupted during schema correction");
         try {
-          result = parseText(
-            role,
-            session.getLastAssistantText() ?? "",
-            outputRecovered,
-          );
+          result = parseFinal();
         } catch (finalError) {
-          if (guard.finalizationReason === "doom_loop")
-            throw new AgentDoomLoopError(role, attempt, guard.interventions);
           throw finalError;
         }
         if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
@@ -701,11 +715,7 @@ export class PiRunner implements AgentRunner {
           "Command authorization is handled by the host. Call team_command with the required executable and argv now. Use current verifiedCommandResults for checks already run. Do not ask the user for command IDs or command output. If a command is denied, return status BLOCKED with its reason.",
           { expandPromptTemplates: false },
         );
-        result = parseText(
-          role,
-          session.getLastAssistantText() ?? "",
-          outputRecovered,
-        );
+        result = parseFinal();
         if (result.type === "QUESTION_REQUEST")
           result = {
             status: "BLOCKED",

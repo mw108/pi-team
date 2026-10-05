@@ -341,6 +341,8 @@ export class RuntimeCommandApprovalCoordinator {
       run: control.attempt,
       requestId: pending.requestId,
       ...safe,
+      command: { executable: safe.executable, args: safe.args },
+      authorization: { decision: "pending", source: "runtime" },
       purpose: redactVisibleText(request.purpose),
     });
     await this.deps.persistAttempt(
@@ -427,6 +429,17 @@ export class RuntimeCommandApprovalCoordinator {
               ? "none"
               : "role-and-workflow",
         commandId: command.id,
+        command: { executable: safe.executable, args: safe.args },
+        authorization: {
+          decision: choice === "deny" ? "denied" : "approved",
+          source: "runtime",
+          scope:
+            choice === "allow_once"
+              ? "once"
+              : choice === "deny"
+                ? "none"
+                : "workflow",
+        },
         run: control.attempt,
         requestId: pending.requestId,
         decision: choice,

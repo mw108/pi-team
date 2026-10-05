@@ -39,6 +39,25 @@ export class AgentDoomLoopError extends Error {
   }
 }
 
+export class AgentOutputError extends Error {
+  readonly category = "agent_output";
+  constructor(
+    readonly kind: "parse" | "schema" | "finalization",
+    readonly agentId: Role,
+    readonly rawFinalResponsePreview: string,
+    finalizing = false,
+    readonly diagnostic?: string,
+  ) {
+    const display = agentId[0].toUpperCase() + agentId.slice(1);
+    super(
+      kind === "finalization"
+        ? `${display} returned invalid final output after tool finalization. The response attempted another tool call instead of returning the required ${display} JSON. Next: /team-retry ${agentId}`
+        : `${display} returned invalid final output${finalizing ? " after tool finalization" : ""} (${kind}). Next: /team-retry ${agentId}`,
+    );
+    this.name = "AgentOutputError";
+  }
+}
+
 export class AgentAbortedByUserError extends Error {
   readonly failures = 0;
   constructor(
@@ -63,6 +82,7 @@ export class AgentSupersededForRetryError extends Error {
 
 export type FailureCategory =
   | "doom_loop"
+  | "agent_output"
   | "cancelled"
   | "timeout"
   | "http_503"
@@ -73,6 +93,7 @@ export type FailureCategory =
   | "other";
 
 export function classifyFailure(error: unknown): FailureCategory {
+  if (error instanceof AgentOutputError) return "agent_output";
   if (error instanceof AgentDoomLoopError) return "doom_loop";
   if (error instanceof AgentTimeoutError) return "timeout";
   const value = error as { status?: number; code?: string; name?: string };
@@ -102,6 +123,8 @@ export function explainFailure(error: unknown): {
   if (category === "other") return { category, matchedRule: null };
   if (error instanceof AgentDoomLoopError)
     return { category, matchedRule: "AgentDoomLoopError" };
+  if (error instanceof AgentOutputError)
+    return { category, matchedRule: `AgentOutputError:${error.kind}` };
   if (error instanceof AgentTimeoutError)
     return { category, matchedRule: "AgentTimeoutError" };
   const value = error as { status?: number; code?: string };
@@ -136,6 +159,8 @@ export function safeFailureLabel(
   switch (category) {
     case "doom_loop":
       return "doom loop persisted";
+    case "agent_output":
+      return "invalid agent final output";
     case "cancelled":
       return "cancelled";
     case "timeout":

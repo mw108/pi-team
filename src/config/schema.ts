@@ -254,7 +254,11 @@ export const configSchema = z
     logging: z
       .object({
         agentLogs: z
-          .object({ level: z.enum(["off", "summary"]).default("summary") })
+          .object({
+            level: z
+              .enum(["off", "summary", "diagnostic", "trace"])
+              .default("summary"),
+          })
           .default({}),
       })
       .default({}),

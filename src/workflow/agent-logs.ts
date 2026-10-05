@@ -289,30 +289,35 @@ export class AgentLogStore {
                                                             ? `team_command · ${formatApprovedCommand(event.summary) ?? event.activity}`
                                                             : event.activity
                                                           : event.type ===
-                                                              "network_error"
-                                                            ? "network connection lost"
+                                                                "tool_end" &&
+                                                              event.tool ===
+                                                                "team_command"
+                                                            ? `team_command ${event.success === null ? "approval pending" : event.success ? "succeeded" : "failed"}${typeof event.exitCode === "number" ? ` · exit ${event.exitCode}` : ""}${event.error && typeof event.error === "object" ? ` · ${(event.error as { category?: string; message?: string }).category ?? "error"}: ${(event.error as { message?: string }).message ?? "unknown"}` : ""}`
                                                             : event.type ===
-                                                                "network_retry_scheduled"
-                                                              ? `network retry ${event.retry} scheduled`
+                                                                "network_error"
+                                                              ? "network connection lost"
                                                               : event.type ===
-                                                                  "network_retry_started"
-                                                                ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
+                                                                  "network_retry_scheduled"
+                                                                ? `network retry ${event.retry} scheduled`
                                                                 : event.type ===
-                                                                    "network_recovered"
-                                                                  ? "connection recovered"
+                                                                    "network_retry_started"
+                                                                  ? `reconnect ${event.retry}${event.maxRetries === 0 ? "" : `/${event.maxRetries}`}`
                                                                   : event.type ===
-                                                                      "network_retries_exhausted"
-                                                                    ? "network retries exhausted"
+                                                                      "network_recovered"
+                                                                    ? "connection recovered"
                                                                     : event.type ===
-                                                                        "provider_error"
-                                                                      ? event.label
+                                                                        "network_retries_exhausted"
+                                                                      ? "network retries exhausted"
                                                                       : event.type ===
-                                                                          "retry"
-                                                                        ? `retry → attempt ${event.nextAttempt}`
+                                                                          "provider_error"
+                                                                        ? event.label
                                                                         : event.type ===
-                                                                            "agent_complete"
-                                                                          ? "completed"
-                                                                          : undefined;
+                                                                            "retry"
+                                                                          ? `retry → attempt ${event.nextAttempt}`
+                                                                          : event.type ===
+                                                                              "agent_complete"
+                                                                            ? "completed"
+                                                                            : undefined;
       if (label) lines.push(`${time} ${label}`);
       if (event.type === "provider_request_failure") {
         lines.push(...errorLines(event.error));

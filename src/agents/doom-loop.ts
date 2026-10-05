@@ -3,16 +3,17 @@ import type { TeamConfig } from "../config/schema.ts";
 import { serenaRead, serenaWrite } from "./permissions.ts";
 import type { Role } from "./schemas.ts";
 import { detectedCommandId } from "./discovery.ts";
+import { commandOutcomeForLog } from "./command-observability.ts";
 
 export const DEFAULT_DOOM_LOOP_STEER = `You are repeating observational search/read operations without progress. Stop broad exploration. Summarize established facts, identify the next concrete action, and make the required change or finish with a structured result.
 
 Stop repeating tool calls that you have already performed. Review the information already available in your context. If a specific fact is still missing, use a materially different tool or approach. Otherwise stop gathering information and produce the best valid final result now. Do not repeat the same tool-call pattern again.`;
 export const DOOM_LOOP_FINALIZE = `Your tool-use loop has continued after multiple interventions.
 
-You may not use additional tools. Using only the information already available in your context, produce your required final structured result now.`;
+Tools are now disabled. Do not call tools or output <tool_call> markup. Return only the final JSON object required by your role schema, without Markdown or commentary. If required work could not be completed, use your role's BLOCKED or failure status with a concise reason.`;
 export const TOOL_BUDGET_FINALIZE = `You have reached the tool-call budget.
 
-Do not call any more tools. Use the information already collected and produce your required final structured result now.`;
+Tools are now disabled. Do not call tools or output <tool_call> markup. Return only the final JSON object required by your role schema, without Markdown or commentary. If required work could not be completed, use your role's BLOCKED or failure status with a concise reason.`;
 export const TOOL_BURST_STEER = `Too many tool calls were emitted in one response. Remaining calls were not executed. Reassess the task and make a small number of targeted calls.`;
 export const TOOL_BURST_STREAM_STEER = `Your previous response emitted too many tool calls and was stopped before completion. No calls from that response were executed. Do not retry the batch. Reassess the task, summarize the intended action, and make only a small number of targeted calls.`;
 
@@ -157,6 +158,7 @@ export type GuardEvent =
       repeatCount: number;
       progressEpoch: number;
       limit?: number;
+      diagnostic?: string;
     }
   | {
       type: "tool_call_burst_limited";
@@ -297,6 +299,7 @@ export class ToolUseGuard {
   interventions = 0;
   toolsDisabledForFinalization = false;
   finalizationReason?: "doom_loop" | "tool_budget";
+  private lastInvalidCommand?: string;
   constructor(
     private readonly config: ReturnType<typeof resolveDoomLoop>,
     private readonly maxToolCalls: number,
@@ -388,6 +391,11 @@ export class ToolUseGuard {
       repeatCount: count,
       progressEpoch,
       ...(limit === undefined ? {} : { limit }),
+      ...(tool === "team_command" && this.lastInvalidCommand
+        ? {
+            diagnostic: `Repeated invalid team_command invocation: ${this.lastInvalidCommand}`,
+          }
+        : {}),
     });
     this.detector.clear();
     this.consecutiveFailures = 0;
@@ -405,7 +413,7 @@ export class ToolUseGuard {
           ? streaming
             ? TOOL_BURST_STREAM_STEER
             : TOOL_BURST_STEER
-          : this.config.steerPrompt,
+          : `${this.config.steerPrompt}${tool === "team_command" && this.lastInvalidCommand ? `\n\nRepeated invalid team_command invocation (validation): ${this.lastInvalidCommand}. Correct the tool arguments before retrying.` : ""}`,
       );
     } else {
       this.finalizationReason = "doom_loop";
@@ -519,6 +527,13 @@ export class ToolUseGuard {
       !isError &&
       (command?.exitCode === undefined || command.exitCode === 0) &&
       !approvalDenied;
+    if (tool === "team_command") {
+      const outcome = commandOutcomeForLog(result, isError);
+      this.lastInvalidCommand =
+        outcome.error?.category === "validation"
+          ? outcome.error.message.slice(0, 300)
+          : undefined;
+    }
     if (pending)
       this.detector.completeMutation(pending.tool, pending.signature, worked);
     if (!this.config.enabled) return;

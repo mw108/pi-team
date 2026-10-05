@@ -601,6 +601,20 @@ test("engine JSONL and team-log redact dynamic requests and preserve original ex
     "--",
     "--token=[REDACTED]",
   ]);
+  assert.deepEqual(requested.authorization, {
+    decision: "pending",
+    source: "runtime",
+  });
+  const decided = events.find(
+    (event) => event.type === "command_approval_decided",
+  )!;
+  assert.deepEqual(decided.authorization, {
+    decision: "approved",
+    source: "runtime",
+    scope: "workflow",
+  });
+  assert.equal(decided.requestingRole, "implementor");
+  assert.deepEqual(decided.command, requested.command);
   assert.doesNotMatch(JSON.stringify(events), /SECRET/);
   assert.doesNotMatch(prompts[0], /SECRET/);
   assert.doesNotMatch(await log.timeline(state.id, "implementor", 1), /SECRET/);

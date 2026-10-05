@@ -25,6 +25,10 @@ import {
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { commandTool } from "../src/agents/commands.ts";
+import {
+  commandOutcomeForLog,
+  sanitizeCommandForLog,
+} from "../src/agents/command-observability.ts";
 import { effectiveConfig } from "../src/agents/discovery.ts";
 import {
   classifyToolActivity,
@@ -40,6 +44,59 @@ import type { AgentRunner } from "../src/agents/runner.ts";
 import { research } from "./helpers.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
+
+test("command diagnostics classify pre-execution failures and preserve safe argv", () => {
+  assert.deepEqual(
+    sanitizeCommandForLog({
+      executable: "php",
+      args: [
+        "artisan",
+        "test",
+        "--password=private",
+        "tests/Unit/ConfigTest.php",
+      ],
+    }),
+    {
+      command: "structured",
+      commandId: "",
+      executable: "php",
+      args: [
+        "artisan",
+        "test",
+        "--password=[REDACTED]",
+        "tests/Unit/ConfigTest.php",
+      ],
+    },
+  );
+  assert.deepEqual(
+    commandOutcomeForLog({ details: { status: "denied" } }, false)
+      .authorization,
+    { decision: "denied", source: "runtime" },
+  );
+  assert.equal(
+    commandOutcomeForLog(
+      {
+        content: [
+          { text: "Unknown commandId: foo (not approved for this role)" },
+        ],
+      },
+      true,
+    ).error?.code,
+    "UNKNOWN_COMMAND_ID",
+  );
+  assert.equal(
+    commandOutcomeForLog(
+      { content: [{ text: "Bubblewrap could not start" }] },
+      true,
+    ).error?.category,
+    "sandbox_setup",
+  );
+  assert.equal(
+    commandOutcomeForLog({ details: { exitCode: -1, timedOut: true } }, false)
+      .error?.category,
+    "timeout",
+  );
+});
 
 test("recovered Critic output is logged and workflow continues to Reviewer", async () => {
   const cwd = await repository();
@@ -817,8 +874,114 @@ test("team_command JSONL and /team-log use only resolved approved metadata", asy
         undefined,
         {} as any,
       ),
-    /not approved/,
+    /Unknown commandId/,
   );
+});
+
+test("summary command logs distinguish execution, validation, and pending approval", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.commands = [];
+  class CommandOutcomes extends FixtureRunner {
+    override async run(
+      role: Role,
+      _state: WorkflowState,
+      _signal?: AbortSignal,
+      activity?: ActivityObserver,
+    ) {
+      const good = {
+        executable: "php",
+        args: ["artisan", "test", "--token", "secret-value"],
+        purpose: "test",
+      };
+      activity?.("team_command", "good", undefined, undefined, good);
+      activity?.(undefined, "good", undefined, true, undefined, {
+        details: { exitCode: 0, output: "ok", sandbox: { mode: "none" } },
+      });
+      activity?.("team_command", "bad", undefined, undefined, {
+        args: ["artisan", "test"],
+      });
+      activity?.(undefined, "bad", undefined, false, undefined, {
+        content: [
+          {
+            type: "text",
+            text: "Validation failed for tool team_command: missing executable",
+          },
+        ],
+      });
+      activity?.("team_command", "failed", undefined, undefined, {
+        executable: "php",
+        args: ["artisan", "test", "tests/Unit/ConfigTest.php"],
+        purpose: "test",
+      });
+      activity?.(undefined, "failed", undefined, true, undefined, {
+        details: { exitCode: 1, output: "APP_KEY=secret-value test failed" },
+      });
+      activity?.("team_command", "pending", undefined, undefined, {
+        executable: "composer",
+        args: ["test"],
+        purpose: "test",
+      });
+      activity?.(undefined, "pending", undefined, true, undefined, {
+        details: { status: "pending" },
+      });
+      return output(role);
+    }
+  }
+  const engine = new WorkflowEngine(cwd, new CommandOutcomes(), ui);
+  const state = await engine.start("Fix", cfg);
+  state.approvedCommands = [
+    {
+      id: "test-php",
+      executable: "php",
+      args: ["artisan", "test", "--token", "secret-value"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+  ];
+  state.discoveredCommands = state.approvedCommands.map((command) => ({
+    command,
+    source: "test fixture",
+    category: "test" as const,
+    confidence: "high" as const,
+  }));
+  state.commandApprovalComplete = true;
+  await engine.store.save(state);
+  await engine.invoke("implementor", state);
+  const events = await new AgentLogStore(cwd).read(state.id, "implementor", 1);
+  const starts = events.filter(
+    (event) => event.type === "tool_start" && event.tool === "team_command",
+  );
+  const ends = events.filter(
+    (event) => event.type === "tool_end" && event.tool === "team_command",
+  );
+  assert.equal(starts.length, 4);
+  assert.deepEqual(starts[0].command, {
+    executable: "php",
+    args: ["artisan", "test", "--token", "[REDACTED]"],
+  });
+  assert.deepEqual(starts[0].authorization, {
+    source: "static",
+    decision: "approved",
+  });
+  assert.equal(ends[0].success, true);
+  assert.equal(ends[0].exitCode, 0);
+  assert.equal(typeof ends[0].durationMs, "number");
+  assert.equal(ends[1].success, false);
+  assert.deepEqual(ends[1].error, {
+    category: "validation",
+    code: "INVALID_ARGUMENTS",
+    message: "Validation failed for tool team_command: missing executable",
+  });
+  assert.equal(ends[2].exitCode, 1);
+  assert.equal((ends[2].error as { category: string }).category, "execution");
+  assert.match(String(ends[2].output), /APP_KEY=\[REDACTED\]/);
+  assert.equal(ends[3].success, null);
+  assert.deepEqual(ends[3].authorization, {
+    decision: "pending",
+    source: "runtime",
+  });
+  assert.doesNotMatch(JSON.stringify(events), /secret-value/);
 });
 
 test("running attempts are readable and logging off still preserves history", async () => {

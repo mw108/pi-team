@@ -10,6 +10,7 @@ import {
   staticCommandMatches,
 } from "./command-policy.ts";
 import { commandKey } from "./discovery.ts";
+import { commandSummary } from "./command-observability.ts";
 import {
   normalizedRuntimeCommand,
   type RuntimeCommandRequest,
@@ -143,7 +144,7 @@ export function commandTool(
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute an approved argv command by ID, or submit structured argv for static policy matching or user approval. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. Configured static rules: ${JSON.stringify(config.permissions.commands.allow)}. No shell interpolation.`,
+    description: `Execute an approved argv command by id, or submit executable, args, and purpose. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"run tests"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
     parameters: Type.Union([
       Type.Object({ id: Type.String() }),
       Type.Object({
@@ -160,13 +161,24 @@ export function commandTool(
     async execute(_id, params, signal) {
       const approvedNow = currentCommands?.() ?? allowed;
       let command: Command | undefined;
+      let authorizationSource: "static" | "runtime" | undefined;
       if ("id" in (params as object)) {
         command = approvedNow.find(
           (c) => c.id === (params as { id: string }).id,
         );
-        if (!command) throw new Error("Command not approved for this role");
+        if (!command)
+          throw new Error(
+            `Unknown commandId: ${commandSummary(String((params as { id: unknown }).id)).commandId} (not approved for this role). Use an available ID or supply executable, args, and purpose.`,
+          );
       } else {
-        const normalized = normalizedRuntimeCommand(params, role);
+        let normalized: ReturnType<typeof normalizedRuntimeCommand>;
+        try {
+          normalized = normalizedRuntimeCommand(params, role);
+        } catch {
+          throw new Error(
+            'Invalid team_command arguments. Supply either id=<known command ID>, or executable, args (array of strings), and purpose. Example: executable=php, args=["artisan","test","tests/Unit/ConfigTest.php"], purpose=run tests. The command category must be allowed for this role.',
+          );
+        }
         command = approvedNow.find(
           (c) => commandKey(c) === commandKey(normalized.command),
         );
@@ -175,8 +187,10 @@ export function commandTool(
           config.permissions.commands.allow.some((rule) =>
             staticCommandMatches(rule, normalized.command),
           )
-        )
+        ) {
           command = normalized.command;
+          authorizationSource = "static";
+        }
         if (!command) {
           if (!runtimeApproval)
             throw new Error("Runtime command approval is unavailable");
@@ -194,6 +208,10 @@ export function commandTool(
                   ? "COMMAND_APPROVAL_DENIED"
                   : "COMMAND_APPROVAL_PENDING",
               commandId: normalized.command.id,
+              message:
+                decision === "deny"
+                  ? "Command approval denied"
+                  : "Command approval pending",
             };
             return {
               content: [{ type: "text", text: JSON.stringify(denied) }],
@@ -201,6 +219,7 @@ export function commandTool(
             };
           }
           command = normalized.command;
+          authorizationSource = "runtime";
         }
       }
       const result = await execute(
@@ -213,7 +232,17 @@ export function commandTool(
       await onResult?.(command, result);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
-        details: result,
+        details: {
+          ...result,
+          ...(authorizationSource
+            ? {
+                authorization: {
+                  decision: "approved",
+                  source: authorizationSource,
+                },
+              }
+            : {}),
+        },
       };
     },
   };
