@@ -130,6 +130,54 @@ export async function execute(
     await prepared.cleanup();
   }
 }
+
+/** The provider sees basic field types; invocation-mode requirements live here. */
+function commandInvocation(input: unknown): "id" | "structured" {
+  const value =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : {};
+  const hasId = Object.hasOwn(value, "id");
+  const hasStructuredFields = [
+    "executable",
+    "args",
+    "purpose",
+    "category",
+  ].some((field) => Object.hasOwn(value, field));
+  if (hasId && hasStructuredFields)
+    throw new Error(
+      "Invalid team_command arguments: provide either id or executable + args + purpose. Do not provide both forms in the same call.",
+    );
+  if (hasId) {
+    if (typeof value.id !== "string" || !value.id.trim())
+      throw new Error(
+        "Invalid team_command arguments: id must be a non-empty string.",
+      );
+    return "id";
+  }
+  if (!hasStructuredFields)
+    throw new Error(
+      "Invalid team_command arguments: team_command requires either id or executable + args + purpose. This tool does not support command discovery.",
+    );
+  const missing = [
+    typeof value.executable === "string" && value.executable.trim()
+      ? undefined
+      : "executable",
+    Array.isArray(value.args) &&
+    value.args.every((arg) => typeof arg === "string")
+      ? undefined
+      : "args",
+    typeof value.purpose === "string" && value.purpose.trim()
+      ? undefined
+      : "purpose",
+  ].filter((field): field is string => field !== undefined);
+  if (missing.length)
+    throw new Error(
+      `Invalid team_command arguments: structured command requires executable, args, and purpose. Missing or invalid: ${missing.join(", ")}.`,
+    );
+  return "structured";
+}
+
 export function commandTool(
   role: Role,
   config: TeamConfig,
@@ -144,25 +192,23 @@ export function commandTool(
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Executes one concrete command only; this is not a command-listing or discovery tool. Use either an available id or executable + args + purpose. team_command({}) is invalid; never call with an empty object. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"run tests"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
-    parameters: Type.Union([
-      Type.Object({ id: Type.String() }),
-      Type.Object({
-        executable: Type.String(),
-        args: Type.Array(Type.String()),
-        purpose: Type.String(),
-        category: Type.Optional(
-          Type.Union(
-            commandCategories.map((category) => Type.Literal(category)),
-          ),
-        ),
-      }),
-    ]),
+    description: `Execute one concrete command. Provide either id or executable + args + purpose; do not provide both forms. team_command({}) is invalid. This tool does not list or discover commands. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"Run required unit test"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    parameters: Type.Object(
+      {
+        id: Type.Optional(Type.String()),
+        executable: Type.Optional(Type.String()),
+        args: Type.Optional(Type.Array(Type.String())),
+        purpose: Type.Optional(Type.String()),
+        category: Type.Optional(Type.String({ enum: [...commandCategories] })),
+      },
+      { additionalProperties: false },
+    ),
     async execute(_id, params, signal) {
+      const invocation = commandInvocation(params);
       const approvedNow = currentCommands?.() ?? allowed;
       let command: Command | undefined;
       let authorizationSource: "static" | "runtime" | undefined;
-      if ("id" in (params as object)) {
+      if (invocation === "id") {
         command = approvedNow.find(
           (c) => c.id === (params as { id: string }).id,
         );

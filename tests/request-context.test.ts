@@ -51,16 +51,13 @@ function requestContext(): Context {
         name: "team_command",
         description: "Run command. PASSWORD=secret-password-value",
         parameters: {
-          anyOf: [
-            { type: "object", properties: { id: { type: "string" } } },
-            {
-              type: "object",
-              properties: {
-                executable: { type: "string" },
-                password: { default: "nested-secret-value" },
-              },
-            },
-          ],
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            executable: { type: "string" },
+            password: { default: "nested-secret-value" },
+          },
+          additionalProperties: false,
         } as any,
       },
     ],
@@ -71,7 +68,9 @@ test("request projection preserves tool schema and Tester structure with redacti
   const projected = providerRequestContext(requestContext(), "summary");
   const tool = projected.tools[0];
   assert.equal(tool.name, "team_command");
-  assert.equal((tool.parameters as any).anyOf.length, 2);
+  assert.equal((tool.parameters as any).type, "object");
+  assert.equal((tool.parameters as any).additionalProperties, false);
+  assert.equal((tool.parameters as any).anyOf, undefined);
   assert.equal(
     (projected.contextSummary.candidateValidationCommands as any)[0].executable,
     "php",
@@ -82,7 +81,7 @@ test("request projection preserves tool schema and Tester structure with redacti
     "php",
   );
   assert.equal(
-    (tool.parameters as any).anyOf[1].properties.password.default,
+    (tool.parameters as any).properties.password.default,
     "[REDACTED]",
   );
   const serialized = JSON.stringify(projected);
@@ -139,7 +138,8 @@ test("request projection bounds large prompt, context and schema as valid JSONL"
     timestamp: 0,
   };
   context.tools![0].parameters = {
-    anyOf: [{ description: "z".repeat(100000) }],
+    type: "object",
+    properties: { description: { description: "z".repeat(100000) } },
   } as any;
   const cwd = await repository();
   const logs = new AgentLogStore(cwd);

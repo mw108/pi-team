@@ -117,7 +117,7 @@ test("Tester instructions and tool description rule out empty discovery", async 
   assert.match(testerCommandInstructions, /team_command\(\{\}\) is invalid/);
   const cfg = config();
   const tool = commandTool("tester", cfg, "/tmp", []);
-  assert.match(tool.description, /Executes one concrete command/);
-  assert.match(tool.description, /not a command-listing or discovery tool/);
+  assert.match(tool.description, /Execute one concrete command/);
+  assert.match(tool.description, /does not list or discover commands/);
   assert.match(tool.description, /team_command\(\{\}\) is invalid/);
 });
