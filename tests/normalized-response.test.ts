@@ -205,6 +205,7 @@ test("Pi completed response is observed after provider end and before stream del
   source.end();
   await delivered;
   assert.deepEqual(order, [
+    "provider_request_context",
     "provider_request_start",
     "provider_request_end",
     "assistant_response",

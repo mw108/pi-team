@@ -6,6 +6,7 @@ import { effectiveConfig } from "./discovery.ts";
 import { allowedCommandCategories } from "./command-policy.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
+import { testerValidationContext } from "./validation-context.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -101,10 +102,21 @@ export async function contextFor(
         ...s.config.pentest.localUrls.map((value) => new URL(value).origin),
       ],
     };
-  if (role === "tester")
+  if (role === "tester") {
     context.approvedCommands = effectiveConfig(s, role).commands.filter((c) =>
       allowedCommandCategories(role).includes(c.purpose),
     );
+    Object.assign(context, testerValidationContext(s));
+    context.candidateValidationCommandList = (
+      context.candidateValidationCommands as {
+        executable: string;
+        args: string[];
+      }[]
+    ).map(
+      (command, index) =>
+        `${index + 1}. ${[command.executable, ...command.args].join(" ")}`,
+    );
+  }
   if (role === "commitAgent")
     copy("codeReviewer", "securityReviewer", "tester");
   context.previousFindings = s.history

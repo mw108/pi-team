@@ -75,7 +75,8 @@ test("live stream activity updates state, reasoning, timestamps and bounded prog
     },
   );
   const result = runtime.streamSimple(model, { messages: [] }).result();
-  assert.equal(events[0]?.type, "provider_request_start");
+  assert.equal(events[0]?.type, "provider_request_context");
+  assert.equal(events[1]?.type, "provider_request_start");
   assert.deepEqual(updates[0], {
     providerRequest: 1,
     startedAt: 1000,

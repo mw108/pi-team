@@ -144,7 +144,7 @@ export function commandTool(
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute an approved argv command by id, or submit executable, args, and purpose. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"run tests"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    description: `Executes one concrete command only; this is not a command-listing or discovery tool. Use either an available id or executable + args + purpose. team_command({}) is invalid; never call with an empty object. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"run tests"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
     parameters: Type.Union([
       Type.Object({ id: Type.String() }),
       Type.Object({

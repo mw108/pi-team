@@ -146,10 +146,15 @@ test("each provider request receives its agent's resolved timeout", async (t) =>
   const finite = reviewer.run();
   await Promise.resolve();
   assert.equal(reviewer.timeoutMs(), 1000);
-  assert.deepEqual(reviewer.events[0]?.providerTimeouts?.requestTimeoutMs, {
-    value: 1000,
-    source: "agent",
-  });
+  assert.deepEqual(
+    reviewer.events.find(
+      (event: any) => event.type === "provider_request_start",
+    )?.providerTimeouts?.requestTimeoutMs,
+    {
+      value: 1000,
+      source: "agent",
+    },
+  );
   t.mock.timers.tick(999);
   assert.equal(reviewer.aborted(), false);
   t.mock.timers.tick(1);
@@ -160,11 +165,16 @@ test("each provider request receives its agent's resolved timeout", async (t) =>
   const unlimited = implementor.run();
   await Promise.resolve();
   assert.equal(implementor.timeoutMs(), 2147483647);
-  assert.deepEqual(implementor.events[0]?.providerTimeouts?.requestTimeoutMs, {
-    value: 0,
-    source: "workflow",
-    mode: "unlimited",
-  });
+  assert.deepEqual(
+    implementor.events.find(
+      (event: any) => event.type === "provider_request_start",
+    )?.providerTimeouts?.requestTimeoutMs,
+    {
+      value: 0,
+      source: "workflow",
+      mode: "unlimited",
+    },
+  );
   assert.equal(
     piRequestTimeoutMs(resolveRequestTimeout(cfg, "implementor")),
     2147483647,

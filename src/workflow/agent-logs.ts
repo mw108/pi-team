@@ -339,6 +339,10 @@ export class AgentLogStore {
                                                                               "agent_complete"
                                                                             ? "completed"
                                                                             : undefined;
+      if (event.type === "provider_request_context")
+        lines.push(
+          `${time} provider request ${event.providerRequest} context · ${(event.tools as unknown[] | undefined)?.length ?? 0} tools`,
+        );
       if (label) lines.push(`${time} ${label}`);
       if (event.type === "provider_tool_call_raw")
         lines.push(

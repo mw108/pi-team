@@ -26,6 +26,7 @@ import {
   type RawToolCallEvent,
   type ToolCallLogLevel,
 } from "./provider-tool-calls.ts";
+import { providerRequestContext } from "./request-context.ts";
 
 export interface ResolvedNetworkRetry {
   maxRetries: number; // 0 means unlimited.
@@ -64,6 +65,7 @@ export type NetworkRetryEvent = {
 export type ProviderRequestEvent = {
   type:
     | "provider_request_start"
+    | "provider_request_context"
     | "provider_request_end"
     | "provider_request_failure"
     | "provider_progress"
@@ -390,6 +392,17 @@ export function configureNetworkRetry(
               : {}),
           maxRetries: 0,
         };
+        if (rawToolCallLevel !== "off") {
+          try {
+            observeRequest?.({
+              type: "provider_request_context",
+              ...identity,
+              ...providerRequestContext(context, rawToolCallLevel),
+            });
+          } catch {
+            // Request diagnostics must not prevent inference.
+          }
+        }
         observeRequest?.({
           type: "provider_request_start",
           ...identity,
