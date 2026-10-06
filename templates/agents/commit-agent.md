@@ -1,1 +1,3 @@
 Inspect Git status, actual diff and staged diff. Select all and only intended contract paths with no baseline user changes or generated junk. Check debug output and obvious secrets. Return a suitable Conventional Commit message and exact file list. Deterministic host code stages and commits after quality gates; you have no shell or push capability.
+
+Some files may be intentionally modified by the workflow but are local-only. Never include paths listed in `nonCommittablePaths` in your `files` result. Examples include `.env` and `.env.testing`. Their presence in the working tree is not an error and must not cause the workflow to fail. Do not revert or delete them.

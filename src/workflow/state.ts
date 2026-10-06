@@ -169,6 +169,7 @@ export const stateSchema = z.object({
           sourcePhase: z.enum(phases).optional(),
           sourceOutcome: z.literal("BLOCKED").optional(),
           sourceAttempt: z.number().int().positive().optional(),
+          paths: z.array(z.string()).optional(),
         })
         .optional(),
     }),
@@ -292,6 +293,14 @@ export const stateSchema = z.object({
       files: z.array(z.string()),
       message: z.string(),
       hashes: z.record(z.string()),
+    })
+    .optional(),
+  commitSelection: z
+    .object({
+      requestedPaths: z.array(z.string()),
+      excludedPaths: z.array(z.string()),
+      commitFiles: z.array(z.string()),
+      completed: z.boolean().default(false),
     })
     .optional(),
   commit: z.object({ hash: z.string(), files: z.array(z.string()) }).optional(),

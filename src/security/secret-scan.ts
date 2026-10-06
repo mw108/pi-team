@@ -75,6 +75,7 @@ export async function scanCommitSecrets(
   run: ScannerRun = defaultRun,
 ): Promise<SecretScanResult> {
   const files = await relevantContent(cwd, paths);
+  if (!files.length) return { scanner: "builtin", findings: [] };
   try {
     await run("gitleaks", ["version"]);
   } catch (error) {

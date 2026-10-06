@@ -29,6 +29,7 @@ export interface CompletionReportInput {
   validation: CompletionReport["validation"];
   validationCommands: ValidationCommandResult[];
   commit: CompletionReport["commit"];
+  excludedCommitPaths: { path: string; reason: "non-committable" }[];
   cycles: { design: number; localFix: number; pentest: number };
   warnings: string[];
   unresolvedIssues: string[];
@@ -47,14 +48,15 @@ export async function buildCompletionReportInput(
   const claimed = new Set(
     implementation?.status === "IMPLEMENTED" ? implementation.changedFiles : [],
   );
-  const changedFiles = unique(
-    s.commit?.files ??
+  const changedFiles = unique([
+    ...(s.commit?.files ??
       current.filter(
         (path) =>
           !path.startsWith(".pi/team/") &&
           (!s.baseline.dirtyPaths.includes(path) || claimed.has(path)),
-      ),
-  );
+      )),
+    ...(s.commitSelection?.excludedPaths ?? []),
+  ]);
   const validation: CompletionReport["validation"] = [];
   const gate = (
     label: string,
@@ -180,6 +182,9 @@ export async function buildCompletionReportInput(
     ...(s.reportFailure ? [`Narrative report failed: ${s.reportFailure}`] : []),
   ]);
   const commitResult = s.results.commitAgent;
+  const excludedCommitPaths = unique(
+    s.commitSelection?.excludedPaths ?? [],
+  ).map((path) => ({ path, reason: "non-committable" as const }));
   return {
     workflowId: s.id,
     task: s.task,
@@ -195,13 +200,17 @@ export async function buildCompletionReportInput(
     },
     validation,
     validationCommands,
+    excludedCommitPaths,
     commit: {
       created: !!s.commit,
       ...(s.commit
         ? { hash: s.commit.hash, message: commitResult?.message }
         : {
             detail: s.config.qualityGates.commit.enabled
-              ? (s.blocker ?? "No commit was recorded.")
+              ? s.commitSelection?.completed &&
+                !s.commitSelection.commitFiles.length
+                ? "Nothing committable; local-only changes remain in the working tree."
+                : (s.blocker ?? "No commit was recorded.")
               : "Disabled by configuration.",
           }),
     },
@@ -214,7 +223,7 @@ export async function buildCompletionReportInput(
     unresolvedIssues,
     limitations: unique([
       ...(pentest?.limitations ?? []),
-      ...(historical && !s.commit
+      ...(historical && !s.commit && !s.commitSelection?.completed
         ? [
             "Changed paths are unavailable in this older workflow state without a recorded commit.",
           ]
@@ -251,6 +260,7 @@ export function fallbackReport(input: CompletionReportInput): CompletionReport {
     changedFiles: input.implementation.changedFiles,
     validation: input.validation,
     notes: [...input.warnings, ...input.limitations],
+    excludedCommitPaths: input.excludedCommitPaths,
     unresolvedIssues: input.unresolvedIssues,
     commit: input.commit,
   };
@@ -278,6 +288,7 @@ export function finalizeReport(
     unresolvedIssues: input.unresolvedIssues,
     commit: input.commit,
     notes: unique([...input.warnings, ...input.limitations]),
+    excludedCommitPaths: input.excludedCommitPaths,
   });
 }
 
@@ -294,6 +305,11 @@ export function renderReport(report: CompletionReport, failure?: string) {
   };
   section("Implemented", report.implemented);
   section("Changed files", report.changedFiles);
+  if (report.excludedCommitPaths?.length)
+    section(
+      "Modified locally but intentionally not committed",
+      report.excludedCommitPaths.map((entry) => entry.path),
+    );
   section(
     "Validation",
     report.validation.map(

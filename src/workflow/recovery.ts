@@ -670,7 +670,14 @@ async function planWorkflowRecovery(
       return unsafe(
         "Implementor did not complete successfully; inspect repository changes and retry the Implementor.",
       );
-    if (phase === "COMMIT" && !state.commit)
+    if (
+      phase === "COMMIT" &&
+      !state.commit &&
+      !(
+        state.commitSelection?.completed &&
+        !state.commitSelection.commitFiles.length
+      )
+    )
       return unsafe(
         "Commit is not confirmed; inspect repository changes before continuing.",
       );

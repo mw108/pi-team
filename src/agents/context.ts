@@ -7,6 +7,7 @@ import { allowedCommandCategories } from "./command-policy.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { testerValidationContext } from "./validation-context.ts";
+import { nonCommittablePaths } from "../workflow/commit-paths.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -117,8 +118,12 @@ export async function contextFor(
         `${index + 1}. ${[command.executable, ...command.args].join(" ")}`,
     );
   }
-  if (role === "commitAgent")
+  if (role === "commitAgent") {
     copy("codeReviewer", "securityReviewer", "tester");
+    context.nonCommittablePaths = nonCommittablePaths(s.config);
+    context.commitPathInstruction =
+      "Files in nonCommittablePaths may be valid workflow modifications but are local-only. Never include them in your files result. Their presence is not an error; do not revert or delete them.";
+  }
   context.previousFindings = s.history
     .filter((e) => e.event.startsWith("FIX_"))
     .slice(-5)

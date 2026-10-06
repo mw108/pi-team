@@ -21,6 +21,7 @@ import {
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 import type { WorkflowState } from "./state.ts";
+import { isNonCommittablePath } from "./commit-paths.ts";
 const exec = promisify(execFile);
 export async function git(cwd: string, args: string[]) {
   return (
@@ -317,6 +318,7 @@ export async function prepareCommit(
   s: WorkflowState,
   files: string[],
   message: string,
+  allowEmpty = false,
 ) {
   if (
     s.config.qualityGates.codeReview.enabled &&
@@ -369,10 +371,12 @@ export async function prepareCommit(
     JSON.stringify(await gateSnapshot(s)) !== JSON.stringify(s.gateHashes)
   )
     throw new Error("Reviewed files changed before commit");
-  if (!files.length || new Set(files).size !== files.length)
+  if ((!files.length && !allowEmpty) || new Set(files).size !== files.length)
     throw new Error("Commit files must be unique and nonempty");
   for (const path of files) {
     assertRelative(path);
+    if (isNonCommittablePath(s.config, path))
+      throw new Error(`Non-committable path cannot be staged: ${path}`);
     if (
       !allowed.includes(path) ||
       s.baseline.dirtyPaths.includes(path) ||
@@ -385,6 +389,7 @@ export async function prepareCommit(
     (p) =>
       !s.baseline.dirtyPaths.includes(p) &&
       !p.startsWith(".pi/team/") &&
+      !isNonCommittablePath(s.config, p) &&
       !(artifacts.has(p) && !allowed.includes(p)),
   );
   if (produced.some((p) => !files.includes(p)))
@@ -394,7 +399,10 @@ export async function prepareCommit(
   if ((await git(s.cwd, ["diff", "--cached", "--name-only"])).trim())
     throw new Error("Existing staged changes prevent automatic commit");
   for (const path of files) {
-    if (/(^|\/)(\.env(?:\..*)?|auth\.json|.*\.(pem|key)|id_rsa)$/.test(path))
+    if (
+      /(^|\/)(\.env(?:\..*)?|auth\.json|.*\.(pem|key)|id_rsa)$/.test(path) &&
+      !/(^|\/)\.env\.example$/.test(path)
+    )
       throw new Error("Credential-like file denied");
   }
   const scan = await scanCommitSecrets(s.cwd, files);
@@ -414,6 +422,7 @@ export async function prepareCommit(
 export async function createCommit(s: WorkflowState) {
   const intent = s.commitIntent;
   if (!intent) throw new Error("No commit intent");
+  if (!intent.files.length) throw new Error("Empty commit intent denied");
   // Revalidate gates and baseline attribution immediately before staging, even
   // when called independently or after preparing a persisted intent.
   await prepareCommit(s, intent.files, intent.message);

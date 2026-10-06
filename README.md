@@ -645,7 +645,9 @@ Static command rules match the exact executable and exact `argsPrefix`. Without 
 
 Commit preparation scans only commit-intended regular files. It uses `gitleaks` automatically when available on PATH, with a private temporary scan directory containing only those files; otherwise a built-in scanner checks common token prefixes, JWTs, private-key markers and credential assignments. Findings block commit without printing full values. The fallback is conservative and cannot recognize every secret; review generated files and approved command behavior before committing.
 
-Credential-like files, including `.env` variants, remain excluded from automatic commits even when file-tool access was authorized. Editing them can proceed through the normal contract and tool approvals; commit them manually only after reviewing the diff and secret handling.
+Credential-like files remain denied by the commit safety check even when file-tool access was authorized. Editing them can proceed through the normal contract and tool approvals; commit them manually only after reviewing the diff and secret handling.
+
+Some workflow files are intentionally local-only. By default, `.env` and `.env.testing` may be modified when file permissions allow it, but Pi-Team excludes them from automatic commits. Commit exclusions are applied before commit-path attribution and staging, so local-only files do not block an otherwise valid commit. `.env.example` remains committable, subject to normal attribution and secret scanning. Excluded files remain modified in the working tree and are listed in the final report.
 
 Commit Agent has read-only Git inspection and produces a message/file plan. Host code checks quality gates, exact intended file lists, baseline attribution, staged changes, HEAD, file hashes and common credential patterns before staging and committing. Commit hooks are disabled by default. See the explicit trust option below; required validation should normally be approved commands. Secret scanning is heuristic, not comprehensive. Changes to the same originally clean file made concurrently by the user cannot be perfectly attributed; avoid concurrent editing during a task. Git push is never performed and no push/reset/clean/rebase/force command tool is exposed to agents. An explicit orphan discard uses a scoped Git restore in host code.
 
@@ -656,7 +658,11 @@ Workflow discovery skips corrupt state files and loads the newest valid workflow
 ```yaml
 commit:
   runHooks: false
+  excludePaths:
+    - some/local/file
 ```
+
+`commit.excludePaths` adds exact repository-relative paths to the built-in `.env` and `.env.testing` exclusions; it cannot remove those defaults. Older configurations need no migration. This policy controls only automatic commits and does not change file read or write permissions.
 
 The default uses `git -c core.hooksPath=/dev/null commit`. Set `runHooks: true` only for an explicitly trusted repository: its configured hooks execute arbitrary local code with host permissions and can alter source/index contents or run network operations. This is never enabled by discovery or an agent. Quality gates, hashes, baseline attribution and staged-change protection are checked before staging and again before commit invocation. Trusted hooks can have side effects during Git's own commit execution; the extension cannot sandbox or preapprove those effects.
 

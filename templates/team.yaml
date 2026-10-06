@@ -52,6 +52,7 @@ pentest:
     maxResponseBodyBytes: 2097152
 commit:
   runHooks: false
+  excludePaths: []
 ui:
   progress:
     enabled: true

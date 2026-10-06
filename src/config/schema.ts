@@ -7,6 +7,8 @@ import {
   isForbiddenExecutable,
 } from "../agents/command-policy.ts";
 import { permissionPattern } from "../agents/path-policy.ts";
+import { posix } from "node:path";
+import { policyPath } from "../agents/path-policy.ts";
 export const logicalRoles = [
   "orchestrator",
   "researcher",
@@ -307,7 +309,33 @@ export const configSchema = z
       })
       .strict()
       .default({}),
-    commit: z.object({ runHooks: z.boolean().default(false) }).default({}),
+    commit: z
+      .object({
+        runHooks: z.boolean().default(false),
+        excludePaths: z
+          .array(
+            z.string().superRefine((path, ctx) => {
+              try {
+                policyPath(path);
+                if (
+                  path.includes("\\") ||
+                  /[?*\[\]{}\r\n]/.test(path) ||
+                  posix.normalize(path) !== path ||
+                  path.endsWith("/")
+                )
+                  throw new Error("Expected an exact normalized path");
+              } catch {
+                ctx.addIssue({
+                  code: "custom",
+                  message:
+                    "Commit exclusion requires an exact normalized repository-relative path",
+                });
+              }
+            }),
+          )
+          .default([]),
+      })
+      .default({}),
     pentest: z
       .object({
         localUrls: z.array(z.string().url()).default([]),

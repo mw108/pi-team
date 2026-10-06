@@ -295,6 +295,9 @@ export const completionReportSchema = z.object({
     }),
   ),
   notes: strings,
+  excludedCommitPaths: z
+    .array(z.object({ path: z.string(), reason: z.literal("non-committable") }))
+    .optional(),
   unresolvedIssues: strings,
   commit: z.object({
     created: z.boolean(),

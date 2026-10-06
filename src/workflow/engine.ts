@@ -41,6 +41,7 @@ import {
   effectiveConfig,
 } from "../agents/discovery.ts";
 import type { TeamConfig, Command } from "../config/schema.ts";
+import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
 import {
   normalizedRuntimeCommand,
   proposeSimilarRule,
@@ -925,6 +926,15 @@ export class WorkflowEngine {
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
+      } else if (
+        role === "commitAgent" &&
+        state.blocker?.startsWith("Cannot safely attribute commit path: ") &&
+        isNonCommittablePath(
+          state.config,
+          state.blocker.slice("Cannot safely attribute commit path: ".length),
+        )
+      ) {
+        // Older COMMIT attempts can be retried with the new exclusion policy.
       } else if (!(
         (state.blocker?.startsWith("Insufficient Solver proposals") ||
           state.blocker?.startsWith("Solver quorum not reached")) &&
@@ -990,6 +1000,7 @@ export class WorkflowEngine {
     }
     delete state.gateHashes;
     delete state.commitIntent;
+    delete state.commitSelection;
     record(state, "downstream_invalidated", `After manual retry of ${role}`);
   }
   private nextAttempt(state: WorkflowState, role: Role) {
@@ -2844,7 +2855,11 @@ export class WorkflowEngine {
         if (s.phase === "COMMIT") {
           const overlap = contractPaths(
             contractSchema.parse(s.results.reviewer),
-          ).filter((path) => s.baseline.dirtyPaths.includes(path));
+          ).filter(
+            (path) =>
+              s.baseline.dirtyPaths.includes(path) &&
+              !isNonCommittablePath(s.config, path),
+          );
           if (overlap.length) {
             await this.requestApproval(s, {
               kind: "manualCommit",
@@ -3241,21 +3256,51 @@ export class WorkflowEngine {
               role: "commitAgent",
               toolName: "commit_inspect",
             });
-            s.commitIntent = await prepareCommit(
-              s,
-              result.files,
-              result.message,
-            );
-            // Persist intent before a non-idempotent operation. Interrupted commits require inspection.
-            s.inFlight = { phase: "COMMIT", roles: ["commitAgent"] };
+            const selection = classifyCommitPaths(s.config, result.files);
+            s.commitSelection = { ...selection, completed: false };
+            if (selection.excludedPaths.length)
+              record(
+                s,
+                "commit_paths_excluded",
+                selection.excludedPaths.join(", "),
+                {
+                  agent: "commitAgent",
+                  attempt:
+                    s.history.findLast(
+                      (entry) =>
+                        entry.event === "agent_attempt_started" &&
+                        entry.meta?.agent === "commitAgent",
+                    )?.meta?.attempt ?? 1,
+                  paths: selection.excludedPaths,
+                  reason: "non_committable",
+                },
+              );
             await this.store.save(s);
-            this.emitAgentEvent({
-              type: "activity",
-              role: "commitAgent",
-              toolName: "commit_create",
-            });
-            s.commit = await createCommit(s);
-            delete s.inFlight;
+            const intent = await prepareCommit(
+              s,
+              selection.commitFiles,
+              result.message,
+              selection.excludedPaths.length > 0,
+            );
+            if (intent.files.length) {
+              s.commitIntent = intent;
+              // Persist intent before a non-idempotent operation. Interrupted commits require inspection.
+              s.inFlight = { phase: "COMMIT", roles: ["commitAgent"] };
+              await this.store.save(s);
+              this.emitAgentEvent({
+                type: "activity",
+                role: "commitAgent",
+                toolName: "commit_create",
+              });
+              s.commit = await createCommit(s);
+              delete s.inFlight;
+            } else
+              record(
+                s,
+                "commit_nothing_committable",
+                selection.excludedPaths.join(", "),
+              );
+            s.commitSelection.completed = true;
             this.emitAgentEvent({ type: "complete", role: "commitAgent" });
             record(s, "agent_completed", "commitAgent");
           } catch (error) {
