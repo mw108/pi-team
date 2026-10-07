@@ -100,12 +100,15 @@ export function providerRequestContext(
     for (const added of message.toolsAdded ?? []) tools.set(added.name, added);
   }
   const long = level === "diagnostic" || level === "trace";
+  const projectInstructions = parsed.projectInstructions as
+    { source?: unknown; sha256?: unknown; content?: unknown } | undefined;
   return {
     systemPromptPreview: bounded(system, long ? 32768 : 8192),
     userContextPreview: bounded(safeUserText, long ? 65536 : 16384),
     contextSummary: Object.fromEntries(
       [
         "task",
+        "projectInstructions",
         "requirements",
         "reviewer",
         "implementor",
@@ -120,6 +123,18 @@ export function providerRequestContext(
           boundedStructure(parsed[key], long ? 16384 : 8192),
         ]),
     ),
+    ...(projectInstructions
+      ? {
+          projectInstructions: {
+            source: projectInstructions.source,
+            sha256: projectInstructions.sha256,
+            contentPreview:
+              typeof projectInstructions.content === "string"
+                ? bounded(projectInstructions.content, long ? 8192 : 2048)
+                : undefined,
+          },
+        }
+      : {}),
     tools: [...tools.values()].slice(0, 64).map((tool) => ({
       name: bounded(tool.name, 256),
       description: bounded(tool.description, long ? 8192 : 2048),

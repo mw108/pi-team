@@ -12,6 +12,10 @@ See [investigation](docs/investigation.md), [executed validation](docs/validatio
 
 ## Start a task
 
+Pi Team automatically loads a repository-root `AGENTS.md` when a workflow starts. It treats the file as authoritative project guidance for every workflow agent, including coding, architecture, testing, security, and reporting conventions. Explicit user instructions and the workflow contract take precedence; `AGENTS.md` cannot override host security, permissions, command authorization, sandboxing, network policy, commit selection, or workflow gates. Pi Team keeps a bounded UTF-8 startup snapshot and SHA-256 hash, shows its presence in `/team-status`, and blocks if it changes, appears, or disappears during the workflow. Restart and retry use the saved snapshot and check for drift before agents continue. Only the root `AGENTS.md` is supported; nested instruction inheritance is not implemented.
+
+Pi Team preserves the validated `AGENTS.md` text exactly as authored in the workflow snapshot and in agent prompts and context. It does not redact or rewrite this model-facing text. Logs and diagnostic previews may show a bounded, redacted version; that display does not change what agents receive.
+
 Open Pi anywhere inside the target Git repository. Pi Team resolves its Git root for configuration, prompts, state and Git operations:
 
 ```bash

@@ -15,6 +15,7 @@ import {
 } from "../agents/runtime-commands.ts";
 import { posix } from "node:path";
 import { verifiedCommandResultSchema } from "./verified-commands.ts";
+import type { ProjectInstructions } from "./project-instructions.ts";
 import {
   redactVisibleText,
   redactStructured,
@@ -109,6 +110,16 @@ export const stateSchema = z.object({
   semanticConfigHash: z.string().optional(),
   driftConfigSnapshot: configSchema.optional(),
   agentPromptHashes: z.record(z.string()).optional(),
+  projectInstructions: z
+    .object({
+      source: z.literal("AGENTS.md"),
+      content: z.string(),
+      sha256: z.string(),
+      bytes: z.number().int().nonnegative(),
+      loadedAt: z.string(),
+    })
+    .nullable()
+    .optional() as z.ZodType<ProjectInstructions | null | undefined>,
   driftCandidate: z
     .object({
       configPath: z.string(),
@@ -131,6 +142,13 @@ export const stateSchema = z.object({
       phase: z.enum(phases),
       event: z.string(),
       detail: z.string(),
+      instruction: z
+        .object({
+          path: z.literal("AGENTS.md"),
+          sha256: z.string().optional(),
+          bytes: z.number().int().nonnegative().optional(),
+        })
+        .optional(),
       meta: z
         .object({
           agent: z.enum(roles),
@@ -577,6 +595,7 @@ export function record(
   event: string,
   detail = "",
   meta?: WorkflowState["history"][number]["meta"],
+  instruction?: WorkflowState["history"][number]["instruction"],
 ) {
   state.history.push({
     at: new Date().toISOString(),
@@ -584,6 +603,7 @@ export function record(
     event,
     detail: redactVisibleText(detail).slice(0, 4000),
     ...(meta ? { meta: redactStructured(meta) } : {}),
+    ...(instruction ? { instruction } : {}),
   });
 }
 export function block(
@@ -600,6 +620,8 @@ export function block(
 
 /** Sanitize free text before each new state write; operational argv stays intact. */
 export function sanitizeWorkflowStateText(state: WorkflowState): void {
+  // Preserve projectInstructions.content exactly for later agent attempts.
+  // Only diagnostic copies of that content are redacted.
   state.task = redactVisibleText(state.task);
   state.requirements = state.requirements.map(redactVisibleText);
   redactStructuredInPlace(state.results);

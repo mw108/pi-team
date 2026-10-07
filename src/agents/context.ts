@@ -12,10 +12,13 @@ export async function contextFor(
   s: WorkflowState,
 ): Promise<Record<string, any>> {
   if (role === "reporter")
-    return sanitizeContextForProvider(
-      (s.reportInput as Record<string, any> | undefined) ??
-        (await buildCompletionReportInput(s)),
-    );
+    return sanitizeContextForProvider({
+      ...((s.reportInput as Record<string, any> | undefined) ??
+        (await buildCompletionReportInput(s))),
+      ...(s.projectInstructions
+        ? { projectInstructions: s.projectInstructions }
+        : {}),
+    });
   const context: Record<string, unknown> = {
     task: s.task,
     requirements: s.requirements,
@@ -28,6 +31,8 @@ export async function contextFor(
         "Code review → optional Pentest → Security Review → Tester → Commit Agent. A commit is forbidden until all earlier enabled gates pass.",
     },
   };
+  if (s.projectInstructions)
+    context.projectInstructions = s.projectInstructions;
   const copy = (...keys: string[]) => {
     for (const key of keys) if (s.results[key]) context[key] = s.results[key];
   };
@@ -133,5 +138,21 @@ export async function contextFor(
 }
 
 export function sanitizeContextForProvider<T>(context: T): T {
-  return redactStructured(context);
+  if (
+    !context ||
+    typeof context !== "object" ||
+    Array.isArray(context) ||
+    !("projectInstructions" in context)
+  )
+    return redactStructured(context);
+  const { projectInstructions, ...otherContext } = context as Record<
+    string,
+    unknown
+  >;
+  // Project instructions are model input exactly as loaded. This exception
+  // grants no host capabilities; tool and commit authorization remain host-side.
+  return {
+    ...redactStructured(otherContext),
+    projectInstructions,
+  } as T;
 }

@@ -421,6 +421,17 @@ export function renderProgress(
   const lines = [
     `Team ${state.id.slice(0, 8)} · ${phase} · Design cycle ${state.fullCycle}/${state.config.workflow.maxFullCycles}`,
   ];
+  const instructionsChanged = state.history.some(
+    (event) => event.event === "project_instructions_changed",
+  );
+  if (instructionsChanged)
+    lines.push(
+      "Project instructions: ✗ AGENTS.md changed since workflow start",
+    );
+  else if (state.projectInstructions)
+    lines.push(
+      `Project instructions: ✓ AGENTS.md · sha256 ${state.projectInstructions.sha256.slice(0, 12)}`,
+    );
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
   const requirement = pendingFixRequirements(state);
   if (requirement) {

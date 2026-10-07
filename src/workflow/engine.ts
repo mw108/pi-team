@@ -8,6 +8,10 @@ import { join } from "node:path";
 import { resolve } from "node:path";
 import { projectRootSync } from "../config/project.ts";
 import {
+  loadProjectInstructions,
+  projectInstructionsDrift,
+} from "./project-instructions.ts";
+import {
   loadConfig,
   snapshotDefinition,
   type TeamDefinition,
@@ -448,6 +452,11 @@ export class WorkflowEngine {
     mode?: "keep" | "discard" | "override",
   ) {
     this.assertActiveAgent(state, role);
+    const instructionDrift = await projectInstructionsDrift(
+      this.cwd,
+      state.projectInstructions,
+    );
+    if (instructionDrift) throw new Error(instructionDrift);
     const label = getAgentDisplayName(state.config, role);
     if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
@@ -1137,6 +1146,7 @@ export class WorkflowEngine {
       config,
       definition?.path,
     );
+    const projectInstructions = await loadProjectInstructions(this.cwd);
     if (
       definition &&
       (snapshot.configHash !== definition.configHash ||
@@ -1165,7 +1175,14 @@ export class WorkflowEngine {
     state.semanticConfigHash = snapshot.semanticConfigHash;
     state.driftConfigSnapshot = snapshot.config;
     state.agentPromptHashes = snapshot.agentPromptHashes;
+    state.projectInstructions = projectInstructions;
     record(state, "started");
+    if (projectInstructions)
+      record(state, "project_instructions_loaded", "AGENTS.md", undefined, {
+        path: projectInstructions.source,
+        sha256: projectInstructions.sha256,
+        bytes: projectInstructions.bytes,
+      });
     await this.store.save(state);
     return state;
   }
@@ -1223,6 +1240,24 @@ export class WorkflowEngine {
                 return "initial";
               })();
     for (;;) {
+      const instructionDrift = await projectInstructionsDrift(
+        this.cwd,
+        authoritative.projectInstructions,
+      );
+      if (instructionDrift) {
+        record(
+          authoritative,
+          "project_instructions_changed",
+          instructionDrift,
+          undefined,
+          {
+            path: "AGENTS.md",
+            sha256: authoritative.projectInstructions?.sha256,
+          },
+        );
+        await this.store.save(authoritative);
+        throw new Error(instructionDrift);
+      }
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
       const nextAttempt = this.nextAttempt(authoritative, role);
@@ -2378,6 +2413,22 @@ export class WorkflowEngine {
           break;
         }
         this.ui.progress(s);
+        const instructionDrift = await projectInstructionsDrift(
+          this.cwd,
+          s.projectInstructions,
+        );
+        if (instructionDrift) {
+          record(
+            s,
+            "project_instructions_changed",
+            instructionDrift,
+            undefined,
+            { path: "AGENTS.md", sha256: s.projectInstructions?.sha256 },
+          );
+          block(s, instructionDrift);
+          await this.store.save(s);
+          break;
+        }
         if (s.pendingApproval?.kind !== "configDrift") {
           if (!s.teamConfigHash || !s.agentPromptHashes || !s.teamConfigPath) {
             block(

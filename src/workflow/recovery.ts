@@ -17,6 +17,7 @@ import {
 import type { Phase, WorkflowState } from "./state.ts";
 import { isLimitBlockerStillActive } from "./limit-blocker.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
+import { projectInstructionsDrift } from "./project-instructions.ts";
 
 export type FixRequirementsOrigin = {
   sourceAgent: "implementor" | "codeReviewer";
@@ -440,6 +441,11 @@ async function planWorkflowRecovery(
     return unsafe("Workflow is already running.");
   if (state.driftCandidate)
     return unsafe("Configuration drift requires user review.");
+  const instructionDrift = await projectInstructionsDrift(
+    cwd,
+    state.projectInstructions,
+  );
+  if (instructionDrift) return unsafe(instructionDrift);
   if (
     !state.teamConfigPath ||
     !state.teamConfigHash ||
