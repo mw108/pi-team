@@ -5,6 +5,7 @@ import { join } from "node:path";
 import YAML from "yaml";
 import {
   createAssistantMessageEventStream,
+  getCurrentTools,
   type AssistantMessage,
   type Model,
   type Api,
@@ -98,6 +99,59 @@ function fixtureRuntime(failures: string[]) {
     },
   };
 }
+
+test("output repair hides provider tools without removing host executable tools", async () => {
+  const fixture = fixtureRuntime([]);
+  let repairing = true;
+  configureNetworkRetry(
+    fixture.runtime,
+    { maxRetries: 1, delayMs: 0 },
+    () => undefined,
+    undefined,
+    undefined,
+    Date.now,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    "summary",
+    () => repairing,
+  );
+  const context = {
+    messages: [
+      {
+        role: "system" as const,
+        content: "",
+        toolsAdded: [
+          {
+            name: "team_command",
+            description: "test",
+            parameters: { type: "object" },
+          },
+        ],
+        timestamp: 0,
+      },
+      {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: "repair" }],
+        timestamp: 1,
+      },
+    ],
+  } as any;
+  await fixture.runtime.streamSimple(model, context).result();
+  assert.deepEqual(getCurrentTools((fixture.contexts[0] as any).messages), []);
+  assert.equal(getCurrentTools(context.messages).length, 1);
+  repairing = false;
+  await fixture.runtime.streamSimple(model, context).result();
+  assert.equal(
+    getCurrentTools((fixture.contexts[1] as any).messages).length,
+    1,
+  );
+});
 
 function transportError(code: string): TypeError {
   const cause = Object.assign(new Error(`read ${code}`), {

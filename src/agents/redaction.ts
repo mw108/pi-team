@@ -5,6 +5,10 @@ export function redactVisibleText(text: string) {
     text
       .slice(0, 65536)
       .replace(
+        /(<parameter=(?:password|passwd|token|secret|authorization|api[-_]?key|app[-_]?key|credential|private[-_]?key|access[-_]?token)>)[\s\S]*?(<\/parameter>)/gi,
+        "$1[REDACTED]$2",
+      )
+      .replace(
         /((?:--?|\/)(?:password|passwd|token|secret|authorization|api[-_]?key|credential|credentials|access[-_]?token|auth[-_]?token))(\s+|[=:])([^\s]+)/gi,
         "$1$2[REDACTED]",
       )

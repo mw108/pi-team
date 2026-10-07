@@ -1,5 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  getCurrentTools,
+} from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type {
   AssistantMessage,
@@ -70,6 +73,7 @@ export type ProviderRequestEvent = {
     | "provider_request_failure"
     | "provider_progress"
     | "provider_tool_call_raw"
+    | "textual_tool_call_recovered"
     | "tool_call_burst_stream_cutoff";
   providerRequest: number;
   provider: string;
@@ -295,10 +299,29 @@ export function configureNetworkRetry(
     providerRequest: number,
   ) => void,
   rawToolCallLevel: ToolCallLogLevel = "summary",
+  isOutputRepair?: () => boolean,
 ): void {
   const original = runtime.streamSimple.bind(runtime);
   let requestNumber = 0;
   runtime.streamSimple = (model, context, options) => {
+    // Keep the host's executable tool registry intact during output repair.
+    // Only this provider request sees an empty tool declaration.
+    const requestContext = isOutputRepair?.()
+      ? {
+          ...context,
+          messages: [
+            ...context.messages,
+            {
+              role: "system" as const,
+              content: "",
+              toolsRemoved: getCurrentTools(context.messages).map((tool) => ({
+                name: tool.name,
+              })),
+              timestamp: Date.now(),
+            },
+          ],
+        }
+      : context;
     const result = createAssistantMessageEventStream();
     void (async () => {
       let retry = 0;
@@ -397,7 +420,7 @@ export function configureNetworkRetry(
             observeRequest?.({
               type: "provider_request_context",
               ...identity,
-              ...providerRequestContext(context, rawToolCallLevel),
+              ...providerRequestContext(requestContext, rawToolCallLevel),
             });
           } catch {
             // Request diagnostics must not prevent inference.
@@ -486,7 +509,11 @@ export function configureNetworkRetry(
         };
         let events: AssistantMessageEvent[] = [];
         try {
-          for await (const event of original(model, context, requestOptions)) {
+          for await (const event of original(
+            model,
+            requestContext,
+            requestOptions,
+          )) {
             if (
               event.type === "toolcall_start" &&
               streamGuard &&

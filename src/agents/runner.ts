@@ -8,7 +8,8 @@ import {
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { z } from "zod";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { agentDir } from "../config/loader.ts";
 import {
@@ -85,6 +86,7 @@ import {
   FileMutationTracker,
   type MutationObserver,
 } from "./mutation-attribution.ts";
+import { parseTextualToolCall } from "./textual-tool-call.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -104,6 +106,44 @@ export type { GuardEvent } from "./doom-loop.ts";
 
 export const testerCommandInstructions =
   " Implementor checks[] are not execution evidence, but may be candidate commands to execute. Use candidateValidationCommands for missing checks: call team_command with exact executable and args plus a concise purpose, or use an exact approved command ID. commandAuthorizationHints are informational static policy; the host decides authorization. team_command executes one command; it does not discover or list commands. team_command({}) is invalid and must never be used. If no candidates exist, inspect project files with available read/grep/find/ls tools, or return BLOCKED if no safe command can be determined.";
+
+export function recoverTextualToolCallMessage(
+  role: Role,
+  message: AssistantMessage,
+): { message: AssistantMessage; tool: string } | null {
+  if (["error", "aborted", "length"].includes(message.stopReason)) return null;
+  if (message.content.some((part) => part.type === "toolCall")) return null;
+  const text = message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+  try {
+    parseText(role, text);
+    return null;
+  } catch (error) {
+    if (!(error instanceof AgentOutputError) || error.kind !== "parse")
+      return null;
+  }
+  const call = parseTextualToolCall(text);
+  if (!call) return null;
+  // Recovery changes parsing only. Pi's normal registry, schema, guard,
+  // host authorization, and execution pipeline still decide this call.
+  return {
+    tool: call.name,
+    message: {
+      ...message,
+      content: [
+        ...message.content,
+        {
+          type: "toolCall",
+          id: `recovered-${randomUUID()}`,
+          name: call.name,
+          arguments: call.arguments as JsonObject,
+        },
+      ],
+    },
+  };
+}
 
 export function compactValidationEvidence(
   evidence: (Pick<CommandEvidence, "id" | "exitCode" | "output"> &
@@ -197,6 +237,8 @@ export interface AgentRunner {
   ): Promise<unknown>;
 }
 export class PiRunner implements AgentRunner {
+  private readonly outputRepair = new WeakMap<AgentSession, () => void>();
+
   async createSession(
     role: Role,
     s: WorkflowState,
@@ -249,12 +291,15 @@ export class PiRunner implements AgentRunner {
       cacheWarming: "off",
     });
     const httpIdleTimeoutMs = settings.getHttpIdleTimeoutMs();
+    let outputRepairActive = false;
+    let lastProviderRequest = 0;
     configureNetworkRetry(
       runtime,
       resolveNetworkRetry(config, role),
       getSignal,
       network,
-      (event) =>
+      (event) => {
+        if (event.providerRequest) lastProviderRequest = event.providerRequest;
         providerEvent?.(
           event.type === "provider_progress"
             ? event
@@ -268,7 +313,8 @@ export class PiRunner implements AgentRunner {
                   },
                 },
               },
-        ),
+        );
+      },
       Date.now,
       providerProgress,
       undefined,
@@ -291,6 +337,7 @@ export class PiRunner implements AgentRunner {
         : undefined,
       normalizedResponse,
       config.logging.agentLogs.level,
+      () => outputRepairActive,
     );
     const paths: string[] = [],
       factories: any[] = [];
@@ -330,6 +377,28 @@ export class PiRunner implements AgentRunner {
           guardState.guard.toolsDisabledForFinalization;
         return message === event.message ? undefined : { message };
       });
+      pi.on("message_end", async (event) => {
+        if (event.message.role !== "assistant") return;
+        const recovered = recoverTextualToolCallMessage(role, event.message);
+        if (!recovered) return;
+        outputRepairActive = false;
+        try {
+          providerEvent?.({
+            type: "textual_tool_call_recovered",
+            providerRequest: lastProviderRequest,
+            provider: selected.provider,
+            model: selected.model,
+            api: model.api,
+            networkRetry: 0,
+            requestStartedAt: new Date().toISOString(),
+            tool: recovered.tool,
+            agent: role,
+          });
+        } catch {
+          // Diagnostic logging must not suppress an authorized recovery.
+        }
+        return { message: recovered.message };
+      });
       pi.on("tool_call", async (event) => {
         const { tool, input } = toolInvocation(event.toolName, event.input);
         const guarded = await guardState?.guard.call(
@@ -346,6 +415,11 @@ export class PiRunner implements AgentRunner {
             guardState.guard.toolsDisabledForFinalization;
         }
         if (guarded) return guarded;
+        if (outputRepairActive)
+          return {
+            block: true,
+            reason: "Native tool calls are disabled during output repair",
+          };
         try {
           await checkTool(
             role,
@@ -451,6 +525,9 @@ export class PiRunner implements AgentRunner {
     // Pi defaults to parallel batches; sequential execution lets a failed-call
     // guard stop the remainder of a response before more tools run.
     session.agent.toolExecution = "sequential";
+    this.outputRepair.set(session, () => {
+      outputRepairActive = true;
+    });
     return session;
   }
   async run(
@@ -705,7 +782,9 @@ export class PiRunner implements AgentRunner {
           await validateContractPaths(state.cwd, result);
       } catch (error) {
         // Correction is output-only: never replay writes or commands because of malformed JSON.
-        session.setActiveToolsByName([]);
+        const prepareOutputRepair = this.outputRepair.get(session);
+        if (prepareOutputRepair) prepareOutputRepair();
+        else session.setActiveToolsByName([]);
         const required = (zodToJsonSchema(resultSchemas[role]) as any).required;
         await session.prompt(
           `Your previous final response did not match the required ${role} schema. Diagnostic: ${redactVisibleText(String(error instanceof AgentOutputError ? (error.diagnostic ?? error.message) : error).slice(0, 1000))}. Tools are now disabled. Return only the required JSON object with these fields: ${JSON.stringify(required)}. Do not use Markdown fences. Do not call tools or output <tool_call> markup. Do not include commentary before or after the JSON. If required work could not be completed, return the role's blocked or failure status where supported. Required instance schema: ${JSON.stringify(zodToJsonSchema(resultSchemas[role]))}.`,

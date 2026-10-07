@@ -348,6 +348,10 @@ export class AgentLogStore {
         lines.push(
           `${time} provider request ${event.providerRequest} raw tool ${event.tool ?? event.toolCallIndex}: ${event.rawArguments} (${event.parseStatus})`,
         );
+      if (event.type === "textual_tool_call_recovered")
+        lines.push(
+          `${time} provider request ${event.providerRequest} recovered textual tool ${event.tool}`,
+        );
       if (event.type === "provider_request_failure") {
         lines.push(...errorLines(event.error));
         const configuredTimeout = (
