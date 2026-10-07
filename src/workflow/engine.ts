@@ -10,6 +10,7 @@ import { projectRootSync } from "../config/project.ts";
 import {
   loadProjectInstructions,
   projectInstructionsDrift,
+  validateProjectInstructions,
 } from "./project-instructions.ts";
 import {
   loadConfig,
@@ -1147,6 +1148,8 @@ export class WorkflowEngine {
       definition?.path,
     );
     const projectInstructions = await loadProjectInstructions(this.cwd);
+    if (projectInstructions)
+      validateProjectInstructions(projectInstructions, config);
     if (
       definition &&
       (snapshot.configHash !== definition.configHash ||

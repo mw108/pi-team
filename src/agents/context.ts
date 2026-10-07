@@ -7,6 +7,7 @@ import { allowedCommandCategories } from "./command-policy.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { testerValidationContext } from "./validation-context.ts";
+import { projectInstructionsForAgent } from "../workflow/project-instructions.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -16,7 +17,13 @@ export async function contextFor(
       ...((s.reportInput as Record<string, any> | undefined) ??
         (await buildCompletionReportInput(s))),
       ...(s.projectInstructions
-        ? { projectInstructions: s.projectInstructions }
+        ? {
+            projectInstructions: projectInstructionsForAgent(
+              s.projectInstructions,
+              s.config,
+              role,
+            ),
+          }
         : {}),
     });
   const context: Record<string, unknown> = {
@@ -32,7 +39,11 @@ export async function contextFor(
     },
   };
   if (s.projectInstructions)
-    context.projectInstructions = s.projectInstructions;
+    context.projectInstructions = projectInstructionsForAgent(
+      s.projectInstructions,
+      s.config,
+      role,
+    );
   const copy = (...keys: string[]) => {
     for (const key of keys) if (s.results[key]) context[key] = s.results[key];
   };

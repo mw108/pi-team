@@ -12,9 +12,35 @@ See [investigation](docs/investigation.md), [executed validation](docs/validatio
 
 ## Start a task
 
-Pi Team automatically loads a repository-root `AGENTS.md` when a workflow starts. It treats the file as authoritative project guidance for every workflow agent, including coding, architecture, testing, security, and reporting conventions. Explicit user instructions and the workflow contract take precedence; `AGENTS.md` cannot override host security, permissions, command authorization, sandboxing, network policy, commit selection, or workflow gates. Pi Team keeps a bounded UTF-8 startup snapshot and SHA-256 hash, shows its presence in `/team-status`, and blocks if it changes, appears, or disappears during the workflow. Restart and retry use the saved snapshot and check for drift before agents continue. Only the root `AGENTS.md` is supported; nested instruction inheritance is not implemented.
+Pi Team automatically loads a repository-root `AGENTS.md` when a workflow starts. It treats the file as authoritative project guidance for workflow agents. Explicit user instructions and the workflow contract take precedence; `AGENTS.md` cannot override host security, permissions, command authorization, sandboxing, network policy, commit selection, or workflow gates. Pi Team keeps a bounded UTF-8 startup snapshot and SHA-256 hash, shows its presence in `/team-status`, and blocks if it changes, appears, or disappears during the workflow. Restart and retry use the saved snapshot and check for drift before agents continue. Only the root `AGENTS.md` is supported; nested instruction inheritance is not implemented.
 
-Pi Team preserves the validated `AGENTS.md` text exactly as authored in the workflow snapshot and in agent prompts and context. It does not redact or rewrite this model-facing text. Logs and diagnostic previews may show a bounded, redacted version; that display does not change what agents receive.
+Use exact, unindented `## [scope]` lines to give an agent its own instructions. Text before the first marker and `[all]` sections apply to every agent. Repeated sections are allowed and selected in file order:
+
+```md
+# Project instructions
+
+These rules apply to everyone.
+
+## [all]
+
+Follow existing architecture.
+
+## [implementor]
+
+Read `BEST_PRACTICES.md` before changing code.
+
+## [reviewer]
+
+Check the implementation contract against `BEST_PRACTICES.md`.
+
+## [tester]
+
+Follow `TESTING.md` conventions.
+```
+
+The fixed scopes are `all`, `orchestrator`, `researcher`, `critic`, `reviewer`, `implementor`, `codeReviewer`, `pentester`, `securityReviewer`, `tester`, `commitAgent`, and `reporter`. A fixed scope remains valid when that agent is disabled. Solver scopes are `solver1` through `solverN`, where `N` is the effective `workflow.solverCount` (1–10). For example, `solverCount: 3` permits `[solver1]`, `[solver2]`, and `[solver3]`; `[solver4]` fails workflow initialization. Unknown scopes such as `[unknownRole]` also fail initialization.
+
+Only a complete `## [scope]` line outside fenced code is a marker. Case matters; indentation, trailing prose, other heading levels, and markers in code fences are ordinary Markdown. If there are no scoped markers, the entire file applies to every agent. Pi Team saves and hashes the full validated file; agent prompts and structured context receive only the applicable sections, with authored text and line endings preserved. Diagnostic previews are bounded and redacted. Referenced files such as `BEST_PRACTICES.md` are not automatically inlined.
 
 Open Pi anywhere inside the target Git repository. Pi Team resolves its Git root for configuration, prompts, state and Git operations:
 
