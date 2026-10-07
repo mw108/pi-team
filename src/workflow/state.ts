@@ -297,13 +297,20 @@ export const stateSchema = z.object({
     .optional(),
   commitSelection: z
     .object({
-      requestedPaths: z.array(z.string()),
+      workflowPaths: z.array(z.string()),
       excludedPaths: z.array(z.string()),
-      commitFiles: z.array(z.string()),
+      commitPaths: z.array(z.string()),
+      validatedAt: z.string().optional(),
       completed: z.boolean().default(false),
     })
     .optional(),
-  commit: z.object({ hash: z.string(), files: z.array(z.string()) }).optional(),
+  commit: z
+    .object({
+      hash: z.string(),
+      files: z.array(z.string()),
+      message: z.string().optional(),
+    })
+    .optional(),
   reportFailure: z.string().optional(),
   reportInput: z.unknown().optional(),
 });
@@ -336,6 +343,17 @@ function migrateState(value: unknown): unknown {
       };
   }
   if (!value || typeof value !== "object") return value;
+  const selection = (value as Record<string, any>).commitSelection;
+  if (selection && !Array.isArray(selection.workflowPaths))
+    value = {
+      ...(value as Record<string, unknown>),
+      commitSelection: {
+        workflowPaths: selection.requestedPaths ?? [],
+        excludedPaths: selection.excludedPaths ?? [],
+        commitPaths: selection.commitFiles ?? [],
+        completed: selection.completed ?? false,
+      },
+    };
   // Earlier runtime grants had category scope, and old similarity rules allowed
   // arbitrary suffixes. Their requesting role cannot be recovered safely.
   const legacy = value as Record<string, any>;
@@ -506,7 +524,12 @@ export function validateState(value: unknown): WorkflowState {
       throw new Error("Approved dirty path is not in the baseline");
   for (const [key, result] of Object.entries(state.results))
     if ((roles as readonly string[]).includes(key))
-      parseResult(key as Role, result);
+      parseResult(
+        key as Role,
+        key === "commitAgent" && result && typeof result === "object"
+          ? { message: (result as Record<string, unknown>).message }
+          : result,
+      );
   return state;
 }
 export function newState(

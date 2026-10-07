@@ -4,13 +4,19 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configSchema } from "../src/config/schema.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
+import { validateState } from "../src/workflow/state.ts";
 import {
   classifyCommitPaths,
   nonCommittablePaths,
 } from "../src/workflow/commit-paths.ts";
 import { contextFor } from "../src/agents/context.ts";
+import { parseResult } from "../src/agents/schemas.ts";
 import { git, head, prepareCommit } from "../src/workflow/git.ts";
-import { renderReport } from "../src/workflow/report.ts";
+import {
+  buildCompletionReportInput,
+  renderReport,
+} from "../src/workflow/report.ts";
+import { deriveAgentProgressState } from "../src/ui/progress.ts";
 import { config, FixtureRunner, output, repository } from "./helpers.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
@@ -33,6 +39,10 @@ async function workflow(
     excludePaths?: string[];
     retryProposed?: string[];
     ignored?: string[];
+    failCommitFirst?: boolean;
+    unexpectedPath?: string;
+    secretPath?: string;
+    noChanges?: boolean;
   } = {},
 ) {
   const cwd = await repository();
@@ -78,18 +88,38 @@ async function workflow(
         filesToCreate: contractFiles.filter((path) => !tracked.has(path)),
       };
     if (role === "implementor") {
-      for (const path of contractFiles) {
-        await mkdir(dirname(join(cwd, path)), { recursive: true });
-        await writeFile(join(cwd, path), `workflow change in ${path}\n`);
-      }
-      return { ...output(role), changedFiles: contractFiles };
+      if (!options.noChanges)
+        for (const path of contractFiles) {
+          await mkdir(dirname(join(cwd, path)), { recursive: true });
+          await writeFile(
+            join(cwd, path),
+            path === options.secretPath
+              ? "API_KEY=abc123def456ghi789\n"
+              : `workflow change in ${path}\n`,
+          );
+        }
+      return {
+        ...output(role),
+        changedFiles: contractFiles,
+      };
     }
-    if (role === "tester") return output(role);
+    if (role === "tester") {
+      if (options.unexpectedPath)
+        await writeFile(
+          join(cwd, options.unexpectedPath),
+          "outside workflow\n",
+        );
+      return output(role);
+    }
     if (role === "commitAgent") {
       commitInputs.push(await contextFor(role, state));
+      if (options.failCommitFirst && count === 1)
+        throw new Error("Commit message unavailable");
       return {
         message: "feat: fixture",
-        files: count > 1 ? (options.retryProposed ?? proposed) : proposed,
+        ...(options.retryProposed
+          ? { files: count > 1 ? options.retryProposed : proposed }
+          : {}),
       };
     }
     if (role === "reporter") {
@@ -117,9 +147,9 @@ test("default policy is exact, normalized, additive, and rejects traversal", () 
   assert.deepEqual(
     classifyCommitPaths(legacy, ["./.env", ".env.testing", ".env.example"]),
     {
-      requestedPaths: ["./.env", ".env.testing", ".env.example"],
+      workflowPaths: [".env", ".env.testing", ".env.example"],
       excludedPaths: [".env", ".env.testing"],
-      commitFiles: [".env.example"],
+      commitPaths: [".env.example"],
     },
   );
   const extended = config();
@@ -148,18 +178,32 @@ test("incident paths exclude local files before attribution and stage only five 
     },
   );
   assert.equal(state.phase, "DONE", state.blocker);
-  assert.deepEqual(state.commitSelection, {
-    requestedPaths: incidentFiles,
-    excludedPaths: [".env", ".env.testing"],
-    commitFiles: incidentFiles.slice(2),
-    completed: true,
-  });
-  assert.deepEqual(state.commit?.files, incidentFiles.slice(2));
-  assert.deepEqual(commitInputs[0].nonCommittablePaths, [
+  assert.deepEqual(
+    state.commitSelection && {
+      ...state.commitSelection,
+      validatedAt: undefined,
+    },
+    {
+      workflowPaths: incidentFiles.toSorted(),
+      excludedPaths: [".env", ".env.testing"],
+      commitPaths: incidentFiles.slice(2).toSorted(),
+      validatedAt: undefined,
+      completed: true,
+    },
+  );
+  assert.deepEqual(state.commit?.files, incidentFiles.slice(2).toSorted());
+  assert.deepEqual(
+    commitInputs[0].authoritativeCommitPaths,
+    incidentFiles.slice(2).toSorted(),
+  );
+  assert.deepEqual(commitInputs[0].excludedCommitPaths, [
     ".env",
     ".env.testing",
   ]);
-  assert.match(commitInputs[0].commitPathInstruction, /Never include them/);
+  assert.match(
+    commitInputs[0].commitPathInstruction,
+    /Do not add, remove, or propose paths/,
+  );
   assert.deepEqual(
     (await git(cwd, ["show", "--format=", "--name-only", "HEAD"]))
       .trim()
@@ -189,7 +233,7 @@ test("incident paths exclude local files before attribution and stage only five 
 });
 
 test("only excluded tracked files complete without creating a commit", async () => {
-  const { cwd, state, before, reporterInputs } = await workflow(
+  const { cwd, state, before, reporterInputs, runner } = await workflow(
     [".env", ".env.testing"],
     [".env", ".env.testing"],
     { tracked: [".env", ".env.testing"] },
@@ -197,8 +241,14 @@ test("only excluded tracked files complete without creating a commit", async () 
   assert.equal(state.phase, "DONE", state.blocker);
   assert.equal(state.commit, undefined);
   assert.equal(await head(cwd), before);
-  assert.deepEqual(state.commitSelection?.commitFiles, []);
+  assert.deepEqual(state.commitSelection?.commitPaths, []);
   assert.equal(state.commitSelection?.completed, true);
+  assert.equal(reporterInputs.length, 1);
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(
+    deriveAgentProgressState(state, "commitAgent").status,
+    "completed",
+  );
   assert.match(
     (state.reportInput as any)?.commit?.detail ?? "",
     /Nothing committable/,
@@ -210,6 +260,52 @@ test("only excluded tracked files complete without creating a commit", async () 
     [".env", ".env.testing"],
   );
   assert.match(await git(cwd, ["status", "--short"]), /\.env/);
+});
+
+test("Implementor file claims cannot create a commit without repository changes", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    { noChanges: true },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.deepEqual(state.commitSelection?.workflowPaths, []);
+  assert.deepEqual(state.commitSelection?.commitPaths, []);
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(state.commit, undefined);
+});
+
+test("message-only result cannot omit phpunit.xml or inject paths", async () => {
+  const { cwd, state, commitInputs } = await workflow(
+    [".gitignore", "README.md", ".env"],
+    incidentFiles,
+    { ignored: [".env", ".env.testing"] },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.deepEqual(
+    commitInputs[0].authoritativeCommitPaths,
+    incidentFiles.slice(2).toSorted(),
+  );
+  assert.deepEqual(state.commit?.files, incidentFiles.slice(2).toSorted());
+  assert.match(
+    await git(cwd, ["show", "--format=", "--name-only", "HEAD"]),
+    /phpunit\.xml/,
+  );
+  assert.doesNotMatch(
+    await git(cwd, ["show", "--format=", "--name-only", "HEAD"]),
+    /README\.md|\.gitignore|\.env/,
+  );
+  assert.throws(() =>
+    parseResult("commitAgent", {
+      message: "feat: change",
+      files: ["README.md"],
+    }),
+  );
+  state.results.commitAgent = { message: "wrong legacy message" };
+  assert.equal(
+    (await buildCompletionReportInput(state)).commit.message,
+    "feat: fixture",
+  );
 });
 
 test("pre-existing dirty excluded path remains untouched while normal file commits", async () => {
@@ -224,31 +320,61 @@ test("pre-existing dirty excluded path remains untouched while normal file commi
   assert.match(await readFile(join(cwd, ".env"), "utf8"), /workflow change/);
 });
 
-test("normal unattributable path still blocks", async () => {
-  const { state, engine } = await workflow(["src/UnknownFile.php"], [".env"]);
+test("unexpected .gitignore change still blocks before Commit Agent", async () => {
+  const { state, engine, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    { unexpectedPath: ".gitignore" },
+  );
   assert.equal(state.phase, "BLOCKED");
   assert.match(
     state.blocker ?? "",
-    /Cannot safely attribute commit path: src\/UnknownFile.php/,
+    /Repository contains changes outside the Implementation Contract: \.gitignore/,
   );
-  assert.doesNotMatch(state.blocker ?? "", /\.env/);
+  assert.equal(runner.counts.commitAgent, undefined);
   assert.deepEqual(
     (await engine.store.load(state.id)).commitSelection,
     state.commitSelection,
   );
 });
 
-test("a legacy .env attribution blocker can retry COMMIT without rerunning gates", async () => {
-  const { cwd, state, engine, runner } = await workflow(
-    ["src/UnknownFile.php"],
-    [".env", "config/app.php"],
-    { retryProposed: [".env", "config/app.php"] },
+test("unexpected generated output blocks before Commit Agent", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    { unexpectedPath: "generated.txt" },
   );
   assert.equal(state.phase, "BLOCKED");
-  state.blocker = "Cannot safely attribute commit path: .env";
-  state.results.commitAgent = {
+  assert.match(
+    state.blocker ?? "",
+    /outside the Implementation Contract: generated\.txt/,
+  );
+  assert.equal(runner.counts.commitAgent, undefined);
+});
+
+test("secret in host-selected file blocks before Commit Agent", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    { secretPath: "config/app.php" },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  assert.match(state.blocker ?? "", /Commit blocked: possible/);
+  assert.equal(runner.counts.commitAgent, undefined);
+});
+
+test("a legacy file-list mismatch can retry COMMIT without rerunning gates", async () => {
+  const { cwd, state, engine, runner } = await workflow(
+    [".env", "config/app.php"],
+    [".env", "config/app.php"],
+    { failCommitFirst: true },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  state.blocker =
+    "Commit excludes workflow changes or includes unexpected generated files";
+  (state.results as Record<string, unknown>).commitAgent = {
     message: "feat: fixture",
-    files: [".env", "config/app.php"],
+    files: [".gitignore", "README.md", ".env"],
   };
   await engine.store.save(state);
   const restarted = new WorkflowEngine(cwd, runner, ui);
@@ -263,6 +389,24 @@ test("a legacy .env attribution blocker can retry COMMIT without rerunning gates
   assert.deepEqual(loaded.commit?.files, ["config/app.php"]);
   assert.equal(runner.counts.tester, 1);
   assert.equal(runner.counts.commitAgent, 2);
+});
+
+test("legacy persisted selection and Commit Agent files remain readable", async () => {
+  const { state } = await workflow(["config/app.php"], ["config/app.php"]);
+  const persisted = JSON.parse(JSON.stringify(state));
+  persisted.commitSelection = {
+    requestedPaths: ["config/app.php"],
+    excludedPaths: [],
+    commitFiles: ["config/app.php"],
+    completed: true,
+  };
+  persisted.results.commitAgent = {
+    message: "feat: fixture",
+    files: ["README.md"],
+  };
+  const loaded = validateState(persisted);
+  assert.deepEqual(loaded.commitSelection?.commitPaths, ["config/app.php"]);
+  assert.deepEqual(loaded.commit?.files, ["config/app.php"]);
 });
 
 test("host refuses non-committable path even when prepareCommit is called directly", async () => {

@@ -22,19 +22,20 @@ export function isNonCommittablePath(
   return nonCommittablePaths(config).includes(policyPath(path));
 }
 
-export function classifyCommitPaths(config: TeamConfig, proposed: string[]) {
-  if (!proposed.length)
-    throw new Error("Commit files must be unique and nonempty");
+export function classifyCommitPaths(
+  config: TeamConfig,
+  workflowPaths: string[],
+) {
   const excluded = new Set(nonCommittablePaths(config));
-  const normalized = proposed.map((path) => {
+  const normalized = workflowPaths.map((path) => {
     policyPath(path); // Reject traversal and absolute paths before normalization.
     return posix.normalize(path.normalize("NFC").replace(/\\/g, "/"));
   });
   if (new Set(normalized.map(policyPath)).size !== normalized.length)
     throw new Error("Commit files must be unique and nonempty");
   return {
-    requestedPaths: [...proposed],
+    workflowPaths: normalized,
     excludedPaths: normalized.filter((path) => excluded.has(policyPath(path))),
-    commitFiles: normalized.filter((path) => !excluded.has(policyPath(path))),
+    commitPaths: normalized.filter((path) => !excluded.has(policyPath(path))),
   };
 }

@@ -675,7 +675,7 @@ async function planWorkflowRecovery(
       !state.commit &&
       !(
         state.commitSelection?.completed &&
-        !state.commitSelection.commitFiles.length
+        !state.commitSelection.commitPaths.length
       )
     )
       return unsafe(

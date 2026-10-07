@@ -121,7 +121,7 @@ test("commit and review facts remain authoritative in finalized report", async (
     changedFiles: ["math.js"],
     checks: [],
   };
-  s.results.commitAgent = { message: "fix addition", files: ["math.js"] };
+  s.results.commitAgent = { message: "fix addition" };
   s.commit = { hash: "abc123", files: ["math.js"] };
   const input = await buildCompletionReportInput(s);
   assert.deepEqual(input.implementation.changedFiles, ["math.js"]);

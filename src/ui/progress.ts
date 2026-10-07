@@ -158,6 +158,12 @@ export function deriveAgentProgressState(
       (state.phase === "RESEARCH" && role === "researcher"))
   )
     return { status: "running", attempt: live.attempt };
+  if (
+    role === "commitAgent" &&
+    state.commitSelection?.completed &&
+    !state.commitSelection.commitPaths.length
+  )
+    return { status: "completed", detail: "nothing committable" };
   if (lifecycle > invalidation && latest?.event === "agent_attempt_failed")
     return { status: "failed", attempt: latest.meta?.attempt };
   if (lifecycle > invalidation && latest?.event === "agent_aborted_by_user")

@@ -21,7 +21,7 @@ import {
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 import type { WorkflowState } from "./state.ts";
-import { isNonCommittablePath } from "./commit-paths.ts";
+import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
 const exec = promisify(execFile);
 export async function git(cwd: string, args: string[]) {
   return (
@@ -314,6 +314,44 @@ export function gitInspectTool(s: WorkflowState): ToolDefinition {
     },
   };
 }
+/** Repository and contract evidence, never LLM output, determines staging paths. */
+export async function determineAuthoritativeCommitSelection(s: WorkflowState) {
+  const unexpected = await unexpectedWorkflowPaths(s);
+  if (unexpected.length)
+    throw new Error(
+      `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
+    );
+  const allowed = new Set(
+    contractPaths(contractSchema.parse(s.results.reviewer)),
+  );
+  const baselineDirty = new Set(s.baseline.dirtyPaths);
+  const visible = (await dirtyPaths(s.cwd)).filter(
+    (path) => allowed.has(path) && !baselineDirty.has(path),
+  );
+  // Git status omits ignored local-only files. Compare host snapshots taken
+  // immediately before implementation to include those workflow changes.
+  const excludedContractPaths = [...allowed].filter((path) =>
+    isNonCommittablePath(s.config, path),
+  );
+  const currentExcluded = await hashes(s.cwd, excludedContractPaths);
+  const changedExcluded = excludedContractPaths.filter(
+    (path) =>
+      (s.implementationStartHashes?.[path] !== undefined &&
+        s.implementationStartHashes[path] !== currentExcluded[path]) ||
+      s.observedImplementorMutations.some((mutation) => mutation.path === path),
+  );
+  const workflowPaths = [...new Set([...visible, ...changedExcluded])].sort();
+  const selection = classifyCommitPaths(s.config, workflowPaths);
+  // Apply all commit safety checks, including secret scanning, before the model
+  // sees the selection. prepareCommit repeats them after message generation.
+  await prepareCommit(
+    s,
+    selection.commitPaths,
+    "commit selection validation",
+    true,
+  );
+  return selection;
+}
 export async function prepareCommit(
   s: WorkflowState,
   files: string[],
@@ -371,6 +409,11 @@ export async function prepareCommit(
     JSON.stringify(await gateSnapshot(s)) !== JSON.stringify(s.gateHashes)
   )
     throw new Error("Reviewed files changed before commit");
+  const unexpected = await unexpectedWorkflowPaths(s);
+  if (unexpected.length)
+    throw new Error(
+      `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
+    );
   if ((!files.length && !allowEmpty) || new Set(files).size !== files.length)
     throw new Error("Commit files must be unique and nonempty");
   for (const path of files) {
@@ -392,9 +435,10 @@ export async function prepareCommit(
       !isNonCommittablePath(s.config, p) &&
       !(artifacts.has(p) && !allowed.includes(p)),
   );
-  if (produced.some((p) => !files.includes(p)))
+  const missing = produced.filter((path) => !files.includes(path));
+  if (missing.length)
     throw new Error(
-      "Commit excludes workflow changes or includes unexpected generated files",
+      `Commit selection no longer matches repository changes: ${missing.join(", ")}`,
     );
   if ((await git(s.cwd, ["diff", "--cached", "--name-only"])).trim())
     throw new Error("Existing staged changes prevent automatic commit");
@@ -450,5 +494,5 @@ export async function createCommit(s: WorkflowState) {
   ]);
   const hash = await head(s.cwd);
   if (!hash) throw new Error("Commit hash unavailable");
-  return { hash, files: intent.files };
+  return { hash, files: intent.files, message: intent.message };
 }

@@ -282,7 +282,7 @@ export const testSchema = z.object({
   failedAreas: strings,
   classification: z.enum(["FIX_LOCAL", "FIX_DESIGN"]).optional(),
 });
-export const commitSchema = z.object({ message: text, files: strings });
+export const commitSchema = z.object({ message: text }).strict();
 export const completionReportSchema = z.object({
   summary: text,
   implemented: strings,

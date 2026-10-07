@@ -204,11 +204,17 @@ export async function buildCompletionReportInput(
     commit: {
       created: !!s.commit,
       ...(s.commit
-        ? { hash: s.commit.hash, message: commitResult?.message }
+        ? {
+            hash: s.commit.hash,
+            message:
+              s.commit.message ??
+              s.commitIntent?.message ??
+              commitResult?.message,
+          }
         : {
             detail: s.config.qualityGates.commit.enabled
               ? s.commitSelection?.completed &&
-                !s.commitSelection.commitFiles.length
+                !s.commitSelection.commitPaths.length
                 ? "Nothing committable; local-only changes remain in the working tree."
                 : (s.blocker ?? "No commit was recorded.")
               : "Disabled by configuration.",

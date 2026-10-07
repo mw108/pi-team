@@ -41,7 +41,7 @@ import {
   effectiveConfig,
 } from "../agents/discovery.ts";
 import type { TeamConfig, Command } from "../config/schema.ts";
-import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
+import { isNonCommittablePath } from "./commit-paths.ts";
 import {
   normalizedRuntimeCommand,
   proposeSimilarRule,
@@ -61,6 +61,7 @@ import {
   classifyAttributedImplementation,
   discardAttributedImplementation,
   prepareCommit,
+  determineAuthoritativeCommitSelection,
   createCommit,
 } from "./git.ts";
 import {
@@ -928,6 +929,12 @@ export class WorkflowEngine {
         // Presentation can be retried after work has completed.
       } else if (
         role === "commitAgent" &&
+        state.blocker ===
+          "Commit excludes workflow changes or includes unexpected generated files"
+      ) {
+        // Legacy agent file-list mismatch; retry recomputes host selection.
+      } else if (
+        role === "commitAgent" &&
         state.blocker?.startsWith("Cannot safely attribute commit path: ") &&
         isNonCommittablePath(
           state.config,
@@ -998,9 +1005,11 @@ export class WorkflowEngine {
           state.results[dependent];
       delete state.results[dependent];
     }
-    delete state.gateHashes;
+    if (role !== "commitAgent") {
+      delete state.gateHashes;
+      delete state.commitSelection;
+    }
     delete state.commitIntent;
-    delete state.commitSelection;
     record(state, "downstream_invalidated", `After manual retry of ${role}`);
   }
   private nextAttempt(state: WorkflowState, role: Role) {
@@ -2876,6 +2885,48 @@ export class WorkflowEngine {
             });
             continue;
           }
+          const selection = await determineAuthoritativeCommitSelection(s);
+          s.commitSelection = {
+            ...selection,
+            validatedAt: new Date().toISOString(),
+            completed: false,
+          };
+          record(
+            s,
+            "commit_selection_prepared",
+            JSON.stringify({
+              workflowPaths: selection.workflowPaths.length,
+              excludedPaths: selection.excludedPaths.length,
+              commitPaths: selection.commitPaths.length,
+            }),
+          );
+          if (selection.excludedPaths.length)
+            record(
+              s,
+              "commit_paths_excluded",
+              selection.excludedPaths.join(", "),
+              {
+                agent: "commitAgent",
+                attempt: Math.max(1, this.nextAttempt(s, "commitAgent") - 1),
+                paths: selection.excludedPaths,
+                reason: "non_committable",
+              },
+            );
+          await this.store.save(s);
+          if (!selection.commitPaths.length) {
+            delete s.results.commitAgent;
+            delete s.manualRetry;
+            s.commitSelection.completed = true;
+            record(
+              s,
+              "commit_nothing_committable",
+              selection.excludedPaths.join(", "),
+            );
+            transition(s);
+            record(s, "phase_completed");
+            await this.store.save(s);
+            continue;
+          }
         }
         if (s.phase === "REPORT" && !s.reportInput) {
           s.reportInput = await buildCompletionReportInput(s);
@@ -3256,31 +3307,12 @@ export class WorkflowEngine {
               role: "commitAgent",
               toolName: "commit_inspect",
             });
-            const selection = classifyCommitPaths(s.config, result.files);
-            s.commitSelection = { ...selection, completed: false };
-            if (selection.excludedPaths.length)
-              record(
-                s,
-                "commit_paths_excluded",
-                selection.excludedPaths.join(", "),
-                {
-                  agent: "commitAgent",
-                  attempt:
-                    s.history.findLast(
-                      (entry) =>
-                        entry.event === "agent_attempt_started" &&
-                        entry.meta?.agent === "commitAgent",
-                    )?.meta?.attempt ?? 1,
-                  paths: selection.excludedPaths,
-                  reason: "non_committable",
-                },
-              );
-            await this.store.save(s);
+            const selection = s.commitSelection;
+            if (!selection) throw new Error("Host commit selection is missing");
             const intent = await prepareCommit(
               s,
-              selection.commitFiles,
+              selection.commitPaths,
               result.message,
-              selection.excludedPaths.length > 0,
             );
             if (intent.files.length) {
               s.commitIntent = intent;
@@ -3300,7 +3332,7 @@ export class WorkflowEngine {
                 "commit_nothing_committable",
                 selection.excludedPaths.join(", "),
               );
-            s.commitSelection.completed = true;
+            selection.completed = true;
             this.emitAgentEvent({ type: "complete", role: "commitAgent" });
             record(s, "agent_completed", "commitAgent");
           } catch (error) {
@@ -3382,7 +3414,8 @@ export class WorkflowEngine {
             discardablePaths: owned,
           };
         }
-        if (s.phase === "IMPLEMENT") delete s.implementationStartHashes;
+        // Preserve the host's pre-implementation hashes through COMMIT so
+        // ignored local-only changes can be reported without agent claims.
         transition(s);
         record(s, "phase_completed");
         await this.store.save(s);

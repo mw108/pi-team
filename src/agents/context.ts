@@ -7,7 +7,6 @@ import { allowedCommandCategories } from "./command-policy.ts";
 import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { testerValidationContext } from "./validation-context.ts";
-import { nonCommittablePaths } from "../workflow/commit-paths.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -120,9 +119,11 @@ export async function contextFor(
   }
   if (role === "commitAgent") {
     copy("codeReviewer", "securityReviewer", "tester");
-    context.nonCommittablePaths = nonCommittablePaths(s.config);
+    if (!s.commitSelection) throw new Error("Host commit selection is missing");
+    context.authoritativeCommitPaths = s.commitSelection.commitPaths;
+    context.excludedCommitPaths = s.commitSelection.excludedPaths;
     context.commitPathInstruction =
-      "Files in nonCommittablePaths may be valid workflow modifications but are local-only. Never include them in your files result. Their presence is not an error; do not revert or delete them.";
+      "The host has validated the exact file set. Generate a Conventional Commit message for authoritativeCommitPaths. Do not add, remove, or propose paths. excludedCommitPaths are local-only changes and are intentionally omitted; their presence is not an error.";
   }
   context.previousFindings = s.history
     .filter((e) => e.event.startsWith("FIX_"))

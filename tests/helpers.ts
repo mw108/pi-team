@@ -178,7 +178,7 @@ export function output(role: Role): any {
         failedAreas: [],
       };
     case "commitAgent":
-      return { message: "fix(math): correct addition", files: ["math.js"] };
+      return { message: "fix(math): correct addition" };
     case "reporter":
       return {
         summary: "Fixed addition",
