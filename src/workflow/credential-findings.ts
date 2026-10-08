@@ -59,15 +59,15 @@ export function credentialFindingPrompt(
     options: [
       {
         value: "allow_once",
-        label: "Ja",
+        label: "Allow once",
         description: "Allow this finding for the current commit attempt",
       },
       {
         value: "allow_workflow",
-        label: "Ja für diesen Workflow",
+        label: "Allow for this workflow",
         description: "Allow this exact finding for this workflow",
       },
-      { value: "deny", label: "Nein", description: "Block the commit" },
+      { value: "deny", label: "Deny", description: "Block the commit" },
     ],
   };
 }

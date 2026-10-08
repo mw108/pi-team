@@ -95,6 +95,7 @@ export function approvalParams(request: ApprovalRequest) {
           "runtimeFile",
           "contractPath",
           "securityRisk",
+          "credentialFinding",
         ].includes(request.kind)
           ? "single"
           : "multi",

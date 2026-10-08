@@ -8,6 +8,7 @@ import {
   approvalParams,
   approvalValues,
 } from "../src/integrations/pi-ask.ts";
+import { credentialFindingPrompt } from "../src/workflow/credential-findings.ts";
 async function packageFixture(version = "1.2.0") {
   const root = await mkdtemp(join(tmpdir(), "pi-ask-probe-"));
   await mkdir(join(root, "src"));
@@ -125,4 +126,38 @@ test("pi-ask multi-selection grants only exact listed values; cancellation and n
       }),
     /freeform/,
   );
+});
+
+test("credential approval dialog uses English single-choice labels and retains decision values", () => {
+  const request = credentialFindingPrompt({
+    scanner: "builtin",
+    ruleId: "credential-assignment",
+    path: "src/auth.spec.ts",
+    fileSha256: "a".repeat(64),
+    findingFingerprint: "b".repeat(64),
+    line: 12,
+    excerpt: "password: '[REDACTED]",
+  });
+  const params = approvalParams(request);
+  assert.equal(params.questions[0].type, "single");
+  assert.equal(request.title, "Potential credential detected");
+  assert.match(request.prompt, /File: src\/auth\.spec\.ts/);
+  assert.match(request.prompt, /Allow this exact finding/);
+  assert.deepEqual(
+    request.options.map(({ value, label }) => [value, label]),
+    [
+      ["allow_once", "Allow once"],
+      ["allow_workflow", "Allow for this workflow"],
+      ["deny", "Deny"],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(params), /\b(?:Ja|Nein|für)\b/i);
+  for (const value of ["allow_once", "allow_workflow", "deny"])
+    assert.deepEqual(
+      approvalValues(request, {
+        mode: "submit",
+        answers: { approval: { values: [value] } },
+      }),
+      [value],
+    );
 });
