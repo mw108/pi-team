@@ -42,6 +42,9 @@ async function workflow(
     failCommitFirst?: boolean;
     unexpectedPath?: string;
     secretPath?: string;
+    secretText?: string;
+    credentialChoices?: string[];
+    changeRepositoryAfterApproval?: boolean;
     noChanges?: boolean;
   } = {},
 ) {
@@ -94,7 +97,7 @@ async function workflow(
           await writeFile(
             join(cwd, path),
             path === options.secretPath
-              ? "API_KEY=abc123def456ghi789\n"
+              ? (options.secretText ?? "API_KEY=abc123def456ghi789\n")
               : `workflow change in ${path}\n`,
           );
         }
@@ -129,8 +132,15 @@ async function workflow(
   });
   const engine = new WorkflowEngine(cwd, runner, {
     ...ui,
-    approve: async (request) =>
-      request.kind === "dirtyPaths" ? (options.baselineDirty ?? []) : [],
+    approve: async (request) => {
+      if (request.kind === "dirtyPaths") return options.baselineDirty ?? [];
+      if (request.kind === "credentialFinding") {
+        if (options.changeRepositoryAfterApproval)
+          await writeFile(join(cwd, "unexpected.txt"), "unreviewed change\n");
+        return options.credentialChoices?.splice(0, 1) ?? [];
+      }
+      return [];
+    },
   });
   const state = await engine.start("Commit exclusions", cfg);
   const before = await head(cwd);
@@ -352,15 +362,194 @@ test("unexpected generated output blocks before Commit Agent", async () => {
   assert.equal(runner.counts.commitAgent, undefined);
 });
 
-test("secret in host-selected file blocks before Commit Agent", async () => {
+test("heuristic credential in host-selected file waits before Commit Agent", async () => {
   const { state, runner } = await workflow(
     ["config/app.php"],
     ["config/app.php"],
     { secretPath: "config/app.php" },
   );
-  assert.equal(state.phase, "BLOCKED");
-  assert.match(state.blocker ?? "", /Commit blocked: possible/);
+  assert.equal(state.phase, "WAITING_USER");
+  assert.equal(state.pendingApproval?.kind, "credentialFinding");
+  assert.equal(state.pendingCredentialFinding?.ruleId, "credential-assignment");
   assert.equal(runner.counts.commitAgent, undefined);
+});
+
+test("allow once commits one finding without persisting workflow approval", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    {
+      secretPath: "config/app.php",
+      credentialChoices: ["allow_once"],
+    },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.commitAgent, 1);
+  assert.equal(state.workflowApprovedCredentialFindings.length, 0);
+  assert.ok(
+    state.history.some(
+      (entry) => entry.event === "credential_finding_approved_once",
+    ),
+  );
+});
+
+test("workflow approval survives reload and does not authorize another workflow", async () => {
+  const { state, engine } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    {
+      secretPath: "config/app.php",
+      credentialChoices: ["allow_workflow"],
+    },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  const loaded = await engine.store.load(state.id);
+  assert.equal(loaded.workflowApprovedCredentialFindings.length, 1);
+  assert.equal(loaded.workflowApprovedCredentialFindings[0].scanner, "builtin");
+  assert.ok(
+    loaded.history.some(
+      (entry) => entry.event === "credential_finding_approved_workflow",
+    ),
+  );
+  const other = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  assert.equal(other.state.phase, "WAITING_USER");
+  assert.equal(other.state.workflowApprovedCredentialFindings.length, 0);
+});
+
+test("denial blocks commit without agent failure or upstream rerun", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    {
+      secretPath: "config/app.php",
+      credentialChoices: ["deny"],
+    },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  assert.match(state.blocker ?? "", /Credential finding denied/);
+  assert.equal(state.commit, undefined);
+  assert.equal(state.agentFailures, 0);
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(runner.counts.implementor, 1);
+  assert.ok(
+    state.history.some((entry) => entry.event === "credential_finding_denied"),
+  );
+});
+
+test("multiple findings require independent approval and denial stops commit", async () => {
+  const { state, runner } = await workflow(
+    ["config/app.php"],
+    ["config/app.php"],
+    {
+      secretPath: "config/app.php",
+      secretText:
+        "API_KEY=abc123def456ghi789\nTOKEN=xyz987abc654def321\nSECRET=foo456bar789baz123\n",
+      credentialChoices: ["allow_once", "deny"],
+    },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  assert.equal(state.commit, undefined);
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(
+    state.history.filter(
+      (entry) => entry.event === "credential_finding_approval_requested",
+    ).length,
+    2,
+  );
+});
+
+test("pending credential approval resumes after state reload without rerunning gates", async () => {
+  const first = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  assert.equal(first.state.phase, "WAITING_USER");
+  const resumed = new WorkflowEngine(first.cwd, first.runner, {
+    ...ui,
+    approve: async (request) =>
+      request.kind === "credentialFinding" ? ["allow_workflow"] : [],
+  });
+  const loaded = await resumed.store.load(first.state.id);
+  await resumed.run(loaded);
+  assert.equal(loaded.phase, "DONE", loaded.blocker);
+  assert.equal(first.runner.counts.implementor, 1);
+  assert.equal(first.runner.counts.codeReviewer, 1);
+  assert.equal(first.runner.counts.securityReviewer, 1);
+  assert.equal(first.runner.counts.tester, 1);
+  assert.equal(first.runner.counts.commitAgent, 1);
+  assert.equal(loaded.workflowApprovedCredentialFindings.length, 1);
+});
+
+test("concurrent approval resumes cannot create two commits", async () => {
+  const first = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  assert.equal(first.state.phase, "WAITING_USER");
+  const approvalUi = {
+    ...ui,
+    approve: async (request: { kind: string }) =>
+      request.kind === "credentialFinding" ? ["allow_workflow"] : [],
+  };
+  const a = new WorkflowEngine(first.cwd, first.runner, approvalUi);
+  const b = new WorkflowEngine(first.cwd, first.runner, approvalUi);
+  const [stateA, stateB] = await Promise.all([
+    a.store.load(first.state.id),
+    b.store.load(first.state.id),
+  ]);
+  await Promise.allSettled([a.run(stateA), b.run(stateB)]);
+  const commits = (
+    await git(first.cwd, ["rev-list", "--count", `${first.before}..HEAD`])
+  ).trim();
+  assert.equal(commits, "1");
+  assert.equal(first.runner.counts.commitAgent, 1);
+});
+
+test("changed file invalidates pending approval after reconnect", async () => {
+  const first = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  assert.equal(first.state.phase, "WAITING_USER");
+  await writeFile(
+    join(first.cwd, "config/app.php"),
+    "API_KEY=different987credential654\n",
+  );
+  const resumed = new WorkflowEngine(first.cwd, first.runner, {
+    ...ui,
+    approve: async (request) =>
+      request.kind === "credentialFinding" ? ["allow_workflow"] : [],
+  });
+  const loaded = await resumed.store.load(first.state.id);
+  await resumed.run(loaded);
+  assert.equal(loaded.phase, "BLOCKED");
+  assert.equal(loaded.commit, undefined);
+  assert.equal(loaded.workflowApprovedCredentialFindings.length, 0);
+  assert.ok(
+    loaded.history.some(
+      (entry) => entry.event === "credential_finding_approval_invalidated",
+    ),
+  );
+});
+
+test("credential approval does not bypass independent repository checks", async () => {
+  const { state } = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+    credentialChoices: ["allow_workflow"],
+    changeRepositoryAfterApproval: true,
+  });
+  assert.equal(state.phase, "BLOCKED");
+  assert.match(state.blocker ?? "", /outside the Implementation Contract/);
+  assert.equal(state.commit, undefined);
+  assert.equal(state.workflowApprovedCredentialFindings.length, 1);
+});
+
+test("older state defaults to no credential approvals", async () => {
+  const { state } = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  const old = JSON.parse(JSON.stringify(state));
+  delete old.workflowApprovedCredentialFindings;
+  assert.deepEqual(validateState(old).workflowApprovedCredentialFindings, []);
 });
 
 test("a legacy file-list mismatch can retry COMMIT without rerunning gates", async () => {

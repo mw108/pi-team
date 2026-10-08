@@ -52,6 +52,7 @@ export const approvalSchema = z.object({
     "sensitivePaths",
     "orphanedImplementation",
     "securityRisk",
+    "credentialFinding",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -106,6 +107,18 @@ export const securityRiskReviewSchema = z.object({
   reviewedAt: z.string().optional(),
 });
 export type SecurityRiskReview = z.infer<typeof securityRiskReviewSchema>;
+export const credentialFindingIdentitySchema = z
+  .object({
+    scanner: z.enum(["builtin", "gitleaks"]),
+    ruleId: z.string().min(1),
+    path: exactPath,
+    fileSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    findingFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+export type CredentialFindingIdentity = z.infer<
+  typeof credentialFindingIdentitySchema
+>;
 export const baselineSchema = z.object({
   head: z.string().nullable(),
   dirtyPaths: z.array(z.string()),
@@ -297,6 +310,20 @@ export const stateSchema = z.object({
   commandApprovalComplete: z.boolean().default(false),
   approvedDirtyPaths: z.array(exactPath).default([]),
   approvedSensitivePaths: z.array(z.string()).default([]),
+  workflowApprovedCredentialFindings: z
+    .array(
+      credentialFindingIdentitySchema
+        .extend({ approvedAt: z.string() })
+        .strict(),
+    )
+    .default([]),
+  pendingCredentialFinding: credentialFindingIdentitySchema
+    .extend({
+      line: z.number().int().positive().optional(),
+      excerpt: z.string().max(240).optional(),
+    })
+    .strict()
+    .optional(),
   sensitiveApprovalContractHash: z.string().optional(),
   pendingApproval: approvalSchema.optional(),
   inFlight: z
@@ -643,6 +670,7 @@ export function newState(
     pendingContractPaths: [],
     approvedDirtyPaths: [],
     approvedSensitivePaths: [],
+    workflowApprovedCredentialFindings: [],
     commandApprovalComplete: false,
     testMutationCycles: 0,
     observedImplementorMutations: [],
@@ -705,6 +733,10 @@ export function sanitizeWorkflowStateText(state: WorkflowState): void {
       state.pendingResearchQuestions.map(redactVisibleText);
   if (state.pendingApproval)
     state.pendingApproval = redactStructured(state.pendingApproval);
+  if (state.pendingCredentialFinding?.excerpt)
+    state.pendingCredentialFinding.excerpt = redactVisibleText(
+      state.pendingCredentialFinding.excerpt,
+    ).slice(0, 240);
   state.pendingRuntimeCommands = state.pendingRuntimeCommands.map((entry) => ({
     ...entry,
     purpose: redactVisibleText(entry.purpose),

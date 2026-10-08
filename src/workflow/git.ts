@@ -24,6 +24,12 @@ import { redactVisibleText } from "../agents/redaction.ts";
 import type { WorkflowState } from "./state.ts";
 import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
 import { matchingSecurityRiskReview } from "./security-risk-review.ts";
+import {
+  CredentialApprovalRequired,
+  credentialIdentity,
+  sameCredentialFinding,
+} from "./credential-findings.ts";
+import type { CredentialFindingIdentity } from "./state.ts";
 const exec = promisify(execFile);
 export async function git(cwd: string, args: string[]) {
   return (
@@ -313,7 +319,10 @@ export function gitInspectTool(s: WorkflowState): ToolDefinition {
   };
 }
 /** Repository and contract evidence, never LLM output, determines staging paths. */
-export async function determineAuthoritativeCommitSelection(s: WorkflowState) {
+export async function determineAuthoritativeCommitSelection(
+  s: WorkflowState,
+  oneShot: readonly CredentialFindingIdentity[] = [],
+) {
   const unexpected = await unexpectedWorkflowPaths(s);
   if (unexpected.length)
     throw new Error(
@@ -345,6 +354,7 @@ export async function determineAuthoritativeCommitSelection(s: WorkflowState) {
     selection.commitPaths,
     "commit selection validation",
     true,
+    oneShot,
   );
   return selection;
 }
@@ -353,6 +363,7 @@ export async function prepareCommit(
   files: string[],
   message: string,
   allowEmpty = false,
+  oneShot: readonly CredentialFindingIdentity[] = [],
 ) {
   if (
     s.config.qualityGates.codeReview.enabled &&
@@ -450,10 +461,27 @@ export async function prepareCommit(
       throw new Error("Credential-like file denied");
   }
   const scan = await scanCommitSecrets(s.cwd, files);
-  if (scan.findings.length) {
-    const finding = scan.findings[0];
+  const mandatory = scan.findings.find(
+    (finding) => finding.classification === "mandatory_block",
+  );
+  if (mandatory) {
     throw new Error(
-      `Commit blocked: possible ${finding.kind} in ${redactVisibleText(finding.path)}${finding.line ? `:${finding.line}` : ""} (${scan.scanner})`,
+      `Commit blocked: possible ${mandatory.kind} in ${redactVisibleText(mandatory.path)}${mandatory.line ? `:${mandatory.line}` : ""} (${scan.scanner})`,
+    );
+  }
+  for (const finding of scan.findings) {
+    const identity = credentialIdentity(scan, finding);
+    if (
+      s.workflowApprovedCredentialFindings.some((approved) =>
+        sameCredentialFinding(approved, identity),
+      ) ||
+      oneShot.some((approved) => sameCredentialFinding(approved, identity))
+    )
+      continue;
+    throw new CredentialApprovalRequired(
+      identity,
+      finding.line,
+      finding.excerpt,
     );
   }
   return {
@@ -463,13 +491,16 @@ export async function prepareCommit(
     hashes: await hashes(s.cwd, files),
   };
 }
-export async function createCommit(s: WorkflowState) {
+export async function createCommit(
+  s: WorkflowState,
+  oneShot: readonly CredentialFindingIdentity[] = [],
+) {
   const intent = s.commitIntent;
   if (!intent) throw new Error("No commit intent");
   if (!intent.files.length) throw new Error("Empty commit intent denied");
   // Revalidate gates and baseline attribution immediately before staging, even
   // when called independently or after preparing a persisted intent.
-  await prepareCommit(s, intent.files, intent.message);
+  await prepareCommit(s, intent.files, intent.message, false, oneShot);
   if ((await head(s.cwd)) !== intent.head)
     throw new Error("HEAD changed; inspect commit recovery manually");
   if (

@@ -437,6 +437,10 @@ export function renderProgress(
       `Project instructions: ✓ AGENTS.md · sha256 ${state.projectInstructions.sha256.slice(0, 12)}`,
     );
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
+  if (state.phase === "WAITING_USER" && state.pendingCredentialFinding)
+    lines.push(
+      `COMMIT is waiting for credential approval in ${state.pendingCredentialFinding.path}${state.pendingCredentialFinding.line ? `:${state.pendingCredentialFinding.line}` : ""}. Run /team resume ${state.id} to review.`,
+    );
   const riskReview = state.securityRiskReview;
   if (riskReview?.status === "pending")
     lines.push(
@@ -622,9 +626,11 @@ export function renderLiveProgress(
             ? state.securityRiskReview.status === "pending"
               ? "◉ Waiting for user review of accepted security risks · /team-continue to reopen"
               : "✓ Security risks approved · /team-continue to resume"
-            : requirement
-              ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
-              : "◉ Waiting for user input",
+            : state.pendingCredentialFinding
+              ? `◉ COMMIT waiting for credential approval in ${state.pendingCredentialFinding.path}${state.pendingCredentialFinding.line ? `:${state.pendingCredentialFinding.line}` : ""} · /team resume ${state.id}`
+              : requirement
+                ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
+                : "◉ Waiting for user input",
         ]
       : [];
   const reserved =

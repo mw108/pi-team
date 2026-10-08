@@ -22,7 +22,7 @@ const signatures: readonly [string, RegExp][] = [
 ];
 
 const assignment =
-  /\b(?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|SECRET(?:_KEY)?|TOKEN|PASSWORD|PRIVATE_KEY|CREDENTIALS?)\s*[:=]\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s;#]+))/gi;
+  /\b(?:[A-Za-z][A-Za-z0-9_]*_)?(?:API_KEY|SECRET(?:_KEY)?|TOKEN|PASSWORD(?:_CONFIRMATION)?|PRIVATE_KEY|CREDENTIALS?)\s*[:=]\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s;#]+))/gi;
 
 function plausible(value: string): boolean {
   const cleaned = value.trim();
@@ -58,7 +58,19 @@ export function detectSecrets(text: string): SecretMatch[] {
     });
   }
   const distinct: SecretMatch[] = [];
-  for (const item of findings.sort(
+  // A signature inside an assignment value remains mandatory. The broader
+  // assignment match must never shadow a high-confidence token.
+  const prioritized = findings.filter(
+    (item) =>
+      item.kind !== "Credential assignment" ||
+      !findings.some(
+        (other) =>
+          other.kind !== "Credential assignment" &&
+          item.start < other.end &&
+          other.start < item.end,
+      ),
+  );
+  for (const item of prioritized.sort(
     (a, b) => a.start - b.start || b.end - a.end,
   ))
     if (!distinct.length || item.start >= distinct.at(-1)!.end)

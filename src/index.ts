@@ -58,6 +58,8 @@ async function finalText(state: WorkflowState) {
     );
   if (state.phase === "WAITING_USER" && state.pendingResearchQuestions?.length)
     return `Researcher waiting for user clarification (${state.pendingResearchQuestions.length} questions). Run /team resume ${state.id} to answer them.`;
+  if (state.phase === "WAITING_USER" && state.pendingCredentialFinding)
+    return `COMMIT is waiting for user approval of a potential credential finding in ${state.pendingCredentialFinding.path}${state.pendingCredentialFinding.line ? `:${state.pendingCredentialFinding.line}` : ""}. Run /team resume ${state.id} to review.`;
   if (state.phase === "WAITING_USER" && state.securityRiskReview)
     return state.securityRiskReview.status === "pending"
       ? `Waiting for user review of accepted security risks. Run /team-continue to reopen the confirmation.`

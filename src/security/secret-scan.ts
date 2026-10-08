@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, relative, isAbsolute } from "node:path";
+import { createHash } from "node:crypto";
 import { detectSecrets } from "./secret-patterns.ts";
 import { assertRelative, assertWithin } from "../agents/permissions.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
@@ -18,6 +19,11 @@ export interface SecretFinding {
   path: string;
   line?: number;
   kind: string;
+  ruleId: string;
+  fileSha256: string;
+  findingFingerprint: string;
+  classification: "reviewable" | "mandatory_block";
+  excerpt?: string;
 }
 export interface SecretScanResult {
   scanner: "gitleaks" | "builtin";
@@ -40,7 +46,7 @@ const defaultRun: ScannerRun = async (executable, args) => {
 };
 
 async function relevantContent(cwd: string, paths: readonly string[]) {
-  const files: { path: string; content: string }[] = [];
+  const files: { path: string; content: string; fileSha256: string }[] = [];
   for (const path of [...new Set(paths)]) {
     assertRelative(path);
     await assertWithin(cwd, path);
@@ -49,7 +55,12 @@ async function relevantContent(cwd: string, paths: readonly string[]) {
       if (!stat.isFile()) throw new Error("Secret scan requires regular files");
       if (stat.size > 2_000_000)
         throw new Error(`Commit file too large for secret scan: ${path}`);
-      files.push({ path, content: await readFile(join(cwd, path), "utf8") });
+      const bytes = await readFile(join(cwd, path));
+      files.push({
+        path,
+        content: bytes.toString("utf8"),
+        fileSha256: createHash("sha256").update(bytes).digest("hex"),
+      });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -57,13 +68,53 @@ async function relevantContent(cwd: string, paths: readonly string[]) {
   return files;
 }
 
-function builtin(files: { path: string; content: string }[]): SecretScanResult {
-  const findings = files.flatMap(({ path, content }) =>
-    detectSecrets(content).map((match) => ({
-      path,
-      line: content.slice(0, match.start).split("\n").length,
-      kind: match.kind,
-    })),
+function builtin(
+  files: { path: string; content: string; fileSha256: string }[],
+): SecretScanResult {
+  const findings = files.flatMap(({ path, content, fileSha256 }) =>
+    detectSecrets(content).flatMap((match) => {
+      const value = content.slice(match.start, match.end);
+      const lineStart = content.lastIndexOf("\n", match.start - 1) + 1;
+      const prefix = content.slice(lineStart, match.start);
+      const testFile =
+        /(?:^|\/)(?:tests?|__tests__)\/|\.(?:spec|test)\.[cm]?[jt]sx?$/.test(
+          path,
+        );
+      if (
+        testFile &&
+        match.kind === "Credential assignment" &&
+        /\bpassword(?:_confirmation)?\s*[:=]\s*['"]?$/i.test(prefix) &&
+        /^(?:password123|testpassword|example-password|dummy-password)$/i.test(
+          value,
+        )
+      )
+        return [];
+      const line = content.slice(0, match.start).split("\n").length;
+      const label =
+        prefix.match(/([A-Za-z][A-Za-z0-9_]*\s*[:=]\s*['"]?)$/)?.[1] ??
+        "credential: ";
+      const ruleId =
+        match.kind === "Credential assignment"
+          ? "credential-assignment"
+          : match.kind.toLowerCase().replaceAll(" ", "-");
+      return [
+        {
+          path,
+          line,
+          kind: match.kind,
+          ruleId,
+          fileSha256,
+          findingFingerprint: createHash("sha256")
+            .update(JSON.stringify([ruleId, match.start, value]))
+            .digest("hex"),
+          classification:
+            match.kind === "Credential assignment"
+              ? ("reviewable" as const)
+              : ("mandatory_block" as const),
+          excerpt: redactVisibleText(`${label}[REDACTED]`),
+        },
+      ];
+    }),
   );
   return { scanner: "builtin", findings };
 }
@@ -137,6 +188,22 @@ export async function scanCommitSecrets(
           ? { line: entry.StartLine }
           : {}),
         kind: redactVisibleText(String(entry.RuleID ?? "secret")).slice(0, 80),
+        ruleId: redactVisibleText(String(entry.RuleID ?? "secret")).slice(
+          0,
+          80,
+        ),
+        fileSha256: files.find((file) => file.path === path)!.fileSha256,
+        findingFingerprint: createHash("sha256")
+          .update(
+            JSON.stringify([
+              entry.RuleID ?? "secret",
+              entry.StartLine,
+              entry.StartColumn,
+              entry.Fingerprint ?? entry.Secret ?? entry.Match ?? "",
+            ]),
+          )
+          .digest("hex"),
+        classification: "mandatory_block",
       };
     });
     if (found && !findings.length)

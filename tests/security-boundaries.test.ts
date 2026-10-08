@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile, symlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
   detectSecrets,
@@ -12,6 +12,11 @@ import { checkTool } from "../src/agents/permissions.ts";
 import { contextFor } from "../src/agents/context.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { prepareCommit } from "../src/workflow/git.ts";
+import {
+  CredentialApprovalRequired,
+  credentialIdentity,
+  sameCredentialFinding,
+} from "../src/workflow/credential-findings.ts";
 import { StateStore } from "../src/workflow/persistence.ts";
 import { block, record, newState } from "../src/workflow/state.ts";
 import { serializeErrorDiagnostics } from "../src/agents/error-diagnostics.ts";
@@ -75,6 +80,70 @@ test("scanner falls back when gitleaks is absent and scans only requested files"
   assert.doesNotMatch(JSON.stringify(result), new RegExp(github));
 });
 
+test("HAPAK registration assertion is recognized as a static test fixture", async () => {
+  const cwd = await repository();
+  const path = "projects/hapak/src/app/register/register.component.spec.ts";
+  await mkdir(join(cwd, "projects/hapak/src/app/register"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(cwd, path),
+    `const req = httpTesting.expectOne(req =>\n  req.url.endsWith('register')\n);\n\nexpect(req.request.method).toBe('POST');\n\nexpect(req.request.body).toEqual({\n  name: 'Test User',\n  email: 'test@example.com',\n  password: 'password123',\n  password_confirmation: 'password123'\n});\n`,
+  );
+  const scan = await scanCommitSecrets(cwd, [path], async () => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
+  assert.deepEqual(scan.findings, []);
+});
+
+test("test files still detect realistic tokens and signatures inside assignments", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "auth.spec.ts"),
+    `const TOKEN = '${github}';\nconst password = 'realistic-long-secret-987';\n`,
+  );
+  const scan = await scanCommitSecrets(cwd, ["auth.spec.ts"], async () => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
+  assert.ok(
+    scan.findings.some(
+      (finding) =>
+        finding.classification === "mandatory_block" &&
+        finding.kind === "GitHub token",
+    ),
+  );
+  assert.ok(
+    scan.findings.some((finding) => finding.classification === "reviewable"),
+  );
+  assert.doesNotMatch(JSON.stringify(scan), new RegExp(github));
+  assert.doesNotMatch(JSON.stringify(scan), /realistic-long-secret-987/);
+});
+
+test("findings in the same file have separate fingerprints and changed files invalidate both", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "math.js"),
+    "const PASSWORD='firstSecret987';\nconst TOKEN='secondSecret654';\n",
+  );
+  const missing = async () => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  };
+  const first = await scanCommitSecrets(cwd, ["math.js"], missing);
+  assert.equal(first.findings.length, 2);
+  const a = credentialIdentity(first, first.findings[0]);
+  const b = credentialIdentity(first, first.findings[1]);
+  assert.equal(sameCredentialFinding(a, b), false);
+  await writeFile(
+    join(cwd, "math.js"),
+    "const PASSWORD='firstSecret987';\nconst TOKEN='changedSecret321';\n",
+  );
+  const second = await scanCommitSecrets(cwd, ["math.js"], missing);
+  assert.equal(
+    sameCredentialFinding(a, credentialIdentity(second, second.findings[0])),
+    false,
+  );
+});
+
 test("available gitleaks runs on isolated commit files and returns safe metadata", async () => {
   const cwd = await repository();
   await writeFile(join(cwd, "math.js"), github);
@@ -106,9 +175,12 @@ test("available gitleaks runs on isolated commit files and returns safe metadata
   );
   assert.equal(calls.length, 2);
   assert.equal(result.scanner, "gitleaks");
-  assert.deepEqual(result.findings, [
-    { path: "math.js", line: 1, kind: "github-token" },
-  ]);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].path, "math.js");
+  assert.equal(result.findings[0].line, 1);
+  assert.equal(result.findings[0].ruleId, "github-token");
+  assert.equal(result.findings[0].classification, "mandatory_block");
+  assert.match(result.findings[0].fileSha256, /^[a-f0-9]{64}$/);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(github));
 });
 
@@ -239,6 +311,37 @@ test("commit preparation blocks a secret without exposing its value", async () =
       return true;
     },
   );
+});
+
+test("one-shot grant applies to one preparation call and is never persisted", async () => {
+  const cwd = await repository();
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Fix", config());
+  state.results.reviewer = contract;
+  state.results.codeReviewer = output("codeReviewer");
+  state.results.securityReviewer = output("securityReviewer");
+  state.results.tester = output("tester");
+  await writeFile(join(cwd, "math.js"), "const PASSWORD='actualSecret987';\n");
+  let identity;
+  try {
+    await prepareCommit(state, ["math.js"], "fix: math");
+    assert.fail("approval should be required");
+  } catch (error) {
+    assert.ok(error instanceof CredentialApprovalRequired);
+    identity = error.identity;
+  }
+  const intent = await prepareCommit(state, ["math.js"], "fix: math", false, [
+    identity,
+  ]);
+  assert.deepEqual(intent.files, ["math.js"]);
+  await assert.rejects(
+    () => prepareCommit(state, ["math.js"], "fix: math"),
+    CredentialApprovalRequired,
+  );
+  assert.deepEqual(state.workflowApprovedCredentialFindings, []);
 });
 
 test("state, nested provider errors, notifications and JSONL redact secrets", async () => {

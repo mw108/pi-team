@@ -57,6 +57,13 @@ import {
 } from "../agents/runtime-commands.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { StateStore } from "./persistence.ts";
+import { scanCommitSecrets } from "../security/secret-scan.ts";
+import {
+  CredentialApprovalRequired,
+  credentialFindingPrompt,
+  credentialIdentity,
+  sameCredentialFinding,
+} from "./credential-findings.ts";
 import {
   baseline,
   git,
@@ -79,6 +86,7 @@ import {
   type WorkflowState,
   type Phase,
   type ApprovalRequest,
+  type CredentialFindingIdentity,
 } from "./state.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
 import {
@@ -176,6 +184,32 @@ export class WorkflowEngine {
   private ownedState?: WorkflowState;
   private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
+  private credentialOneShot: CredentialFindingIdentity[] = [];
+  private async requestCredentialFindingApproval(
+    s: WorkflowState,
+    error: CredentialApprovalRequired,
+  ) {
+    s.pendingCredentialFinding = {
+      ...error.identity,
+      ...(error.line ? { line: error.line } : {}),
+      ...(error.excerpt ? { excerpt: error.excerpt } : {}),
+    };
+    record(
+      s,
+      "credential_finding_approval_requested",
+      JSON.stringify({
+        scanner: error.identity.scanner,
+        ruleId: error.identity.ruleId,
+        path: error.identity.path,
+        line: error.line,
+        fingerprint: error.identity.findingFingerprint,
+      }),
+    );
+    await this.requestApproval(
+      s,
+      credentialFindingPrompt(s.pendingCredentialFinding),
+    );
+  }
   private readonly commandApprovals = new RuntimeCommandApprovalCoordinator({
     activeAttempt: (role) => this.activeAttempts.get(role),
     emitAgentEvent: (event) => this.emitAgentEvent(event),
@@ -397,6 +431,7 @@ export class WorkflowEngine {
     delete state.manualRetry;
     delete state.inFlight;
     delete state.pendingApproval;
+    delete state.pendingCredentialFinding;
     delete state.pendingQuestion;
     delete state.pendingResearchQuestions;
     delete state.driftCandidate;
@@ -2371,6 +2406,8 @@ export class WorkflowEngine {
     existingUnlock?: () => Promise<void>,
   ) {
     const unlock = existingUnlock ?? (await this.store.lock());
+    // An interrupted or independent run starts a new commit attempt.
+    this.credentialOneShot = [];
     this.running = true;
     this.runningWorkflowId = s.id;
     try {
@@ -2649,6 +2686,7 @@ export class WorkflowEngine {
             break;
           }
           if (drift.blocking) {
+            delete s.pendingCredentialFinding;
             const postImplementation = Boolean(
               s.results.implementor || s.commitIntent || s.commit,
             );
@@ -2716,6 +2754,109 @@ export class WorkflowEngine {
           continue;
         }
         if (s.phase === "WAITING_USER") {
+          if (
+            s.pendingCredentialFinding &&
+            s.pendingApproval?.kind === "credentialFinding"
+          ) {
+            const pending = s.pendingCredentialFinding;
+            let selected: string[] | undefined;
+            try {
+              selected = await this.ui.approve?.(
+                credentialFindingPrompt(pending),
+              );
+            } catch {
+              await this.store.save(s);
+              break;
+            }
+            if (
+              !selected ||
+              selected.length !== 1 ||
+              !["allow_once", "allow_workflow", "deny"].includes(selected[0])
+            ) {
+              await this.store.save(s);
+              break;
+            }
+            const currentHash = (await hashes(s.cwd, [pending.path]))[
+              pending.path
+            ];
+            const scan = await scanCommitSecrets(s.cwd, [pending.path]);
+            const matching = scan.findings.some(
+              (finding) =>
+                sameCredentialFinding(
+                  credentialIdentity(scan, finding),
+                  pending,
+                ) && finding.classification === "reviewable",
+            );
+            if (
+              currentHash !== pending.fileSha256 ||
+              !matching ||
+              (await head(s.cwd)) !== s.baseline.head
+            ) {
+              record(
+                s,
+                "credential_finding_approval_invalidated",
+                JSON.stringify({
+                  path: pending.path,
+                  ruleId: pending.ruleId,
+                  fingerprint: pending.findingFingerprint,
+                }),
+              );
+              delete s.pendingCredentialFinding;
+              delete s.pendingApproval;
+              delete s.resumePhase;
+              block(
+                s,
+                "Credential finding or repository changed during approval; inspect before retrying",
+              );
+              await this.store.save(s);
+              break;
+            }
+            record(
+              s,
+              selected[0] === "deny"
+                ? "credential_finding_denied"
+                : selected[0] === "allow_once"
+                  ? "credential_finding_approved_once"
+                  : "credential_finding_approved_workflow",
+              JSON.stringify({
+                scanner: pending.scanner,
+                ruleId: pending.ruleId,
+                path: pending.path,
+                line: pending.line,
+                fingerprint: pending.findingFingerprint,
+              }),
+            );
+            if (
+              selected[0] === "allow_workflow" &&
+              !s.workflowApprovedCredentialFindings.some((item) =>
+                sameCredentialFinding(item, pending),
+              )
+            )
+              s.workflowApprovedCredentialFindings.push({
+                scanner: pending.scanner,
+                ruleId: pending.ruleId,
+                path: pending.path,
+                fileSha256: pending.fileSha256,
+                findingFingerprint: pending.findingFingerprint,
+                approvedAt: new Date().toISOString(),
+              });
+            if (selected[0] === "allow_once")
+              this.credentialOneShot.push(pending);
+            delete s.pendingCredentialFinding;
+            delete s.pendingApproval;
+            delete s.resumePhase;
+            if (selected[0] === "deny") {
+              block(
+                s,
+                `Credential finding denied for ${pending.path}${pending.line ? `:${pending.line}` : ""}`,
+              );
+              await this.store.save(s);
+              break;
+            }
+            s.phase = "COMMIT";
+            await this.store.save(s);
+            continue;
+          }
           if (
             s.securityRiskReview &&
             !s.pendingApproval &&
@@ -3235,7 +3376,17 @@ export class WorkflowEngine {
             });
             continue;
           }
-          const selection = await determineAuthoritativeCommitSelection(s);
+          let selection;
+          try {
+            selection = await determineAuthoritativeCommitSelection(
+              s,
+              this.credentialOneShot,
+            );
+          } catch (error) {
+            if (!(error instanceof CredentialApprovalRequired)) throw error;
+            await this.requestCredentialFindingApproval(s, error);
+            continue;
+          }
           s.commitSelection = {
             ...selection,
             validatedAt: new Date().toISOString(),
@@ -3669,6 +3820,8 @@ export class WorkflowEngine {
               s,
               selection.commitPaths,
               result.message,
+              false,
+              this.credentialOneShot,
             );
             if (intent.files.length) {
               s.commitIntent = intent;
@@ -3680,7 +3833,7 @@ export class WorkflowEngine {
                 role: "commitAgent",
                 toolName: "commit_create",
               });
-              s.commit = await createCommit(s);
+              s.commit = await createCommit(s, this.credentialOneShot);
               delete s.inFlight;
             } else
               record(
@@ -3692,6 +3845,12 @@ export class WorkflowEngine {
             this.emitAgentEvent({ type: "complete", role: "commitAgent" });
             record(s, "agent_completed", "commitAgent");
           } catch (error) {
+            if (error instanceof CredentialApprovalRequired) {
+              delete s.inFlight;
+              delete s.commitIntent;
+              await this.requestCredentialFindingApproval(s, error);
+              continue;
+            }
             this.emitAgentEvent({
               type: "fail",
               role: "commitAgent",
