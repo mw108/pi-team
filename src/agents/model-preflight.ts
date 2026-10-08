@@ -17,13 +17,19 @@ export type ModelPreflightEvent = {
     | "model_load_requested"
     | "model_preflight_ready"
     | "model_preflight_failed"
-    | "model_preflight_unsupported";
+    | "model_preflight_unsupported"
+    | "model_preflight_sse_unsupported"
+    | "model_preflight_explicit_load_unsupported"
+    | "model_preflight_warmup_started"
+    | "model_preflight_warmup_completed"
+    | "model_preflight_warmup_failed";
   provider: string;
   model: string;
   status?: string;
   progress?: number;
   durationMs?: number;
   exitCode?: number;
+  httpStatus?: number;
   message?: string;
 };
 export type ModelPreflightUpdate =
@@ -41,7 +47,15 @@ type Snapshot = {
   progress?: number;
   exitCode?: number;
 };
-type Listener = (snapshot: Snapshot | "load_requested") => void;
+type Listener = (
+  snapshot:
+    | Snapshot
+    | "load_requested"
+    | Pick<
+        ModelPreflightEvent,
+        "type" | "durationMs" | "httpStatus" | "message"
+      >,
+) => void;
 type Shared = {
   controller: AbortController;
   listeners: Set<Listener>;
@@ -57,7 +71,12 @@ type RouterOptions = {
   onUpdate?: (update: ModelPreflightUpdate) => void;
   pollIntervalMs?: number;
 };
+type EndpointCapabilities = {
+  modelsSse: "unknown" | "supported" | "unsupported";
+  explicitModelLoad: "unknown" | "supported" | "unsupported";
+};
 const capabilities = new Map<string, boolean>();
+const endpointCapabilities = new Map<string, EndpointCapabilities>();
 const inFlight = new Map<string, Shared>();
 const states = new Set([
   "unloaded",
@@ -105,19 +124,11 @@ function sseStatus(
 
 /** Telemetry is deliberately fail-open; the caller continues polling /models. */
 async function listenSse(
-  root: URL,
+  response: Response,
   model: string,
-  options: RouterOptions,
   signal: AbortSignal,
   onStatus: (status: { progress?: number; terminal: boolean }) => void,
 ): Promise<void> {
-  const response = await options.fetch(new URL("models/sse", root), {
-    headers: new Headers({
-      ...Object.fromEntries(options.headers),
-      Accept: "text/event-stream",
-    }),
-    signal,
-  });
   if (
     !response.ok ||
     !response.body ||
@@ -180,25 +191,33 @@ export function routerBaseUrl(baseUrl: string): URL | undefined {
   }
 }
 
-function parseCatalog(
-  value: unknown,
-): Array<{ id: string; status: Record<string, unknown> }> | undefined {
+/** Pi's OpenAI client appends /chat/completions to its effective base URL. */
+export function completionUrl(baseUrl: string): URL {
+  const url = new URL(baseUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/chat/completions`;
+  return url;
+}
+
+type CatalogEntry = { id: string; status?: Record<string, unknown> };
+function parseCatalog(value: unknown): CatalogEntry[] | undefined {
   if (!value || typeof value !== "object") return;
   const data = (value as { data?: unknown }).data;
-  if (!Array.isArray(data) || data.length === 0) return;
+  if (!Array.isArray(data)) return;
   if (
     !data.every(
       (entry) =>
-        entry &&
-        typeof entry === "object" &&
-        typeof entry.id === "string" &&
-        entry.status &&
-        typeof entry.status === "object" &&
-        states.has(entry.status.value),
+        entry && typeof entry === "object" && typeof entry.id === "string",
     )
   )
     return;
-  return data;
+  return data.map((entry) => ({
+    id: entry.id,
+    ...(entry.status &&
+    typeof entry.status === "object" &&
+    states.has(entry.status.value)
+      ? { status: entry.status }
+      : {}),
+  }));
 }
 
 function progressOf(status: Record<string, unknown>): number | undefined {
@@ -234,8 +253,9 @@ function progressOf(status: Record<string, unknown>): number | undefined {
   return total > 0 ? Math.max(0, Math.min(1, done / total)) : undefined;
 }
 
-function notify(shared: Shared, snapshot: Snapshot | "load_requested") {
-  if (snapshot !== "load_requested") shared.latest = snapshot;
+function notify(shared: Shared, snapshot: Parameters<Listener>[0]) {
+  if (typeof snapshot === "object" && "state" in snapshot)
+    shared.latest = snapshot;
   for (const listener of shared.listeners) listener(snapshot);
 }
 
@@ -246,13 +266,73 @@ async function catalog(root: URL, options: RouterOptions, signal: AbortSignal) {
   });
   if (response.status === 404) return { supported: false as const };
   if (!response.ok)
-    throw new Error(
-      `llama.cpp Router /models returned HTTP ${response.status}`,
-    );
+    throw new Error(`Provider /models returned HTTP ${response.status}`);
   const parsed = parseCatalog(await response.json().catch(() => undefined));
   return parsed
     ? { supported: true as const, models: parsed }
     : { supported: false as const };
+}
+
+async function warmup(
+  url: URL,
+  model: string,
+  maxTokensField: "max_tokens" | "max_completion_tokens",
+  options: RouterOptions,
+  signal: AbortSignal,
+  shared: Shared,
+): Promise<void> {
+  const startedAt = Date.now();
+  let httpStatus: number | undefined;
+  notify(shared, { type: "model_preflight_warmup_started" });
+  try {
+    // This is a separate preflight request. It has no agent context or inference
+    // timeout; the caller's model/agent load signal governs cold startup.
+    const response = await options.fetch(url, {
+      method: "POST",
+      headers: new Headers({
+        ...Object.fromEntries(options.headers),
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Hello" }],
+        [maxTokensField]: 1,
+        temperature: 0,
+      }),
+      signal,
+    });
+    httpStatus = response.status;
+    if (response.status !== 200)
+      throw new Error(
+        `fallback chat-completion warmup failed at ${url.pathname}: HTTP ${response.status}`,
+      );
+    const body: unknown = await response.json().catch(() => undefined);
+    if (
+      !body ||
+      typeof body !== "object" ||
+      !Array.isArray((body as { choices?: unknown }).choices) ||
+      (body as { choices: unknown[] }).choices.length === 0
+    )
+      throw new Error(
+        `Model warmup returned HTTP 200 but no chat-completion choices at ${url.pathname}`,
+      );
+    notify(shared, {
+      type: "model_preflight_warmup_completed",
+      durationMs: Date.now() - startedAt,
+      httpStatus: 200,
+    });
+  } catch (error) {
+    const message = signal.aborted
+      ? `Model preflight ${signal.reason?.name === "TimeoutError" ? "timed out" : "interrupted"} while warming up ${model}`
+      : `Model preflight failed for ${model}: explicit model loading is unsupported; ${error instanceof Error ? error.message : String(error)}`;
+    notify(shared, {
+      type: "model_preflight_warmup_failed",
+      durationMs: Date.now() - startedAt,
+      httpStatus,
+      message,
+    });
+    throw new Error(message, { cause: error });
+  }
 }
 
 async function runShared(
@@ -261,33 +341,33 @@ async function runShared(
   options: RouterOptions,
   shared: Shared,
   capabilityKey: string,
+  completionUrl: URL,
+  maxTokensField: "max_tokens" | "max_completion_tokens",
 ): Promise<boolean> {
   const signal = shared.controller.signal;
   const knownRouter = capabilities.get(capabilityKey) === true;
-  let first: Awaited<ReturnType<typeof catalog>>;
-  try {
-    first = await catalog(root, options, signal);
-  } catch (error) {
-    // Before capability is established, let the normal provider path own
-    // transport/auth failures and retain its existing diagnostics and retries.
-    if (!knownRouter && !signal.aborted) return false;
-    throw error;
-  }
+  const first = await catalog(root, options, signal);
   if (!first.supported) {
     if (knownRouter)
       throw new Error(
-        `llama.cpp Router /models no longer exposes model status for ${model}`,
+        `Provider /models no longer exposes a valid inventory for ${model}`,
       );
     capabilities.set(capabilityKey, false);
     return false;
   }
   capabilities.set(capabilityKey, true);
+  const endpoints = endpointCapabilities.get(capabilityKey) ?? {
+    modelsSse: "unknown",
+    explicitModelLoad: "unknown",
+  };
+  endpointCapabilities.set(capabilityKey, endpoints);
   let models = first.models;
   let loadRequested = false;
   let latestPolled: Snapshot | undefined;
   let liveProgress: number | undefined;
   const sseController = new AbortController();
   let sseTask: Promise<void> | undefined;
+  let sseError: unknown;
   let wakePoll: (() => void) | undefined;
   let terminalObserved = false;
   const waitForPoll = () =>
@@ -314,17 +394,20 @@ async function runShared(
       const entry = models.find((candidate) => candidate.id === model);
       if (!entry)
         throw new Error(
-          `Configured model is not available in llama.cpp Router: ${model}. Check the provider model ID and Router inventory.`,
+          `Configured model is not available in provider inventory: ${model}. Check the provider model ID and inventory.`,
         );
       const status = entry.status;
-      const value = status.value as string;
+      const value = status?.value as string | undefined;
       const exitCode =
-        typeof status.exit_code === "number" ? status.exit_code : undefined;
-      if (value === "loaded" || value === "sleeping" || status.failed === true)
+        typeof status?.exit_code === "number" ? status.exit_code : undefined;
+      if (value === "loaded" || value === "sleeping" || status?.failed === true)
         liveProgress = undefined;
       latestPolled = {
-        state: value === "loaded" ? "ready" : (value as ModelPreflightState),
-        progress: progressOf(status),
+        state:
+          value === "loaded"
+            ? "ready"
+            : ((value ?? "checking") as ModelPreflightState),
+        progress: status ? progressOf(status) : 0,
         exitCode,
       };
       notify(shared, {
@@ -337,47 +420,81 @@ async function runShared(
       // Router keeps a sleeping child routable; its next inference wakes it.
       // POST /models/load only starts an unloaded instance.
       if (value === "loaded" || value === "sleeping") return true;
-      if (status.failed === true)
+      if (status?.failed === true)
         throw new Error(
           `Model failed to load: ${model}${exitCode === undefined ? "" : ` (llama.cpp exit code: ${exitCode})`}`,
         );
-      if (!sseTask) {
+      if (!sseTask && endpoints.modelsSse !== "unsupported") {
         // GET /models has established Router capability and the model is not ready.
-        sseTask = listenSse(
-          root,
-          model,
-          options,
-          sseController.signal,
-          (event) => {
-            if (signal.aborted) return;
-            if (event.terminal) {
-              terminalObserved = true;
-              wakePoll?.();
-            }
-            if (
-              event.progress === undefined ||
-              (latestPolled?.state !== "loading" &&
-                latestPolled?.state !== "unloaded")
-            )
-              return;
-            liveProgress = event.progress;
-            if (shared.latest?.progress !== event.progress)
-              notify(shared, { ...latestPolled, progress: event.progress });
-          },
-        )
-          .catch(() => {})
-          .finally(() => {
-            if (sseController.signal.aborted) return;
-            liveProgress = undefined;
-            if (
-              (latestPolled?.state === "loading" ||
-                latestPolled?.state === "unloaded") &&
-              shared.latest?.progress !== latestPolled.progress
-            )
-              notify(shared, latestPolled);
+        const response = await options.fetch(new URL("models/sse", root), {
+          headers: new Headers({
+            ...Object.fromEntries(options.headers),
+            Accept: "text/event-stream",
+          }),
+          signal,
+        });
+        if (response.status === 404) {
+          endpoints.modelsSse = "unsupported";
+          notify(shared, {
+            type: "model_preflight_sse_unsupported",
+            httpStatus: 404,
           });
+          await response.body?.cancel();
+        } else if (!response.ok) {
+          await response.body?.cancel();
+          throw new Error(
+            `Provider /models/sse returned HTTP ${response.status}`,
+          );
+        } else {
+          endpoints.modelsSse = "supported";
+          sseTask = listenSse(
+            response,
+            model,
+            sseController.signal,
+            (event) => {
+              if (signal.aborted) return;
+              if (event.terminal) {
+                terminalObserved = true;
+                wakePoll?.();
+              }
+              if (
+                event.progress === undefined ||
+                (latestPolled?.state !== "loading" &&
+                  latestPolled?.state !== "unloaded")
+              )
+                return;
+              liveProgress = event.progress;
+              if (shared.latest?.progress !== event.progress)
+                notify(shared, { ...latestPolled, progress: event.progress });
+            },
+          )
+            .catch((error) => {
+              if (!sseController.signal.aborted) sseError = error;
+            })
+            .finally(() => {
+              if (sseController.signal.aborted) return;
+              liveProgress = undefined;
+              if (
+                (latestPolled?.state === "loading" ||
+                  latestPolled?.state === "unloaded") &&
+                shared.latest?.progress !== latestPolled.progress
+              )
+                notify(shared, latestPolled);
+            });
+        }
       }
-      if (value === "unloaded" && !loadRequested) {
+      if ((value === "unloaded" || value === undefined) && !loadRequested) {
+        if (endpoints.explicitModelLoad === "unsupported") {
+          await warmup(
+            completionUrl,
+            model,
+            maxTokensField,
+            options,
+            signal,
+            shared,
+          );
+          return true;
+        }
         const response = await options.fetch(new URL("models/load", root), {
           method: "POST",
           headers: new Headers({
@@ -387,19 +504,38 @@ async function runShared(
           body: JSON.stringify({ model }),
           signal,
         });
+        if (response.status === 404) {
+          endpoints.explicitModelLoad = "unsupported";
+          notify(shared, {
+            type: "model_preflight_explicit_load_unsupported",
+            httpStatus: 404,
+          });
+          await warmup(
+            completionUrl,
+            model,
+            maxTokensField,
+            options,
+            signal,
+            shared,
+          );
+          return true;
+        }
         if (!response.ok)
           throw new Error(
-            `llama.cpp Router could not load ${model}: HTTP ${response.status}`,
+            `Provider could not load ${model}: HTTP ${response.status}`,
           );
+        endpoints.explicitModelLoad = "supported";
         loadRequested = true;
         notify(shared, "load_requested");
+        if (!status) return true;
       }
+      if (sseError) throw sseError;
       if (!terminalObserved) await waitForPoll();
       terminalObserved = false;
       const next = await catalog(root, options, signal);
       if (!next.supported)
         throw new Error(
-          `llama.cpp Router /models stopped returning model status for ${model}`,
+          `Provider /models stopped returning a valid inventory for ${model}`,
         );
       models = next.models;
     }
@@ -431,7 +567,8 @@ export async function ensureRouterModelReady(
   if (!auth) return;
   const root = routerBaseUrl(auth.auth.baseUrl ?? model.baseUrl);
   if (!root) return;
-  const capabilityKey = `${model.provider}\0${root.href}`;
+  const effectiveBaseUrl = new URL(auth.auth.baseUrl ?? model.baseUrl).href;
+  const capabilityKey = `${model.provider}\0${effectiveBaseUrl}`;
   if (capabilities.get(capabilityKey) === false) return;
   const headers = new Headers();
   for (const source of [
@@ -449,6 +586,12 @@ export async function ensureRouterModelReady(
     headers,
     fetch: requestOptions?.fetch ?? globalThis.fetch,
   };
+  const warmupUrl = completionUrl(effectiveBaseUrl);
+  const maxTokensField =
+    (model as Model<"openai-completions">).compat?.maxTokensField ===
+    "max_completion_tokens"
+      ? "max_completion_tokens"
+      : "max_tokens";
   const startedAt = Date.now();
   const emit = (event: Omit<ModelPreflightEvent, "provider" | "model">) =>
     options.onEvent?.({ ...event, provider: model.provider, model: model.id });
@@ -464,9 +607,15 @@ export async function ensureRouterModelReady(
   let lastProgress: number | undefined;
   let loggedProgress: number | undefined;
   let lastSnapshot: Snapshot | undefined;
+  let warmingUp = false;
   const listener: Listener = (change) => {
     if (change === "load_requested") {
       emit({ type: "model_load_requested" });
+      return;
+    }
+    if ("type" in change) {
+      if (change.type === "model_preflight_warmup_started") warmingUp = true;
+      emit(change);
       return;
     }
     lastSnapshot = change;
@@ -504,7 +653,17 @@ export async function ensureRouterModelReady(
     const current = shared;
     inFlight.set(key, current);
     current.promise = Promise.resolve()
-      .then(() => runShared(root, model.id, input, current, capabilityKey))
+      .then(() =>
+        runShared(
+          root,
+          model.id,
+          input,
+          current,
+          capabilityKey,
+          warmupUrl,
+          maxTokensField,
+        ),
+      )
       .finally(() => {
         if (inFlight.get(key) === current) inFlight.delete(key);
       });
@@ -520,7 +679,13 @@ export async function ensureRouterModelReady(
         return;
       }
       const abort = () =>
-        reject(options.signal?.reason ?? new Error("Request aborted"));
+        reject(
+          warmingUp && options.signal?.reason?.name === "TimeoutError"
+            ? new Error(
+                `Model preflight timed out while warming up ${model.id}`,
+              )
+            : (options.signal?.reason ?? new Error("Request aborted")),
+        );
       options.signal?.addEventListener("abort", abort, { once: true });
       shared!.promise
         .then(resolve, reject)
@@ -545,7 +710,7 @@ export async function ensureRouterModelReady(
     shared.waiters--;
     if (shared.waiters === 0) {
       if (inFlight.get(key) === shared) inFlight.delete(key);
-      shared.controller.abort();
+      shared.controller.abort(options.signal?.reason);
     }
     options.onUpdate?.({ kind: "model_preflight_end" });
   }

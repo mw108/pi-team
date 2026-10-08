@@ -99,6 +99,338 @@ const loading = (model: string, value: unknown, status = "loading") => ({
     progress: { stages: ["text_model"], current: "text_model", value },
   },
 });
+
+type LazyBackendOptions = {
+  sseStatus?: number;
+  loadStatus?: number;
+  warmupStatus?: number;
+  warmupBody?: string;
+  warmupDelayMs?: number;
+  inventoryId?: string;
+};
+
+function lazyBackend(id: string, config: LazyBackendOptions = {}) {
+  const calls: string[] = [];
+  const bodies: Record<string, unknown>[] = [];
+  const fetchMock = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    calls.push(`${init?.method ?? "GET"} ${path}`);
+    if (path === "/models")
+      return Response.json({
+        data: [{ id: config.inventoryId ?? id, object: "model" }],
+      });
+    if (path === "/models/sse")
+      return new Response(null, { status: config.sseStatus ?? 404 });
+    if (path === "/models/load") {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: config.loadStatus ?? 404 });
+    }
+    if (path.endsWith("/chat/completions")) {
+      bodies.push(JSON.parse(String(init?.body)));
+      if (config.warmupDelayMs)
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, config.warmupDelayMs);
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              reject(init.signal?.reason ?? new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      return new Response(
+        config.warmupBody ??
+          JSON.stringify({
+            choices: [
+              { message: { role: "assistant", content: "warmup-only" } },
+            ],
+          }),
+        { status: config.warmupStatus ?? 200 },
+      );
+    }
+    assert.fail(`Unexpected request: ${path}`);
+  };
+  return {
+    fetch: fetchMock as typeof fetch,
+    calls,
+    bodies,
+    loadCount: () =>
+      calls.filter((call) => call === "POST /models/load").length,
+  };
+}
+
+test("Strata inventory with both optional endpoints absent uses a minimal warmup", async () => {
+  const id = "strata/Qwen3.8-Flash-Next";
+  const server = lazyBackend(id);
+  const events: ModelPreflightEvent[] = [];
+  const updates: ModelPreflightUpdate[] = [];
+  await ready(id, server, { events, updates, baseUrl: `${base()}/v1` });
+  assert.deepEqual(server.calls, [
+    "GET /models",
+    "GET /models/sse",
+    "POST /models/load",
+    "POST /v1/chat/completions",
+  ]);
+  assert.deepEqual(server.bodies, [
+    { model: id },
+    {
+      model: id,
+      messages: [{ role: "user", content: "Hello" }],
+      max_tokens: 1,
+      temperature: 0,
+    },
+  ]);
+  assert.ok(
+    events.some((event) => event.type === "model_preflight_sse_unsupported"),
+  );
+  assert.ok(
+    events.some(
+      (event) => event.type === "model_preflight_explicit_load_unsupported",
+    ),
+  );
+  assert.ok(
+    events.some((event) => event.type === "model_preflight_warmup_completed"),
+  );
+  assert.equal(events.at(-1)?.type, "model_preflight_ready");
+  assert.ok(
+    updates.some(
+      (update) => update.kind === "model_preflight" && update.progress === 0,
+    ),
+  );
+});
+
+test("capability 404s are cached per provider endpoint", async () => {
+  const id = "strata/Qwen3.8-Flash-Next";
+  const url = base();
+  const server = lazyBackend(id);
+  await ready(id, server, { baseUrl: url });
+  await ready(id, server, { baseUrl: url });
+  assert.deepEqual(server.calls, [
+    "GET /models",
+    "GET /models/sse",
+    "POST /models/load",
+    "POST /chat/completions",
+    "GET /models",
+    "POST /chat/completions",
+  ]);
+  const other = lazyBackend(id, { loadStatus: 200 });
+  await ready(id, other, { baseUrl: base() });
+  assert.ok(other.calls.includes("POST /models/load"));
+  assert.ok(!other.calls.some((call) => call.includes("chat/completions")));
+});
+
+test("SSE and explicit load capabilities are independent", async () => {
+  const id = "strata/Qwen3.8-Flash-Next";
+  const explicit = lazyBackend(id, { sseStatus: 404, loadStatus: 200 });
+  await ready(id, explicit);
+  assert.ok(explicit.calls.includes("POST /models/load"));
+  assert.ok(!explicit.calls.some((call) => call.includes("chat/completions")));
+  const lazy = lazyBackend(id, { sseStatus: 200 });
+  await ready(id, lazy);
+  assert.ok(lazy.calls.includes("POST /chat/completions"));
+});
+
+test("only SSE 404 is a capability fallback", async () => {
+  for (const status of [500, 401, 403]) {
+    const server = lazyBackend("a", { sseStatus: status });
+    await assert.rejects(
+      ready("a", server),
+      new RegExp(`/models/sse returned HTTP ${status}`),
+    );
+    assert.ok(!server.calls.includes("POST /models/load"));
+  }
+  const url = base();
+  const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new URL(String(input)).pathname === "/models/sse")
+      return new Promise<Response>((_, reject) =>
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+          { once: true },
+        ),
+      );
+    return lazyBackend("a").fetch(input, init);
+  }) as typeof fetch;
+  await assert.rejects(
+    ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      { signal: AbortSignal.timeout(15) },
+    ),
+    /Timeout|timed out/i,
+  );
+});
+
+test("load 500 and auth failures do not trigger warmup", async () => {
+  for (const status of [500, 401, 403]) {
+    const server = lazyBackend("a", { loadStatus: status });
+    await assert.rejects(
+      ready("a", server),
+      new RegExp(`could not load a: HTTP ${status}`),
+    );
+    assert.ok(!server.calls.some((call) => call.includes("chat/completions")));
+  }
+});
+
+test("warmup requires HTTP 200 JSON with nonempty choices", async () => {
+  const cases: Array<[LazyBackendOptions, RegExp]> = [
+    [
+      { warmupStatus: 404 },
+      /chat-completion warmup failed at \/chat\/completions: HTTP 404/,
+    ],
+    [{ warmupStatus: 500 }, /HTTP 500/],
+    [{ warmupBody: '{"object":"ok"}' }, /no chat-completion choices/],
+    [{ warmupBody: '{"choices":[]}' }, /no chat-completion choices/],
+    [{ warmupBody: "not-json" }, /no chat-completion choices/],
+  ];
+  for (const [config, expected] of cases) {
+    const server = lazyBackend("a", config);
+    await assert.rejects(ready("a", server), expected);
+  }
+});
+
+test("warmup ignores normal request timeout but obeys preflight abort", async () => {
+  const url = base();
+  const server = lazyBackend("a", { warmupDelayMs: 20 });
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: server.fetch, timeoutMs: 1 },
+    { signal: AbortSignal.timeout(100) },
+  );
+  const late = lazyBackend("a", { warmupDelayMs: 50 });
+  const lateUrl = base();
+  await assert.rejects(
+    ensureRouterModelReady(
+      runtime(lateUrl),
+      model("a", lateUrl),
+      { fetch: late.fetch, timeoutMs: 1 },
+      { signal: AbortSignal.timeout(10) },
+    ),
+    /Model preflight timed out while warming up/,
+  );
+});
+
+test("warmup uses Pi-compatible URL and configured token field", async () => {
+  for (const suffix of ["", "/v1"]) {
+    const url = `${base()}${suffix}`;
+    const server = lazyBackend("a");
+    await ensureRouterModelReady(
+      runtime(url),
+      {
+        ...model("a", url),
+        compat: { maxTokensField: "max_completion_tokens" },
+      } as Model<Api>,
+      { fetch: server.fetch },
+      {},
+    );
+    assert.ok(server.calls.includes(`POST ${suffix}/chat/completions`));
+    assert.deepEqual(server.bodies.at(-1), {
+      model: "a",
+      messages: [{ role: "user", content: "Hello" }],
+      max_completion_tokens: 1,
+      temperature: 0,
+    });
+  }
+});
+
+test("warmup output stays outside the real agent conversation and provider timing", async () => {
+  const url = base();
+  const server = lazyBackend("a");
+  let inference = 0;
+  let realMessages: unknown;
+  const pi = runtime(url, () => inference++);
+  const original = pi.streamSimple.bind(pi);
+  pi.streamSimple = (selected, context, options) => {
+    realMessages = context.messages;
+    return original(selected, context, options);
+  };
+  const provider: ProviderRequestEvent[] = [];
+  configureNetworkRetry(
+    pi,
+    { maxRetries: 0, delayMs: 1 },
+    () => undefined,
+    undefined,
+    (event) => provider.push(event),
+    Date.now,
+    undefined,
+    () => () => {},
+    (selected, options, signal, onEvent, onUpdate) =>
+      ensureRouterModelReady(
+        pi,
+        selected,
+        { ...options, fetch: server.fetch },
+        { signal, onEvent, onUpdate },
+      ),
+  );
+  const messages = [
+    { role: "user", content: "real work", timestamp: Date.now() },
+  ] as Parameters<ModelRuntime["streamSimple"]>[1]["messages"];
+  await pi.streamSimple(model("a", url), { messages }).result();
+  assert.equal(inference, 1);
+  assert.deepEqual(realMessages, messages);
+  assert.equal(
+    provider.filter((event) => event.type === "provider_request_start").length,
+    1,
+  );
+  assert.deepEqual(server.bodies.at(-1), {
+    model: "a",
+    messages: [{ role: "user", content: "Hello" }],
+    max_tokens: 1,
+    temperature: 0,
+  });
+});
+
+test("exact model ID is required before any optional endpoint", async () => {
+  const server = lazyBackend("unsloth/Qwen3.5-122B-A10B:UD-IQ4_NL");
+  await assert.rejects(
+    ready("unsloth/Qwen3.5-122B-A10B:IQ4_NL", server),
+    /provider inventory/,
+  );
+  assert.deepEqual(server.calls, ["GET /models"]);
+});
+
+test("an empty provider inventory fails exact model validation", async () => {
+  const url = base();
+  const calls: string[] = [];
+  const fetchMock = (async (input: RequestInfo | URL) => {
+    calls.push(new URL(String(input)).pathname);
+    return Response.json({ data: [] });
+  }) as typeof fetch;
+  await assert.rejects(
+    ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      {},
+    ),
+    /not available in provider inventory/,
+  );
+  assert.deepEqual(calls, ["/models"]);
+});
+
+test("capability cache separates provider IDs on one base URL", async () => {
+  const url = base();
+  const first = lazyBackend("a");
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: first.fetch },
+    {},
+  );
+  const second = lazyBackend("a", { loadStatus: 200 });
+  await ensureRouterModelReady(
+    runtime(url),
+    { ...model("a", url), provider: "another-local-provider" },
+    { fetch: second.fetch },
+    {},
+  );
+  assert.ok(second.calls.includes("GET /models/sse"));
+  assert.ok(second.calls.includes("POST /models/load"));
+  assert.ok(!second.calls.some((call) => call.includes("chat/completions")));
+});
 function router(
   sequences: Record<string, Status[]>,
   unsupported = false,
@@ -116,6 +448,8 @@ function router(
       assert.ok(Object.hasOwn(sequences, body.model));
       return Response.json({ success: true });
     }
+    if (url.pathname === "/models/sse")
+      return new Response(null, { status: 404 });
     assert.equal(url.pathname, "/models");
     if (unsupported)
       return Response.json({
@@ -514,6 +848,7 @@ test("unloaded model is loaded once and awaited", async () => {
     [
       "model_preflight_start",
       "model_status",
+      "model_preflight_sse_unsupported",
       "model_load_requested",
       "model_status",
       "model_status",
@@ -616,10 +951,10 @@ test("unknown model fails without load or substitution", async () => {
   assert.equal(server.loadCount(), 0);
 });
 
-test("ordinary OpenAI-compatible model list falls back", async () => {
+test("ordinary OpenAI-compatible model list is validated and explicitly loaded", async () => {
   const server = router({ a: [{ value: "loaded" }] }, true);
   await ready("a", server);
-  assert.equal(server.loadCount(), 0);
+  assert.equal(server.loadCount(), 1);
 });
 
 test("built-in OpenAI provider is not probed", async () => {
@@ -725,6 +1060,7 @@ test("JSONL records status transitions without a line per identical poll", async
       [
         "model_preflight_start",
         "model_status",
+        "model_preflight_sse_unsupported",
         "model_status",
         "model_preflight_ready",
       ],

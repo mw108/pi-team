@@ -245,7 +245,7 @@ export class AgentLogStore {
     for (const event of events) {
       const time =
         typeof event.at === "string" ? event.at.slice(11, 19) : "--:--:--";
-      const label =
+      let label =
         event.type === "agent_start"
           ? event.trigger === "manual_retry"
             ? "manual retry started"
@@ -339,6 +339,16 @@ export class AgentLogStore {
                                                                               "agent_complete"
                                                                             ? "completed"
                                                                             : undefined;
+      if (event.type === "model_preflight_sse_unsupported")
+        label = "model progress stream unsupported";
+      if (event.type === "model_preflight_explicit_load_unsupported")
+        label = "explicit model load unsupported; using warmup";
+      if (event.type === "model_preflight_warmup_started")
+        label = `warming up model ${event.model}`;
+      if (event.type === "model_preflight_warmup_completed")
+        label = `model warmup completed after ${seconds(event.durationMs)}`;
+      if (event.type === "model_preflight_warmup_failed")
+        label = `model warmup failed: ${event.message}`;
       if (event.type === "provider_request_context")
         lines.push(
           `${time} provider request ${event.providerRequest} context · ${(event.tools as unknown[] | undefined)?.length ?? 0} tools`,
