@@ -18,6 +18,7 @@ import type { Phase, WorkflowState } from "./state.ts";
 import { isLimitBlockerStillActive } from "./limit-blocker.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 import { projectInstructionsDrift } from "./project-instructions.ts";
+import { isLegacySecurityRiskBlock } from "./security-risk-review.ts";
 
 export type FixRequirementsOrigin = {
   sourceAgent: "implementor" | "codeReviewer";
@@ -419,6 +420,24 @@ async function planWorkflowRecovery(
   });
   if (active) return unsafe("Workflow is already running.");
   if (
+    state.phase === "WAITING_USER" &&
+    state.securityRiskReview &&
+    !state.pendingApproval &&
+    !state.pendingQuestion &&
+    !state.pendingResearchQuestions?.length &&
+    !state.pendingRuntimeCommands?.length &&
+    !state.pendingRuntimeFiles?.length
+  )
+    return {
+      kind: "continue",
+      nextPhase: "WAITING_USER",
+      agentId: "securityReviewer",
+      reason:
+        state.securityRiskReview.status === "accepted"
+          ? "Accepted security risks were approved; continue to the next gate."
+          : "Waiting for user review of accepted security risks. Continue to reopen the confirmation.",
+    };
+  if (
     state.phase === "WAITING_USER" ||
     state.pendingQuestion ||
     state.pendingApproval ||
@@ -463,6 +482,14 @@ async function planWorkflowRecovery(
   const drift = analyzeConfigDrift(state, current);
   if (drift.blocking)
     return unsafe(`Configuration drift detected.\n${driftSummary(drift)}`);
+  if (isLegacySecurityRiskBlock(state))
+    return {
+      kind: "continue",
+      nextPhase: "WAITING_USER",
+      agentId: "securityReviewer",
+      reason:
+        "Waiting for user review of accepted security risks. Continue to open the confirmation.",
+    };
   const interrupted = interruptedMutationRecovery(state);
   if (interrupted) {
     const classification = await classifyAttributedImplementation(
@@ -879,9 +906,14 @@ export async function getWorkflowRecoveryPlan(
       actions: [{ kind: "abort", command: "/team-stop" }],
     } as WorkflowRecoveryPlan;
   let actions: RecoveryAction[] = [];
-  if (plan.kind === "continue")
+  if (plan.kind === "continue") {
     actions = [{ kind: "continue", command: "/team-continue" }];
-  else if (plan.kind === "unconsumed-manual-retry")
+    if (
+      state.securityRiskReview?.status === "pending" ||
+      isLegacySecurityRiskBlock(state)
+    )
+      actions.push({ kind: "retry", command: "/team-retry securityReviewer" });
+  } else if (plan.kind === "unconsumed-manual-retry")
     actions = [
       { kind: "retry", command: `/team-retry ${plan.agentId}` },
       { kind: "continue", command: "/team-continue" },

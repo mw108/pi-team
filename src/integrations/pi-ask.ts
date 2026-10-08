@@ -93,6 +93,7 @@ export function approvalParams(request: ApprovalRequest) {
           "manualRetry",
           "runtimeCommand",
           "runtimeFile",
+          "securityRisk",
         ].includes(request.kind)
           ? "single"
           : "multi",

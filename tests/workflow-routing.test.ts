@@ -355,7 +355,8 @@ test("security reviewer cannot omit findings or accept risks autonomously", () =
     summary: "Fixture",
   };
   transition(t);
-  assert.equal(t.phase, "BLOCKED");
+  assert.equal(t.phase, "WAITING_USER");
+  assert.equal(t.securityRiskReview?.status, "pending");
 });
 test("failed tests never route to commit", () => {
   const s = state();

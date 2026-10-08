@@ -58,6 +58,10 @@ async function finalText(state: WorkflowState) {
     );
   if (state.phase === "WAITING_USER" && state.pendingResearchQuestions?.length)
     return `Researcher waiting for user clarification (${state.pendingResearchQuestions.length} questions). Run /team resume ${state.id} to answer them.`;
+  if (state.phase === "WAITING_USER" && state.securityRiskReview)
+    return state.securityRiskReview.status === "pending"
+      ? `Waiting for user review of accepted security risks. Run /team-continue to reopen the confirmation.`
+      : "Accepted security risks were approved. Run /team-continue to resume the next gate.";
   return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
 }
 export default function teamExtension(pi: ExtensionAPI) {
@@ -414,17 +418,22 @@ export default function teamExtension(pi: ExtensionAPI) {
             ? await store.load(args.trim())
             : (live?.state ?? (await store.latest()));
         if (state) {
+          const reviewingRisk =
+            state.phase === "WAITING_USER" &&
+            state.securityRiskReview?.status === "pending";
           const recovery =
-            state.phase === "BLOCKED" ||
-            state.phase === "WAITING_USER" ||
-            state.manualRetry ||
-            state.inFlight
-              ? await getWorkflowRecoveryPlan(
-                  state,
-                  root,
-                  Boolean(live?.state?.id === state.id && live.engine),
-                )
-              : undefined;
+            reviewingRisk && live?.state?.id === state.id
+              ? undefined
+              : state.phase === "BLOCKED" ||
+                  state.phase === "WAITING_USER" ||
+                  state.manualRetry ||
+                  state.inFlight
+                ? await getWorkflowRecoveryPlan(
+                    state,
+                    root,
+                    Boolean(live?.state?.id === state.id && live.engine),
+                  )
+                : undefined;
           const runtime =
             live?.state?.id === state.id ? live.runtime : undefined;
           if (runtime) progress(ctx, state, runtime);

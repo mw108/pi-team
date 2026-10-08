@@ -2,6 +2,7 @@ import { completionReportSchema, roles, type Role } from "../agents/schemas.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import { dirtyPaths } from "./git.ts";
 import type { WorkflowState } from "./state.ts";
+import { matchingSecurityRiskReview } from "./security-risk-review.ts";
 import { recoveryAction, type WorkflowRecoveryPlan } from "./recovery.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 
@@ -120,8 +121,13 @@ export async function buildCompletionReportInput(
       security.findings.every(
         (f) =>
           f.classification !== "CONFIRMED" &&
-          f.classification !== "ACCEPTED_RISK",
+          (f.classification !== "ACCEPTED_RISK" ||
+            (s.securityRiskReview?.status === "accepted" &&
+              matchingSecurityRiskReview(s))),
       ),
+    s.securityRiskReview?.status === "accepted" && matchingSecurityRiskReview(s)
+      ? "Accepted security risks explicitly approved by the user"
+      : undefined,
   );
   const tester = s.results.tester;
   gate(

@@ -78,6 +78,13 @@ import {
   type ApprovalRequest,
 } from "./state.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import {
+  currentSecurityRiskReview,
+  isLegacySecurityRiskBlock,
+  matchingSecurityRiskReview,
+  requestSecurityRiskReview,
+  securityRiskQuestion,
+} from "./security-risk-review.ts";
 import { recordVerifiedCommandResult } from "./verified-commands.ts";
 import {
   getActiveSolverIds,
@@ -377,20 +384,32 @@ export class WorkflowEngine {
       for (const key of Object.keys(state))
         delete (state as Record<string, unknown>)[key];
       Object.assign(state, latest);
-      delete state.manualRetry;
-      delete state.inFlight;
-      delete state.pendingApproval;
-      delete state.pendingQuestion;
-      delete state.pendingResearchQuestions;
-      delete state.driftCandidate;
-      state.phase = "ABORTED";
-      record(state, "workflow_aborted", role ?? "workflow");
+      this.abortState(state, role ?? "workflow");
       await this.store.save(state);
     } finally {
       await unlock();
     }
   }
+  private abortState(state: WorkflowState, reason: string) {
+    delete state.manualRetry;
+    delete state.inFlight;
+    delete state.pendingApproval;
+    delete state.pendingQuestion;
+    delete state.pendingResearchQuestions;
+    delete state.driftCandidate;
+    delete state.resumePhase;
+    if (state.securityRiskReview?.status === "pending")
+      delete state.securityRiskReview;
+    state.phase = "ABORTED";
+    record(state, "workflow_aborted", reason);
+  }
   retryConfirmation(state: WorkflowState, role: Role) {
+    if (
+      role === "securityReviewer" &&
+      (state.securityRiskReview?.status === "pending" ||
+        isLegacySecurityRiskBlock(state))
+    )
+      return undefined;
     if (state.manualRetry?.agent === role) return undefined;
     if (pendingFixRequirements(state)) return undefined;
     if (role === "reporter" && state.reportFailure) return undefined;
@@ -908,8 +927,13 @@ export class WorkflowEngine {
         "Completed workflow cannot be retried after commit or completion.",
       );
     const order = Object.keys(phaseRoles) as Phase[];
-    const current =
-      state.phase === "BLOCKED"
+    const riskReviewRetry =
+      role === "securityReviewer" &&
+      (state.securityRiskReview !== undefined ||
+        isLegacySecurityRiskBlock(state));
+    const current = riskReviewRetry
+      ? "SECURITY_REVIEW"
+      : state.phase === "BLOCKED"
         ? state.history.findLast((e) => e.event === "blocked")?.phase
         : state.phase;
     if (
@@ -935,6 +959,8 @@ export class WorkflowEngine {
           .split(", ");
         if (!waiting.includes(role))
           throw new Error(`Cannot clear unrelated blocker: ${state.blocker}`);
+      } else if (riskReviewRetry && isLegacySecurityRiskBlock(state)) {
+        // The old accepted-risk blocker is superseded by a fresh review.
       } else if (role === "reporter" && state.reportFailure) {
         // Presentation can be retried after work has completed.
       } else if (
@@ -974,6 +1000,11 @@ export class WorkflowEngine {
       );
     state.phase = phase;
     delete state.blocker;
+    if (
+      role === "securityReviewer" ||
+      this.dependentRoles(role).includes("securityReviewer")
+    )
+      delete state.securityRiskReview;
     state.manualRetry = { agent: role, phase };
     this.manualReruns.add(role);
     record(state, "agent_retry_requested_by_user", `${role} manual retry`, {
@@ -1009,6 +1040,11 @@ export class WorkflowEngine {
       );
   }
   private invalidateDependents(state: WorkflowState, role: Role) {
+    if (
+      role === "securityReviewer" ||
+      this.dependentRoles(role).includes("securityReviewer")
+    )
+      delete state.securityRiskReview;
     for (const dependent of this.dependentRoles(role)) {
       if (state.results[dependent])
         (state.results as Record<string, unknown>)[`previous_${dependent}`] =
@@ -2218,6 +2254,7 @@ export class WorkflowEngine {
         handedToRun = true;
         return await this.run(s, signal, unlock);
       }
+      if (isLegacySecurityRiskBlock(s)) requestSecurityRiskReview(s);
       if (s.blocker === "Local fix cycle limit reached") s.localFixCycle++;
       if (s.blocker?.startsWith("Research clarification limit reached")) {
         const questions = [
@@ -2519,7 +2556,131 @@ export class WorkflowEngine {
             await this.store.save(s);
           }
         }
+        if (
+          ["TEST", "COMMIT", "REPORT"].includes(s.phase) &&
+          currentSecurityRiskReview(s) &&
+          !(
+            s.securityRiskReview?.status === "accepted" &&
+            matchingSecurityRiskReview(s)
+          )
+        ) {
+          for (const role of ["tester", "commitAgent", "reporter"] as const) {
+            if (s.results[role])
+              (s.results as Record<string, unknown>)[`previous_${role}`] =
+                s.results[role];
+            delete s.results[role];
+          }
+          delete s.reportInput;
+          delete s.commitSelection;
+          s.phase = "SECURITY_REVIEW";
+          transition(s);
+          await this.store.save(s);
+          continue;
+        }
         if (s.phase === "WAITING_USER") {
+          if (
+            s.securityRiskReview &&
+            !s.pendingApproval &&
+            !s.pendingQuestion &&
+            !s.pendingResearchQuestions?.length
+          ) {
+            const review = s.securityRiskReview;
+            if (
+              s.results.securityReviewer?.findings.some(
+                (finding) => finding.classification === "CONFIRMED",
+              )
+            ) {
+              s.phase = "SECURITY_REVIEW";
+              transition(s);
+              await this.store.save(s);
+              continue;
+            }
+            if (!matchingSecurityRiskReview(s)) {
+              if (!currentSecurityRiskReview(s)) {
+                block(
+                  s,
+                  "Security Reviewer result changed during risk review; rerun Security Review",
+                );
+                await this.store.save(s);
+                break;
+              }
+              requestSecurityRiskReview(s);
+              await this.store.save(s);
+              continue;
+            }
+            if (review.status === "accepted") {
+              s.phase = "SECURITY_REVIEW";
+              transition(s);
+              record(s, "phase_completed");
+              await this.store.save(s);
+              continue;
+            }
+            let selected: string[] | undefined;
+            try {
+              selected = await this.ui.approve?.({
+                kind: "securityRisk",
+                title: "Review accepted security risks",
+                prompt: securityRiskQuestion(review),
+                options: [
+                  {
+                    value: "yes",
+                    label: "Yes",
+                    description: "Accept the displayed risks and continue",
+                  },
+                  {
+                    value: "no",
+                    label: "No",
+                    description: "Abort the workflow",
+                  },
+                ],
+              });
+            } catch (error) {
+              record(
+                s,
+                "security_risk_review_interrupted",
+                getErrorMessage(error),
+              );
+              await this.store.save(s);
+              break;
+            }
+            if (!selected?.length) {
+              await this.store.save(s);
+              break;
+            }
+            if (selected.length !== 1 || !["yes", "no"].includes(selected[0])) {
+              record(
+                s,
+                "security_risk_review_interrupted",
+                "Invalid selection",
+              );
+              await this.store.save(s);
+              break;
+            }
+            if (selected[0] === "no") {
+              record(
+                s,
+                "security_risk_review_rejected",
+                "User rejected accepted security risks",
+                {
+                  agent: "securityReviewer",
+                  attempt: review.securityReviewerAttempt ?? 1,
+                  count: review.findings.length,
+                },
+              );
+              this.abortState(s, "User rejected accepted security risks");
+              await this.store.save(s);
+              break;
+            }
+            review.status = "accepted";
+            review.reviewedAt = new Date().toISOString();
+            record(s, "security_risk_review_accepted", "", {
+              agent: "securityReviewer",
+              attempt: review.securityReviewerAttempt ?? 1,
+              count: review.findings.length,
+            });
+            await this.store.save(s);
+            continue;
+          }
           if (s.pendingResearchQuestions?.length && !s.pendingApproval) {
             const questions = s.pendingResearchQuestions;
             const answers = await this.ui.askResearchQuestions?.(questions);
@@ -2734,6 +2895,7 @@ export class WorkflowEngine {
                   delete s.manualRetry;
                   delete s.pendingResearchQuestions;
                   delete s.researchClarificationPending;
+                  delete s.securityRiskReview;
                   delete s.resumePhase;
                   delete s.gateHashes;
                   record(

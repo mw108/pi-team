@@ -406,6 +406,10 @@ Use Pi's `/login` and `/model` to authenticate and inspect actual model IDs, or 
 
 Only the Orchestrator presents user questions. Subagents return a validated `QUESTION_REQUEST`. The engine combines related questions, persists `WAITING_USER` before asking, invokes pi-ask's own `ask_user` implementation and resumes only after a nonempty submitted clarification. Use the built-in **Type your own** option or attach a substantive note; selecting the placeholder alone is not an answer. Cancellation and noninteractive mode leave the workflow waiting.
 
+When Security Reviewer reports `ACCEPTED_RISK` findings, Pi-Team saves the exact finding set and reviewer attempt, then presents one Yes/No confirmation through pi-ask. The question includes each finding ID and the original reviewer evidence, truncated only when needed for question length. Status and diagnostic logs use metadata or redacted text. **Yes** records explicit user acceptance and resumes the configured next gate; **No** aborts the workflow. Confirmed vulnerabilities still follow remediation, and false positives need no approval. Accepted risks are never approved automatically.
+
+`/team-continue` reopens a pending risk confirmation after interruption and continues without another question if Yes was already saved. It also recovers workflows blocked by the earlier accepted-risk gate. `/team-retry securityReviewer` supersedes the previous pending or accepted decision, invalidates downstream results, and asks again if the fresh review reports accepted risks, even when the findings are identical.
+
 No custom question UI is implemented. `/ask-settings`, `/answer` and `/ask:replay` remain available through the installed package. `ask_user` requires Pi TUI mode for its rich form. Replay answers do not independently modify team state; `/team resume` reopens the persisted team question.
 
 ### pi-ask compatibility

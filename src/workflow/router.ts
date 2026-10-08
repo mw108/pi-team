@@ -2,6 +2,11 @@ import { block, record, type WorkflowState, type Phase } from "./state.ts";
 import { pentestSchema, type Role } from "../agents/schemas.ts";
 import { enforcePentestPolicy } from "./pentest-policy.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
+import {
+  currentSecurityRiskReview,
+  matchingSecurityRiskReview,
+  requestSecurityRiskReview,
+} from "./security-risk-review.ts";
 export const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
@@ -37,6 +42,7 @@ export function fix(
   question?: string,
 ) {
   record(s, route, s.phase);
+  delete s.securityRiskReview;
   if (route === "FIX_REQUIREMENTS") {
     const sourcePhase = s.phase;
     const sourceAgent = getPhaseRoles(s, sourcePhase)?.[0];
@@ -127,6 +133,7 @@ export function transition(s: WorkflowState) {
         delete s.results[key];
       }
       delete s.gateHashes;
+      delete s.securityRiskReview;
       s.phase = "SOLVE";
       break;
     case "SOLVE":
@@ -206,10 +213,6 @@ export function transition(s: WorkflowState) {
       const confirmed = review.findings.filter(
         (f) => f.classification === "CONFIRMED",
       );
-      if (review.findings.some((f) => f.classification === "ACCEPTED_RISK")) {
-        block(s, "Accepted security risks require explicit user review");
-        break;
-      }
       if (confirmed.some((f) => !f.route)) {
         block(s, "Confirmed findings require a fix route");
         break;
@@ -221,7 +224,17 @@ export function transition(s: WorkflowState) {
             ? "FIX_DESIGN"
             : "FIX_LOCAL",
         );
-      else s.phase = afterSecurity(s);
+      else if (currentSecurityRiskReview(s)) {
+        if (
+          s.securityRiskReview?.status === "accepted" &&
+          matchingSecurityRiskReview(s)
+        )
+          s.phase = afterSecurity(s);
+        else requestSecurityRiskReview(s);
+      } else {
+        delete s.securityRiskReview;
+        s.phase = afterSecurity(s);
+      }
       break;
     }
     case "TEST": {

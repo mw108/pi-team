@@ -22,6 +22,7 @@ import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 import type { WorkflowState } from "./state.ts";
 import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
+import { matchingSecurityRiskReview } from "./security-risk-review.ts";
 const exec = promisify(execFile);
 export async function git(cwd: string, args: string[]) {
   return (
@@ -373,7 +374,11 @@ export async function prepareCommit(
     s.results.securityReviewer.findings.some(
       (f) =>
         f.classification === "CONFIRMED" ||
-        f.classification === "ACCEPTED_RISK",
+        (f.classification === "ACCEPTED_RISK" &&
+          !(
+            s.securityRiskReview?.status === "accepted" &&
+            matchingSecurityRiskReview(s)
+          )),
     )
   )
     throw new Error("Security gate has not passed");

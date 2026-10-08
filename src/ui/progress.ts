@@ -9,6 +9,10 @@ import { formatCommandLine } from "../agents/command-observability.ts";
 import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 import {
+  currentSecurityRiskReview,
+  isLegacySecurityRiskBlock,
+} from "../workflow/security-risk-review.ts";
+import {
   pendingFixRequirements,
   classifyQualityGateBlocker,
 } from "../workflow/recovery.ts";
@@ -433,6 +437,23 @@ export function renderProgress(
       `Project instructions: ✓ AGENTS.md · sha256 ${state.projectInstructions.sha256.slice(0, 12)}`,
     );
   if (state.phase === "WAITING_USER") lines.push("◉ Waiting for user input");
+  const riskReview = state.securityRiskReview;
+  if (riskReview?.status === "pending")
+    lines.push(
+      "Waiting for explicit review of accepted security risks.",
+      `Security risk IDs: ${riskReview.findings.map((finding) => finding.id).join(", ")}`,
+      "Next action: Answer the active confirmation, or run /team-continue to reopen it after interruption. /team-retry securityReviewer supersedes this review.",
+    );
+  else if (riskReview?.status === "accepted")
+    lines.push("Security risks: ✓ Explicitly accepted by user.");
+  else if (isLegacySecurityRiskBlock(state)) {
+    const current = currentSecurityRiskReview(state)!;
+    lines.push(
+      "Waiting for explicit review of accepted security risks.",
+      `Security risk IDs: ${current.findings.map((finding) => finding.id).join(", ")}`,
+      "Next action: /team-continue opens the security-risk confirmation.",
+    );
+  }
   const requirement = pendingFixRequirements(state);
   if (requirement) {
     lines.push(
@@ -593,9 +614,13 @@ export function renderLiveProgress(
   const waiting =
     state.phase === "WAITING_USER" && !active.length
       ? [
-          requirement
-            ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
-            : "◉ Waiting for user input",
+          state.securityRiskReview
+            ? state.securityRiskReview.status === "pending"
+              ? "◉ Waiting for user review of accepted security risks · /team-continue to reopen"
+              : "✓ Security risks approved · /team-continue to resume"
+            : requirement
+              ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
+              : "◉ Waiting for user input",
         ]
       : [];
   const reserved =

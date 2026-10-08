@@ -50,6 +50,7 @@ export const approvalSchema = z.object({
     "runtimeFile",
     "sensitivePaths",
     "orphanedImplementation",
+    "securityRisk",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -90,6 +91,20 @@ export const pendingQuestionSchema = questionSchema.extend({
   sourceAgent: z.enum(roles).optional(),
   sourcePhase: z.enum(phases).optional(),
 });
+export const securityRiskReviewSchema = z.object({
+  status: z.enum(["pending", "accepted"]),
+  findings: z.array(
+    z.object({
+      id: z.string(),
+      classification: z.literal("ACCEPTED_RISK"),
+      evidence: z.string(),
+    }),
+  ),
+  resultHash: z.string().regex(/^[a-f0-9]{64}$/),
+  securityReviewerAttempt: z.number().int().positive().optional(),
+  reviewedAt: z.string().optional(),
+});
+export type SecurityRiskReview = z.infer<typeof securityRiskReviewSchema>;
 export const baselineSchema = z.object({
   head: z.string().nullable(),
   dirtyPaths: z.array(z.string()),
@@ -193,6 +208,7 @@ export const stateSchema = z.object({
     }),
   ),
   pendingQuestion: pendingQuestionSchema.optional(),
+  securityRiskReview: securityRiskReviewSchema.optional(),
   pendingResearchQuestions: z.array(z.string().min(1)).optional(),
   researchClarificationPending: z.boolean().optional(),
   resumePhase: z.enum(phases).optional(),
@@ -624,7 +640,15 @@ export function sanitizeWorkflowStateText(state: WorkflowState): void {
   // Only diagnostic copies of that content are redacted.
   state.task = redactVisibleText(state.task);
   state.requirements = state.requirements.map(redactVisibleText);
-  redactStructuredInPlace(state.results);
+  // Security Reviewer's result is the exact subject of a user risk decision.
+  // Keep it intact in private workflow state; diagnostic copies remain redacted.
+  for (const [key, result] of Object.entries(state.results)) {
+    if (key === "securityReviewer") continue;
+    (state.results as Record<string, unknown>)[key] =
+      typeof result === "string"
+        ? redactVisibleText(result)
+        : redactStructuredInPlace(result);
+  }
   redactStructuredInPlace(state.answers);
   redactStructuredInPlace(state.history);
   if (state.blocker) state.blocker = redactVisibleText(state.blocker);
