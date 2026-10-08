@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Command } from "../config/schema.ts";
 import type { Role } from "../agents/schemas.ts";
+import type { ContractOperation } from "../agents/permissions.ts";
 import type { RuntimeCommandRequest } from "../agents/runtime-commands.ts";
 import {
   proposeSimilarRule,
@@ -44,6 +45,163 @@ export interface CommandApprovalDependencies {
 export class RuntimeCommandApprovalCoordinator {
   constructor(private readonly deps: CommandApprovalDependencies) {}
   private commandApprovalQueue = Promise.resolve();
+  contractPathPrompt(
+    s: WorkflowState,
+    role: Role,
+    operation: ContractOperation,
+    path: string,
+    reason: string,
+  ): ApprovalRequest {
+    return {
+      kind: "contractPath",
+      title: "Implementation contract scope approval",
+      prompt: `Agent: ${getAgentDisplayName(s.config, role)} (${role})\nOperation: ${operation}\nPath: ${path}\n\nReason:\n${redactVisibleText(reason)}\n\nAllow this change?`,
+      options: [
+        {
+          value: "allow_once",
+          label: "Ja",
+          description: "Allow one matching mutation request",
+        },
+        {
+          value: "allow_workflow",
+          label: "Ja für diesen Workflow",
+          description: "Allow this exact path and operation for this workflow",
+        },
+        {
+          value: "deny",
+          label: "Nein",
+          description: "Do not authorize this change",
+        },
+      ],
+    };
+  }
+  async approveContractPath(
+    s: WorkflowState,
+    role: Role,
+    control: AttemptControl,
+    operation: ContractOperation,
+    path: string,
+    reason: string,
+    signal: AbortSignal | undefined,
+    log: (event: { type: string; [key: string]: unknown }) => void,
+  ): Promise<"once" | "workflow" | "deny"> {
+    const current = () =>
+      control.workflowId === s.id &&
+      this.deps.activeAttempt(role) === control &&
+      !control.intention &&
+      !control.settled &&
+      !signal?.aborted;
+    if (!current()) return "deny";
+    const granted = () =>
+      s.workflowApprovedContractPaths.some(
+        (item) => item.operation === operation && item.path === path,
+      );
+    if (granted()) return "workflow";
+    const pending = {
+      workflowId: s.id,
+      agentId: role,
+      run: control.attempt,
+      requestId: randomUUID(),
+      path,
+      operation,
+      reason: redactVisibleText(reason),
+    };
+    const resumePhase = s.phase;
+    s.pendingContractPaths.push(pending);
+    s.phase = "WAITING_USER";
+    log({
+      type: "contract_path_approval_requested",
+      agent: role,
+      attempt: control.attempt,
+      path,
+      operation,
+      reason: redactVisibleText(reason),
+    });
+    await this.deps.persistAttempt(
+      s,
+      "contract_path_approval_requested",
+      `${role} requests ${operation} ${path}: ${redactVisibleText(reason)}`,
+      { agent: role, attempt: control.attempt },
+    );
+    this.deps.progress(s);
+    const decide = async (): Promise<"once" | "workflow" | "deny"> => {
+      if (!current()) return "deny";
+      if (granted()) return "workflow";
+      const aborted = new Promise<undefined>((resolve) => {
+        if (signal?.aborted) resolve(undefined);
+        else
+          signal?.addEventListener("abort", () => resolve(undefined), {
+            once: true,
+          });
+      });
+      const selected = await Promise.race([
+        this.deps.approve?.(
+          this.contractPathPrompt(s, role, operation, path, reason),
+        ) ?? Promise.resolve(undefined),
+        aborted,
+      ]);
+      if (
+        !current() ||
+        !s.pendingContractPaths.some(
+          (item) => item.requestId === pending.requestId,
+        )
+      )
+        return "deny";
+      const choice = selected?.length === 1 ? selected[0] : undefined;
+      if (!choice || !["allow_once", "allow_workflow", "deny"].includes(choice))
+        return "deny";
+      if (choice === "allow_workflow" && !granted())
+        s.workflowApprovedContractPaths.push({ path, operation });
+      s.pendingContractPaths = s.pendingContractPaths.filter(
+        (item) => item.requestId !== pending.requestId,
+      );
+      if (!s.pendingContractPaths.length && s.phase === "WAITING_USER")
+        s.phase = s.inFlight?.phase ?? resumePhase;
+      const event =
+        choice === "allow_once"
+          ? "contract_path_approval_granted_once"
+          : choice === "allow_workflow"
+            ? "contract_path_approval_granted_workflow"
+            : "contract_path_approval_denied";
+      log({
+        type: event,
+        agent: role,
+        attempt: control.attempt,
+        path,
+        operation,
+        reason: redactVisibleText(reason),
+      });
+      await this.deps.persistAttempt(
+        s,
+        event,
+        `${role} ${operation} ${path}: ${choice}`,
+        { agent: role, attempt: control.attempt },
+      );
+      this.deps.progress(s);
+      return choice === "allow_once"
+        ? "once"
+        : choice === "allow_workflow"
+          ? "workflow"
+          : "deny";
+    };
+    const turn = this.commandApprovalQueue.then(decide);
+    this.commandApprovalQueue = turn.then(
+      () => {},
+      () => {},
+    );
+    try {
+      return await turn;
+    } finally {
+      if (!current()) {
+        s.pendingContractPaths = s.pendingContractPaths.filter(
+          (item) => item.requestId !== pending.requestId,
+        );
+        if (!s.pendingContractPaths.length && s.phase === "WAITING_USER")
+          s.phase = s.inFlight?.phase ?? resumePhase;
+        await this.deps.save(s);
+      }
+    }
+  }
   runtimeFileApprovalPrompt(
     s: WorkflowState,
     role: Role,

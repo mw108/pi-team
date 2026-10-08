@@ -10,6 +10,7 @@ import {
   contractIdentity,
   assertWithin,
   contractPaths,
+  workflowScopePaths,
 } from "../agents/permissions.ts";
 import { contractSchema } from "../agents/schemas.ts";
 import {
@@ -79,7 +80,7 @@ export async function providerDiff(s: WorkflowState): Promise<string> {
     : undefined;
   const paths = [
     ...new Set([
-      ...(contract?.success ? contractPaths(contract.data) : []),
+      ...(contract?.success ? workflowScopePaths(s) : []),
       ...s.approvedDirtyPaths,
     ]),
   ].filter((path) => !isSensitiveReadPath(path));
@@ -172,7 +173,7 @@ export async function gateSnapshot(s: WorkflowState) {
     ...new Set([
       ...Object.keys(s.gateHashes ?? {}),
       ...s.baseline.dirtyPaths,
-      ...(contract?.success ? contractPaths(contract.data) : []),
+      ...(contract?.success ? workflowScopePaths(s) : []),
     ]),
   ];
   return hashes(s.cwd, paths.sort());
@@ -195,7 +196,7 @@ export async function unexpectedWorkflowPaths(
     : undefined;
   const allowed = new Set([
     ...s.baseline.dirtyPaths,
-    ...(contract?.success ? contractPaths(contract.data) : []),
+    ...(contract?.success ? workflowScopePaths(s) : []),
   ]);
   const artifacts = await runtimeArtifacts(s.cwd);
   return (await dirtyPaths(s.cwd)).filter(
@@ -214,11 +215,7 @@ export async function classifyAttributedImplementation(
   if (!prior) return { discardable: [] as string[], ambiguous: [] as string[] };
   const allowed =
     scope === "orphan"
-      ? new Set(
-          contractPaths(contractSchema.parse(s.results.reviewer)).map(
-            policyPath,
-          ),
-        )
+      ? new Set(workflowScopePaths(s).map(policyPath))
       : new Set<string>();
   const baseline = new Set(s.baseline.dirtyPaths.map(policyPath));
   const artifacts =
@@ -322,9 +319,7 @@ export async function determineAuthoritativeCommitSelection(s: WorkflowState) {
     throw new Error(
       `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
     );
-  const allowed = new Set(
-    contractPaths(contractSchema.parse(s.results.reviewer)),
-  );
+  const allowed = new Set(workflowScopePaths(s));
   const baselineDirty = new Set(s.baseline.dirtyPaths);
   const visible = (await dirtyPaths(s.cwd)).filter(
     (path) => allowed.has(path) && !baselineDirty.has(path),
@@ -385,7 +380,7 @@ export async function prepareCommit(
   if ((await head(s.cwd)) !== s.baseline.head)
     throw new Error("Git HEAD changed since workflow start");
   const contract = contractSchema.parse(s.results.reviewer),
-    allowed = contractPaths(contract),
+    allowed = workflowScopePaths(s),
     dirty = await dirtyPaths(s.cwd);
   const writeAuthorized = (path: string) =>
     s.config.permissions.files.allowWrite.some((pattern) =>

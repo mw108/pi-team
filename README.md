@@ -431,7 +431,11 @@ Pi Serena finds the uv-managed Python environment automatically, or accepts `SER
 
 Semantic navigation prefers symbol overview, symbol lookup, references, declarations and implementations. Raw search/read remains available for exact text, configuration, documents and narrow code regions. Strict Serena blocking is not enabled because it can interfere with normal repository exploration. The optional onboarding-check tool is withheld from team sessions because the installed Serena 1.7.0 does not provide that upstream method; semantic tools were tested successfully. Language support depends on Serena's LSP/backend and project requirements.
 
-Implementor receives contract-scoped semantic edit tools. Cross-file rename and safe-delete are withheld because they can affect files outside the approved contract; use explicit scoped edits. File deletion uses `team_delete`, which requires an explicit `filesToDelete` entry. `.serena/` cache files are locally excluded from Git.
+Implementor receives contract-scoped semantic edit tools. Cross-file rename and safe-delete are withheld because they can affect files outside the approved contract; use explicit scoped edits. File deletion uses `team_delete`, which requires an explicit `filesToDelete` entry or an exact user approval for deletion. `.serena/` cache files are locally excluded from Git.
+
+Reviewer contract paths are the initial authorized mutation scope. If a mutating agent needs an additional repository file, it calls `team_request_contract_path` with the exact path, create/modify/delete operation, and a concise reason. Pi Team pauses and asks through `pi-ask`: **Ja** allows one matching mutation request, **Ja für diesen Workflow** persists the exact path and operation for this workflow, and **Nein** denies it. The original Reviewer result is unchanged. A denial may lead to `FIX_DESIGN` or a blocked outcome when the agent cannot continue. Traversal, protected paths, aliases, and paths outside the repository cannot be approved. One-shot approval is held only in the active agent attempt; completed one-shot changes remain visible to review and commit checks without authorizing another write. Workflow grants survive retries, downstream invalidation, and state reload, and do not carry into new workflows.
+
+Each Reviewer list authorizes only its named operation: `filesToCreate` permits creation, `filesToModify` permits modification, and `filesToDelete` permits deletion. A different operation on the same path requires its own user approval.
 
 ### Context7
 

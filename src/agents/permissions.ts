@@ -17,6 +17,7 @@ import {
 import { createHash } from "node:crypto";
 import type { Role, Contract } from "./schemas.ts";
 import type { TeamConfig } from "../config/schema.ts";
+import type { WorkflowState } from "../workflow/state.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { serenaCapability, serenaRead, serenaWrite } from "./serena-policy.ts";
 export { serenaRead, serenaWrite } from "./serena-policy.ts";
@@ -38,6 +39,11 @@ export function allowedTools(role: Role, config: TeamConfig) {
   )
     tools.push("edit", "write");
   if (role === "implementor") tools.push("team_delete");
+  if (
+    role === "implementor" ||
+    (role === "tester" && config.tester.mayModifyTests)
+  )
+    tools.push("team_request_contract_path");
   if (
     role === "implementor" ||
     role === "tester" ||
@@ -71,6 +77,45 @@ export function contractPaths(contract?: Contract) {
         ...contract.filesToDelete,
       ]
     : [];
+}
+export type ContractOperation = "create" | "modify" | "delete";
+export function isContractOperationAllowed(
+  contract: Contract | undefined,
+  path: string,
+  operation: ContractOperation,
+): boolean {
+  if (!contract) return false;
+  switch (operation) {
+    case "create":
+      return contract.filesToCreate.includes(path);
+    case "modify":
+      return contract.filesToModify.includes(path);
+    case "delete":
+      return contract.filesToDelete.includes(path);
+  }
+}
+export type ContractPathApproval = {
+  path: string;
+  operation: ContractOperation;
+};
+export function effectiveContractPaths(
+  contract: Contract | undefined,
+  approvals: ContractPathApproval[] = [],
+) {
+  return [
+    ...new Set([...contractPaths(contract), ...approvals.map((a) => a.path)]),
+  ];
+}
+export function workflowScopePaths(s: WorkflowState): string[] {
+  return [
+    ...new Set([
+      ...effectiveContractPaths(
+        s.results.reviewer as Contract | undefined,
+        s.workflowApprovedContractPaths,
+      ),
+      ...s.completedOneShotContractPaths,
+    ]),
+  ];
 }
 export function contractIdentity(contract: Contract): string {
   return createHash("sha256").update(JSON.stringify(contract)).digest("hex");
@@ -110,6 +155,20 @@ export async function assertWithin(cwd: string, path: string) {
     }
   }
 }
+export async function validateContractPathRequest(cwd: string, path: string) {
+  assertRelative(path);
+  const key = policyPath(path);
+  if (key !== path || /[?*\[\]]/.test(path))
+    throw new Error(
+      "Contract approval requires an exact normalized repository-relative path",
+    );
+  const actual = await assertWithin(cwd, path);
+  if (policyPath(actual) !== key || classifyPath(path) === "forbidden")
+    throw new Error(
+      "Contract path is outside the approved repository boundary",
+    );
+  return key;
+}
 export async function validateContractPaths(cwd: string, contract: Contract) {
   for (const path of contractPaths(contract)) {
     assertRelative(path);
@@ -139,6 +198,11 @@ export async function checkTool(
       operation: "read" | "write",
       path: string,
     ) => Promise<boolean>;
+    workflowContractApprovals?: ContractPathApproval[];
+    consumeContractOnce?: (
+      operation: ContractOperation,
+      path: string,
+    ) => boolean;
   },
 ) {
   const serenaScope = name.startsWith("serena_")
@@ -176,7 +240,12 @@ export async function checkTool(
     throw new Error(
       "Access denied: grep requires a specific non-sensitive file.",
     );
-  const path = serenaScope ? input.relative_path : input.path;
+  const path =
+    name === "team_request_contract_path"
+      ? undefined
+      : serenaScope
+        ? input.relative_path
+        : input.path;
   let actualPath: string | undefined;
   if (typeof path === "string") {
     actualPath = await assertWithin(cwd, path);
@@ -204,20 +273,36 @@ export async function checkTool(
       !dirtyPolicy.approvedDirtyPaths.includes(path)
     )
       throw new Error("Pre-existing dirty path requires explicit approval");
+    const operation: ContractOperation =
+      name === "team_delete"
+        ? "delete"
+        : name === "edit"
+          ? "modify"
+          : await stat(join(cwd, actualPath!)).then(
+              () => "modify" as const,
+              (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT") throw error;
+                return "create" as const;
+              },
+            );
     if (role === "tester") {
       if (
         !config.tester.mayModifyTests ||
-        !config.tester.testPaths.some((prefix) => isWithinPath(path, prefix)) ||
-        !contractPaths(contract).some(
-          (allowed) => policyPath(allowed) === policyPath(path),
-        )
+        !config.tester.testPaths.some((prefix) => isWithinPath(path, prefix))
       )
         throw new Error("Tester may only modify configured test paths");
-    } else if (!contractPaths(contract).includes(path))
-      throw new Error(`Path not in implementation contract: ${path}`);
-    if (name === "team_delete" && !contract?.filesToDelete.includes(path))
+    }
+    const inContract = isContractOperationAllowed(contract, path, operation);
+    const approved = dirtyPolicy?.workflowContractApprovals?.some(
+      (item) => item.operation === operation && item.path === path,
+    );
+    if (
+      !inContract &&
+      !approved &&
+      !dirtyPolicy?.consumeContractOnce?.(operation, path)
+    )
       throw new Error(
-        "Deletion requires filesToDelete in the implementation contract",
+        `Path not in implementation contract: ${path}. Call team_request_contract_path with the path, ${operation} operation, and a concise reason before retrying.`,
       );
     // Cross-file rename/delete can exceed the contract: use explicit edit operations instead.
     if (["serena_rename_symbol", "serena_safe_delete_symbol"].includes(name))

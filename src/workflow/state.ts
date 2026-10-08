@@ -48,6 +48,7 @@ export const approvalSchema = z.object({
     "manualRetry",
     "runtimeCommand",
     "runtimeFile",
+    "contractPath",
     "sensitivePaths",
     "orphanedImplementation",
     "securityRisk",
@@ -249,6 +250,32 @@ export const stateSchema = z.object({
           role: z.enum(roles),
           operation: z.enum(["read", "write"]),
           path: exactPath,
+        })
+        .strict(),
+    )
+    .default([]),
+  workflowApprovedContractPaths: z
+    .array(
+      z
+        .object({
+          path: exactPath,
+          operation: z.enum(["create", "modify", "delete"]),
+        })
+        .strict(),
+    )
+    .default([]),
+  completedOneShotContractPaths: z.array(exactPath).default([]),
+  pendingContractPaths: z
+    .array(
+      z
+        .object({
+          workflowId: z.string().uuid(),
+          agentId: z.enum(roles),
+          run: z.number().int().positive(),
+          requestId: z.string().uuid(),
+          path: exactPath,
+          operation: z.enum(["create", "modify", "delete"]),
+          reason: z.string().min(1).max(500),
         })
         .strict(),
     )
@@ -553,6 +580,18 @@ export function validateState(value: unknown): WorkflowState {
   for (const approval of state.runtimeFileApprovals)
     if (policyPath(approval.path) !== approval.path)
       throw new Error("Runtime file approval identity mismatch");
+  for (const pending of state.pendingContractPaths)
+    if (
+      pending.workflowId !== state.id ||
+      policyPath(pending.path) !== pending.path
+    )
+      throw new Error("Pending contract path identity mismatch");
+  for (const approval of state.workflowApprovedContractPaths)
+    if (policyPath(approval.path) !== approval.path)
+      throw new Error("Contract path approval identity mismatch");
+  for (const path of state.completedOneShotContractPaths)
+    if (policyPath(path) !== path)
+      throw new Error("One-shot contract mutation identity mismatch");
   for (const path of state.approvedDirtyPaths)
     if (!state.baseline.dirtyPaths.includes(path))
       throw new Error("Approved dirty path is not in the baseline");
@@ -599,6 +638,9 @@ export function newState(
     pendingRuntimeCommands: [],
     runtimeFileApprovals: [],
     pendingRuntimeFiles: [],
+    workflowApprovedContractPaths: [],
+    completedOneShotContractPaths: [],
+    pendingContractPaths: [],
     approvedDirtyPaths: [],
     approvedSensitivePaths: [],
     commandApprovalComplete: false,

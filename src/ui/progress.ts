@@ -471,6 +471,10 @@ export function renderProgress(
     lines.push(
       `◉ Waiting for user approval: ${getAgentDisplayName(state.config, request.agentId)} requests ${request.operation} access to ${request.path}`,
     );
+  for (const request of state.pendingContractPaths ?? [])
+    lines.push(
+      `◉ Waiting for user approval: ${getAgentDisplayName(state.config, request.agentId)} requests ${request.operation} of ${request.path}\n  Reason: ${request.reason}`,
+    );
   if (state.pendingResearchQuestions?.length)
     lines.push(
       `Pending research questions: ${state.pendingResearchQuestions.length}`,

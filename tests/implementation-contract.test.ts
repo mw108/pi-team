@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { contractSchema, parseResult } from "../src/agents/schemas.ts";
@@ -191,6 +191,8 @@ test("forbidden contracts fail before implementation; sensitive edits need exact
     assert.throws(() => parse([], [path]), /repository-relative/);
   const sensitive = parse([], ["package.json", ".github/workflows/test.yml"]);
   await validateContractPaths(cwd, sensitive);
+  await mkdir(join(cwd, ".github/workflows"), { recursive: true });
+  await writeFile(join(cwd, ".github/workflows/test.yml"), "name: test\n");
   await assert.rejects(
     () =>
       checkTool(

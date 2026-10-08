@@ -38,6 +38,8 @@ export async function contextFor(
         "Code review → optional Pentest → Security Review → Tester → Commit Agent. A commit is forbidden until all earlier enabled gates pass.",
     },
   };
+  if (s.workflowApprovedContractPaths.length)
+    context.workflowApprovedContractPaths = s.workflowApprovedContractPaths;
   if (s.projectInstructions)
     context.projectInstructions = projectInstructionsForAgent(
       s.projectInstructions,

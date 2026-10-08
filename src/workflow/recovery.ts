@@ -1,7 +1,7 @@
 import { loadConfig } from "../config/loader.ts";
 import { analyzeConfigDrift, driftSummary } from "../config/drift.ts";
 import { contractSchema, type Role } from "../agents/schemas.ts";
-import { contractPaths } from "../agents/permissions.ts";
+import { workflowScopePaths } from "../agents/permissions.ts";
 import {
   dirtyPaths,
   gateSnapshot,
@@ -38,6 +38,7 @@ export function pendingFixRequirements(
     state.pendingResearchQuestions?.length ||
     state.pendingRuntimeCommands.length ||
     state.pendingRuntimeFiles.length ||
+    state.pendingContractPaths.length ||
     state.inFlight ||
     state.manualRetry ||
     state.driftCandidate
@@ -426,7 +427,8 @@ async function planWorkflowRecovery(
     !state.pendingQuestion &&
     !state.pendingResearchQuestions?.length &&
     !state.pendingRuntimeCommands?.length &&
-    !state.pendingRuntimeFiles?.length
+    !state.pendingRuntimeFiles?.length &&
+    !state.pendingContractPaths?.length
   )
     return {
       kind: "continue",
@@ -442,13 +444,15 @@ async function planWorkflowRecovery(
     state.pendingQuestion ||
     state.pendingApproval ||
     state.pendingRuntimeCommands?.length ||
-    state.pendingRuntimeFiles?.length
+    state.pendingRuntimeFiles?.length ||
+    state.pendingContractPaths?.length
   )
     return {
       kind: "waiting-user",
       reason:
         state.pendingRuntimeCommands?.length ||
-        state.pendingRuntimeFiles?.length
+        state.pendingRuntimeFiles?.length ||
+        state.pendingContractPaths?.length
           ? "Waiting for tool approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
           : "Workflow is waiting for user input.",
     };
@@ -868,7 +872,7 @@ async function planWorkflowRecovery(
     }
     const allowed = new Set([
       ...state.baseline.dirtyPaths,
-      ...contractPaths(contractSchema.parse(state.results.reviewer)),
+      ...workflowScopePaths(state),
     ]);
     if (
       (await dirtyPaths(cwd)).some(

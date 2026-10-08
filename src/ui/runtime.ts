@@ -194,7 +194,10 @@ export class ProgressRuntime {
   bind(state: WorkflowState) {
     if (this.disposed) return;
     this.state = state;
-    if (["WAITING_USER", "BLOCKED", "DONE"].includes(state.phase))
+    if (
+      ["WAITING_USER", "BLOCKED", "DONE"].includes(state.phase) &&
+      !(state.phase === "WAITING_USER" && state.pendingContractPaths.length)
+    )
       for (const agent of Object.values(this.agents))
         if (agent.status === "running") {
           agent.status = state.phase === "BLOCKED" ? "failed" : "stopped";

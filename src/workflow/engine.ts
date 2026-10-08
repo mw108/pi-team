@@ -31,7 +31,10 @@ import {
   assertRelative,
   contractIdentity,
   contractPaths,
+  isContractOperationAllowed,
+  workflowScopePaths,
   validateContractPaths,
+  validateContractPathRequest,
 } from "../agents/permissions.ts";
 import {
   classifyPath,
@@ -568,6 +571,7 @@ export class WorkflowEngine {
         state.pendingQuestion ||
         state.pendingRuntimeCommands.length ||
         state.pendingRuntimeFiles.length ||
+        state.pendingContractPaths.length ||
         state.driftCandidate
       )
         throw new Error(
@@ -1394,6 +1398,8 @@ export class WorkflowEngine {
           delete authoritative.manualRetry;
           await this.store.save(authoritative);
         }
+        const contractOnce = new Map<string, number>();
+        const consumedContractOnce = new Set<string>();
         const result = parseResult(
           role,
           await this.runner.run(
@@ -1828,6 +1834,71 @@ export class WorkflowEngine {
                 if (block.type === "toolCall")
                   modelToolRequests.set(block.id, providerRequest);
             },
+            {
+              request: async (operation, path, reason, requestSignal) => {
+                if (!reason.trim() || reason.length > 500)
+                  throw new Error(
+                    "Contract path request requires a concise reason (1–500 characters)",
+                  );
+                if (!["create", "modify", "delete"].includes(operation))
+                  throw new Error("Invalid contract path operation");
+                const key = await validateContractPathRequest(this.cwd, path);
+                if (
+                  role === "tester" &&
+                  (!s.config.tester.mayModifyTests ||
+                    operation === "delete" ||
+                    !s.config.tester.testPaths.some((prefix) =>
+                      isWithinPath(path, prefix),
+                    ))
+                )
+                  throw new Error(
+                    "Tester may only modify configured test paths",
+                  );
+                const contract = s.results.reviewer
+                  ? contractSchema.parse(s.results.reviewer)
+                  : undefined;
+                const already = isContractOperationAllowed(
+                  contract,
+                  path,
+                  operation,
+                );
+                if (
+                  already ||
+                  authoritative.workflowApprovedContractPaths.some(
+                    (item) => item.path === key && item.operation === operation,
+                  )
+                )
+                  return true;
+                const choice = await this.commandApprovals.approveContractPath(
+                  authoritative,
+                  role,
+                  control,
+                  operation,
+                  key,
+                  reason.trim(),
+                  requestSignal,
+                  (event) => logged?.logger.append(event),
+                );
+                if (choice === "once") {
+                  const token = `${operation}:${key}`;
+                  contractOnce.set(token, (contractOnce.get(token) ?? 0) + 1);
+                } else if (choice === "workflow")
+                  s.workflowApprovedContractPaths = structuredClone(
+                    authoritative.workflowApprovedContractPaths,
+                  );
+                return choice !== "deny";
+              },
+              consumeOnce: (operation, path) => {
+                const token = `${operation}:${path}`;
+                const count = contractOnce.get(token) ?? 0;
+                if (!count || control.intention || control.settled)
+                  return false;
+                if (count === 1) contractOnce.delete(token);
+                else contractOnce.set(token, count - 1);
+                consumedContractOnce.add(path);
+                return true;
+              },
+            },
             (operation, path, fileSignal) =>
               this.commandApprovals.approveFile(
                 authoritative,
@@ -1842,6 +1913,17 @@ export class WorkflowEngine {
                 (event) => logged?.logger.append(event),
               ),
             async (mutation: ObservedFileMutation) => {
+              if (
+                consumedContractOnce.delete(policyPath(mutation.path)) &&
+                !authoritative.completedOneShotContractPaths.includes(
+                  policyPath(mutation.path),
+                )
+              ) {
+                authoritative.completedOneShotContractPaths.push(
+                  policyPath(mutation.path),
+                );
+                await this.store.save(authoritative);
+              }
               if (role !== "implementor") return;
               const recordItem = { attempt: attemptNumber, ...mutation };
               if (
@@ -2297,6 +2379,62 @@ export class WorkflowEngine {
         for (const key of Object.keys(s))
           delete (s as Record<string, unknown>)[key];
         Object.assign(s, latest);
+      }
+      // A process restart loses the suspended agent session. A workflow grant
+      // survives; a one-shot grant cannot be replayed without its tool call.
+      if (s.pendingContractPaths.length && this.activeAttempts.size === 0) {
+        for (const pending of [...s.pendingContractPaths]) {
+          if (signal?.aborted) break;
+          const request = this.commandApprovals.contractPathPrompt(
+            s,
+            pending.agentId,
+            pending.operation,
+            pending.path,
+            pending.reason,
+          );
+          request.prompt +=
+            "\n\nThe requesting agent session ended. This decision will not execute the mutation; retry the agent after recovery.";
+          request.options = request.options.filter(
+            (option) => option.value !== "allow_once",
+          );
+          const selected = await this.ui.approve?.(request);
+          const choice = selected?.length === 1 ? selected[0] : undefined;
+          if (
+            !choice ||
+            !request.options.some((option) => option.value === choice)
+          )
+            break;
+          if (
+            choice === "allow_workflow" &&
+            !s.workflowApprovedContractPaths.some(
+              (item) =>
+                item.path === pending.path &&
+                item.operation === pending.operation,
+            )
+          )
+            s.workflowApprovedContractPaths.push({
+              path: pending.path,
+              operation: pending.operation,
+            });
+          s.pendingContractPaths = s.pendingContractPaths.filter(
+            (item) => item.requestId !== pending.requestId,
+          );
+          record(
+            s,
+            choice === "deny"
+              ? "contract_path_approval_denied"
+              : "contract_path_approval_granted_workflow",
+            `${pending.agentId} ${pending.operation} ${pending.path}: ${choice}`,
+            { agent: pending.agentId, attempt: pending.run },
+          );
+          await this.store.save(s);
+        }
+        if (s.pendingContractPaths.length) {
+          this.ui.progress(s);
+          return s;
+        }
+        if (s.phase === "WAITING_USER")
+          s.phase = s.inFlight?.phase ?? "IMPLEMENT";
       }
       // A process restart loses the suspended agent session. Re-present saved
       // requests without ever replaying the command or consuming an allow-once grant.
@@ -2760,9 +2898,7 @@ export class WorkflowEngine {
                 assertRelative(path);
                 if (
                   !s.baseline.dirtyPaths.includes(path) ||
-                  !contractPaths(
-                    contractSchema.parse(s.results.reviewer),
-                  ).includes(path)
+                  !workflowScopePaths(s).includes(path)
                 )
                   throw new Error(
                     "Dirty-path approval is outside the contract/baseline",
@@ -2781,7 +2917,7 @@ export class WorkflowEngine {
               const identity = contractIdentity(contract);
               const required = [
                 ...new Set(
-                  contractPaths(contract)
+                  workflowScopePaths(s)
                     .filter(
                       (path) => classifyPath(path) === "requires_user_approval",
                     )
@@ -2976,7 +3112,7 @@ export class WorkflowEngine {
         }
         if (s.phase === "IMPLEMENT") {
           const contract = contractSchema.parse(s.results.reviewer);
-          const paths = contractPaths(contract);
+          const paths = workflowScopePaths(s);
           await validateContractPaths(this.cwd, contract);
           const identity = contractIdentity(contract);
           if (s.sensitiveApprovalContractHash !== identity) {
@@ -3078,9 +3214,7 @@ export class WorkflowEngine {
           s.gateHashes = snapshot;
         }
         if (s.phase === "COMMIT") {
-          const overlap = contractPaths(
-            contractSchema.parse(s.results.reviewer),
-          ).filter(
+          const overlap = workflowScopePaths(s).filter(
             (path) =>
               s.baseline.dirtyPaths.includes(path) &&
               !isNonCommittablePath(s.config, path),
@@ -3173,7 +3307,7 @@ export class WorkflowEngine {
           const contract = contractSchema.parse(s.results.reviewer);
           s.implementationStartHashes = await hashes(
             this.cwd,
-            contractPaths(contract),
+            workflowScopePaths(s),
           );
         }
         const manualAtStart = new Set<Role>([
@@ -3202,6 +3336,12 @@ export class WorkflowEngine {
             };
           }),
         );
+        if (s.pendingContractPaths.length) {
+          s.phase = "WAITING_USER";
+          await this.store.save(s);
+          this.ui.progress(s);
+          break;
+        }
         if (s.pendingRuntimeCommands.length || s.pendingRuntimeFiles.length) {
           const waiting = [
             ...new Set(
@@ -3483,7 +3623,7 @@ export class WorkflowEngine {
           );
           if (changed.length) {
             const contract = contractSchema.parse(s.results.reviewer);
-            const allowed = new Set(contractPaths(contract).map(policyPath));
+            const allowed = new Set(workflowScopePaths(s).map(policyPath));
             const permitted =
               s.config.tester.mayModifyTests &&
               changed.every(
@@ -3567,17 +3707,14 @@ export class WorkflowEngine {
         ) {
           const oldContract = contractSchema.parse(s.results.reviewer);
           const dirty = await dirtyPaths(this.cwd);
-          const oldPaths = new Set(contractPaths(oldContract).map(policyPath));
+          const oldPaths = new Set(workflowScopePaths(s).map(policyPath));
           const baselinePaths = new Set(s.baseline.dirtyPaths.map(policyPath));
           const startHashes = new Map(
             Object.entries(s.implementationStartHashes ?? {}).map(
               ([path, hash]) => [policyPath(path), hash],
             ),
           );
-          const contractAfter = await hashes(
-            this.cwd,
-            contractPaths(oldContract),
-          );
+          const contractAfter = await hashes(this.cwd, workflowScopePaths(s));
           const contractAfterByIdentity = new Map(
             Object.entries(contractAfter).map(([path, hash]) => [
               policyPath(path),
