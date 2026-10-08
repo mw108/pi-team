@@ -99,7 +99,7 @@ test("structured output rejects other malformed content with typed failures", ()
   );
   assert.equal(recovered, false);
 });
-test("schema correction retry is exactly once and disables actions", async () => {
+test("schema correction keeps the agent session and disables actions", async () => {
   const cwd = await repository();
   const s = newState(cwd, "task", config(), await baseline(cwd));
   let prompts = 0,
@@ -171,7 +171,7 @@ test("Reviewer contract inconsistency triggers output-only correction", async ()
   assert.match(correction, /requiredTests/);
   assert.equal(result.requiredTests[0].file, "tests/math.test.mjs");
 });
-test("persistent malformed output fails after one correction", async () => {
+test("persistent malformed output fails after configured corrections", async () => {
   const cwd = await repository();
   const s = newState(cwd, "task", config(), await baseline(cwd));
   let prompts = 0;
@@ -193,7 +193,7 @@ test("persistent malformed output fails after one correction", async () => {
     (error: unknown) =>
       error instanceof AgentOutputError && error.kind === "parse",
   );
-  assert.equal(prompts, 2);
+  assert.equal(prompts, 3);
 });
 test("malformed final output is counted once and logged with a redacted preview", async () => {
   const cwd = await repository();
@@ -226,7 +226,7 @@ test("malformed final output is counted once and logged with a redacted preview"
       (error as AgentOutputError & { failures: number }).failures === 1 &&
       !/Unexpected token/.test(error.message),
   );
-  assert.equal(prompts, 2);
+  assert.equal(prompts, 3);
   const events = await new AgentLogStore(cwd).read(state.id, "researcher", 1);
   const failure = events.find((event) => event.type === "provider_error")!;
   assert.equal(failure.category, "agent_output");

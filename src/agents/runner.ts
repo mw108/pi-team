@@ -58,6 +58,7 @@ import { commandKey, effectiveConfig } from "./discovery.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
 import {
   AgentOutputError,
+  AgentDoomLoopError,
   AgentTimeoutError,
   getAgentTimeoutMs,
 } from "./errors.ts";
@@ -99,6 +100,17 @@ export type ActivityObserver = (
   result?: unknown,
 ) => void;
 export type OutputObserver = (text: string) => void;
+export type SchemaRepairEvent = {
+  type:
+    | "schema_repair_started"
+    | "schema_repair_failed"
+    | "schema_repair_succeeded"
+    | "schema_repair_exhausted";
+  repairAttempt: number;
+  maxSchemaRepairAttempts: number;
+  failureType: "parse" | "schema" | "finalization";
+  diagnostic?: string;
+};
 export type RuntimeFileApprover = (
   operation: "read" | "write",
   path: string,
@@ -266,6 +278,7 @@ export interface AgentRunner {
       message: AssistantMessage,
       providerRequest: number,
     ) => void,
+    schemaRepair?: (event: SchemaRepairEvent) => void,
     contractApproval?: RuntimeContractApprover,
     fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
@@ -417,10 +430,9 @@ export class PiRunner implements AgentRunner {
         return message === event.message ? undefined : { message };
       });
       pi.on("message_end", async (event) => {
-        if (event.message.role !== "assistant") return;
+        if (event.message.role !== "assistant" || outputRepairActive) return;
         const recovered = recoverTextualToolCallMessage(role, event.message);
         if (!recovered) return;
-        outputRepairActive = false;
         try {
           providerEvent?.({
             type: "textual_tool_call_recovered",
@@ -612,6 +624,7 @@ export class PiRunner implements AgentRunner {
       message: AssistantMessage,
       providerRequest: number,
     ) => void,
+    schemaRepair?: (event: SchemaRepairEvent) => void,
     contractApproval?: RuntimeContractApprover,
     fileApproval?: RuntimeFileApprover,
     mutationObserver?: MutationObserver,
@@ -820,6 +833,11 @@ export class PiRunner implements AgentRunner {
       if (last?.stopReason === "error" || last?.stopReason === "aborted")
         throw new Error(last.errorMessage ?? `Provider ${last.stopReason}`);
       let result: any;
+      let schemaRepairAttempts = 0;
+      let repairPending = false;
+      let lastOutputFailureType: SchemaRepairEvent["failureType"] = "schema";
+      const maxSchemaRepairAttempts =
+        state.config.workflow.maxSchemaRepairAttempts;
       const parseFinal = () => {
         const text = session.getLastAssistantText() ?? "";
         const trimmed = text.trimStart();
@@ -836,32 +854,110 @@ export class PiRunner implements AgentRunner {
           );
         return parseText(role, text, outputRecovered);
       };
-      try {
-        result = parseFinal();
-        if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
-          await validateContractPaths(state.cwd, result);
-      } catch (error) {
-        // Correction is output-only: never replay writes or commands because of malformed JSON.
-        const prepareOutputRepair = this.outputRepair.get(session);
-        if (prepareOutputRepair) prepareOutputRepair();
-        else session.setActiveToolsByName([]);
-        const required = (zodToJsonSchema(resultSchemas[role]) as any).required;
-        await session.prompt(
-          `Your previous final response did not match the required ${role} schema. Diagnostic: ${redactVisibleText(String(error instanceof AgentOutputError ? (error.diagnostic ?? error.message) : error).slice(0, 1000))}. Tools are now disabled. Return only the required JSON object with these fields: ${JSON.stringify(required)}. Do not use Markdown fences. Do not call tools or output <tool_call> markup. Do not include commentary before or after the JSON. If required work could not be completed, return the role's blocked or failure status where supported. Required instance schema: ${JSON.stringify(zodToJsonSchema(resultSchemas[role]))}.`,
-          { expandPromptTemplates: false },
-        );
-        if (timedOut && timeoutMs !== undefined)
-          throw new AgentTimeoutError(role, timeoutMs, attempt);
-        if (signal?.aborted)
-          throw new Error("Agent interrupted during schema correction");
-        try {
-          result = parseFinal();
-        } catch (finalError) {
-          throw finalError;
+      const validateFinal = async () => {
+        while (true) {
+          try {
+            result = parseFinal();
+            if (role === "reviewer" && result.type !== "QUESTION_REQUEST") {
+              try {
+                await validateContractPaths(state.cwd, result);
+              } catch (error) {
+                if (error && typeof error === "object" && "code" in error)
+                  throw error;
+                throw new AgentOutputError(
+                  "schema",
+                  role,
+                  redactVisibleText(
+                    (session.getLastAssistantText() ?? "").slice(0, 2048),
+                  ),
+                  false,
+                  redactVisibleText(String(error)).slice(0, 1500),
+                );
+              }
+            }
+            if (repairPending)
+              schemaRepair?.({
+                type: "schema_repair_succeeded",
+                repairAttempt: schemaRepairAttempts,
+                maxSchemaRepairAttempts,
+                failureType: lastOutputFailureType,
+              });
+            repairPending = false;
+            break;
+          } catch (error) {
+            if (!(error instanceof AgentOutputError)) throw error;
+            const diagnostic = redactVisibleText(
+              error.diagnostic ?? error.message,
+            ).slice(0, 1500);
+            const failureType = error.kind;
+            lastOutputFailureType = failureType;
+            if (repairPending)
+              schemaRepair?.({
+                type: "schema_repair_failed",
+                repairAttempt: schemaRepairAttempts,
+                maxSchemaRepairAttempts,
+                failureType,
+                diagnostic,
+              });
+            if (
+              maxSchemaRepairAttempts !== 0 &&
+              schemaRepairAttempts >= maxSchemaRepairAttempts
+            ) {
+              schemaRepair?.({
+                type: "schema_repair_exhausted",
+                repairAttempt: schemaRepairAttempts,
+                maxSchemaRepairAttempts,
+                failureType,
+                diagnostic,
+              });
+              throw error;
+            }
+            if (
+              guard.repeatedInvalidFinalOutput(
+                session.getLastAssistantText() ?? "",
+              )
+            )
+              throw new AgentDoomLoopError(
+                role,
+                attempt,
+                guard.interventions,
+                "invalid_output",
+              );
+            schemaRepairAttempts++;
+            repairPending = true;
+            schemaRepair?.({
+              type: "schema_repair_started",
+              repairAttempt: schemaRepairAttempts,
+              maxSchemaRepairAttempts,
+              failureType,
+              diagnostic,
+            });
+            // Keep the same Pi session and timeout, but prohibit tool replay.
+            const prepareOutputRepair = this.outputRepair.get(session);
+            if (prepareOutputRepair) prepareOutputRepair();
+            else session.setActiveToolsByName([]);
+            await session.prompt(
+              `Your previous final output failed validation.\n\nFailure type: ${failureType === "parse" ? "JSON_PARSE_ERROR" : "SCHEMA_VALIDATION_ERROR"}\nValidation errors:\n${diagnostic}\n\nCorrect your previous final output. Preserve the original task and its intent. Fix every reported error and keep related fields consistent. Return the complete corrected JSON matching the original output schema exactly. Do not return a partial patch, diff, explanations, Markdown fences, or commentary. Do not omit required fields to bypass validation. Tools are disabled during this correction; use your existing context.`,
+              { expandPromptTemplates: false },
+            );
+            if (timedOut && timeoutMs !== undefined)
+              throw new AgentTimeoutError(role, timeoutMs, attempt);
+            if (signal?.aborted || executionSignal?.aborted)
+              throw new Error("Agent interrupted during schema correction");
+            const latest = session.messages
+              .filter((message) => message.role === "assistant")
+              .at(-1) as any;
+            if (
+              latest?.stopReason === "error" ||
+              latest?.stopReason === "aborted"
+            )
+              throw new Error(
+                latest.errorMessage ?? `Provider ${latest.stopReason}`,
+              );
+          }
         }
-        if (role === "reviewer" && result.type !== "QUESTION_REQUEST")
-          await validateContractPaths(state.cwd, result);
-      }
+      };
+      await validateFinal();
       if (
         role === "tester" &&
         result.type === "QUESTION_REQUEST" &&
@@ -873,7 +969,18 @@ export class PiRunner implements AgentRunner {
           "Command authorization is handled by the host. Call team_command with the required executable and argv now. Use current verifiedCommandResults for checks already run. Do not ask the user for command IDs or command output. If a command is denied, return status BLOCKED with its reason.",
           { expandPromptTemplates: false },
         );
-        result = parseFinal();
+        if (timedOut && timeoutMs !== undefined)
+          throw new AgentTimeoutError(role, timeoutMs, attempt);
+        if (signal?.aborted || executionSignal?.aborted)
+          throw new Error("Agent interrupted during Tester correction");
+        const latest = session.messages
+          .filter((message) => message.role === "assistant")
+          .at(-1) as any;
+        if (latest?.stopReason === "error" || latest?.stopReason === "aborted")
+          throw new Error(
+            latest.errorMessage ?? `Provider ${latest.stopReason}`,
+          );
+        await validateFinal();
         if (result.type === "QUESTION_REQUEST")
           result = {
             status: "BLOCKED",

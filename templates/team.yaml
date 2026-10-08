@@ -6,6 +6,7 @@ workflow:
   maxLocalFixCycles: 5
   maxPentestCycles: 2
   maxAgentFailures: 2
+  maxSchemaRepairAttempts: 2 # additional corrections; 0 means unlimited
   maxQuestions: 5
   maxResearchClarifications: 5
   agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout

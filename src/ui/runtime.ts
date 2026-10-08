@@ -2,7 +2,7 @@ import type { Role } from "../agents/schemas.ts";
 import type { WorkflowState } from "../workflow/state.ts";
 import { formatToolActivity } from "./activity.ts";
 import type { CommandSummary } from "../agents/command-observability.ts";
-import type { GuardEvent } from "../agents/runner.ts";
+import type { GuardEvent, SchemaRepairEvent } from "../agents/runner.ts";
 import type { ContextUsage } from "@earendil-works/pi-coding-agent";
 import type { ActiveSessionRegistry } from "../agents/active-sessions.ts";
 import type {
@@ -125,7 +125,8 @@ export type AgentEvent =
     }
   | { type: "activityEnd"; role: Role; toolCallId?: string }
   | { type: "commandApproved"; role: Role; command: CommandSummary }
-  | { type: "guard"; role: Role; event: GuardEvent };
+  | { type: "guard"; role: Role; event: GuardEvent }
+  | { type: "schemaRepair"; role: Role; event: SchemaRepairEvent };
 
 function interval(callback: () => void, ms: number) {
   const timer = setInterval(callback, ms);
@@ -284,7 +285,13 @@ export class ProgressRuntime {
             ? existing?.previousFailure
             : undefined,
       };
-    else if (event.type === "steer" && existing)
+    else if (event.type === "schemaRepair" && existing) {
+      existing.controlActivity =
+        event.event.type === "schema_repair_started" ||
+        event.event.type === "schema_repair_failed"
+          ? `schema repair ${event.event.repairAttempt}${event.event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.event.maxSchemaRepairAttempts}`}`
+          : undefined;
+    } else if (event.type === "steer" && existing)
       existing.controlActivity = "Steering message queued";
     else if (event.type === "guard" && existing) {
       if (event.event.type === "doom_loop_detected") {

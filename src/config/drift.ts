@@ -20,6 +20,7 @@ const runtimeWorkflow = new Set([
   "maxLocalFixCycles",
   "maxPentestCycles",
   "maxAgentFailures",
+  "maxSchemaRepairAttempts",
   "maxResearchClarifications",
   "maxToolCalls",
   "agentTimeoutMs",

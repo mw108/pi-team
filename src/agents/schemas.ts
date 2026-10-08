@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { posix } from "node:path";
 import { assertRelative } from "./permissions.ts";
 import { AgentOutputError } from "./errors.ts";
@@ -442,7 +442,7 @@ export function parseText<R extends Role>(
         role,
         preview,
         false,
-        redactVisibleText(String(error).slice(0, 1000)),
+        schemaDiagnostic(error),
       );
     }
     onRecovered?.({
@@ -460,7 +460,34 @@ export function parseText<R extends Role>(
       role,
       preview,
       false,
-      redactVisibleText(String(error).slice(0, 1000)),
+      schemaDiagnostic(error),
     );
   }
+}
+
+function schemaDiagnostic(error: unknown): string {
+  if (!(error instanceof ZodError))
+    return redactVisibleText(String(error)).slice(0, 1500);
+  const issues = error.issues.slice(0, 12).map((issue) => {
+    const path = issue.path.reduce<string>(
+      (result, part) =>
+        typeof part === "number"
+          ? `${result}[${part}]`
+          : result
+            ? `${result}.${part}`
+            : part,
+      "",
+    );
+    const constraint =
+      issue.code === "invalid_type"
+        ? ` (expected ${issue.expected}, received ${issue.received})`
+        : "";
+    return `${path || "(root)"}: ${issue.message}${constraint}`;
+  });
+  if (error.issues.length > issues.length)
+    issues.push(
+      `... ${error.issues.length - issues.length} more issues omitted`,
+    );
+  const safe = redactVisibleText(issues.join("\n"));
+  return safe.length > 1500 ? `${safe.slice(0, 1480)}… (truncated)` : safe;
 }

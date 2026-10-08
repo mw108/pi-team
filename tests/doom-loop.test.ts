@@ -1105,7 +1105,7 @@ test("pseudo tool-call final result becomes a typed finalization failure", async
       /team_command|tool call/.test(error.message) &&
       !/Unexpected token/.test(error.message),
   );
-  assert.equal(promptCount, 2);
+  assert.equal(promptCount, 3);
   assert.equal(messages.length, 3);
   assert.ok(disabled >= 1);
 });

@@ -300,6 +300,8 @@ export class ToolUseGuard {
   toolsDisabledForFinalization = false;
   finalizationReason?: "doom_loop" | "tool_budget";
   private lastInvalidCommand?: string;
+  private lastInvalidFinalHash?: string;
+  private identicalInvalidFinals = 0;
   constructor(
     private readonly config: ReturnType<typeof resolveDoomLoop>,
     private readonly maxToolCalls: number,
@@ -314,6 +316,26 @@ export class ToolUseGuard {
   resetHistory() {
     this.detector.clear();
     this.pendingMutations.clear();
+    this.lastInvalidFinalHash = undefined;
+    this.identicalInvalidFinals = 0;
+  }
+  /** Observe final-output repairs without retaining or logging the model's text. */
+  repeatedInvalidFinalOutput(text: string): boolean {
+    if (!this.config.enabled) return false;
+    const hash = createHash("sha256").update(text).digest("hex");
+    this.identicalInvalidFinals =
+      hash === this.lastInvalidFinalHash ? this.identicalInvalidFinals + 1 : 1;
+    this.lastInvalidFinalHash = hash;
+    if (this.identicalInvalidFinals < this.config.maxIdenticalCalls)
+      return false;
+    this.event?.({
+      type: "doom_loop_detected",
+      patternType: "identical",
+      tool: "final_output",
+      repeatCount: this.identicalInvalidFinals,
+      progressEpoch: 0,
+    });
+    return true;
   }
   get streamToolCallLimit() {
     return this.config.enabled ? this.config.maxToolCallsPerResponse : 0;

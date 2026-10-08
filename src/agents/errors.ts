@@ -31,9 +31,12 @@ export class AgentDoomLoopError extends Error {
     readonly agentId: Role,
     readonly attempt: number,
     readonly interventions: number,
+    readonly reason: "tool_calls" | "invalid_output" = "tool_calls",
   ) {
     super(
-      `${agentId} run ${attempt} could not finalize after ${interventions} doom-loop interventions`,
+      reason === "invalid_output"
+        ? `${agentId} run ${attempt} repeated the same invalid final output without progress`
+        : `${agentId} run ${attempt} could not finalize after ${interventions} doom-loop interventions`,
     );
     this.name = "AgentDoomLoopError";
   }

@@ -165,6 +165,7 @@ export const configSchema = z
         maxLocalFixCycles: z.number().int().min(0).default(5),
         maxPentestCycles: z.number().int().min(1).default(2),
         maxAgentFailures: z.number().int().min(1).default(2),
+        maxSchemaRepairAttempts: z.number().int().min(0).default(2),
         maxQuestions: z.number().int().min(1).default(5),
         maxResearchClarifications: z.number().int().min(0).default(5),
         agentTimeoutMs: z

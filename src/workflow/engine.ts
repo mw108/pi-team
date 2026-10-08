@@ -1869,6 +1869,29 @@ export class WorkflowEngine {
                 if (block.type === "toolCall")
                   modelToolRequests.set(block.id, providerRequest);
             },
+            (event) => {
+              if (control.intention || control.settled) return;
+              const metadata = {
+                agent: role,
+                attempt: attemptNumber,
+                repairAttempt: event.repairAttempt,
+                maxSchemaRepairAttempts: event.maxSchemaRepairAttempts,
+                failureType: event.failureType,
+              };
+              logged?.logger.append({
+                ...event,
+                ...metadata,
+              });
+              networkHistoryWrites.push(
+                this.persistAttempt(
+                  authoritative,
+                  event.type,
+                  `${role} schema repair ${event.repairAttempt}${event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.maxSchemaRepairAttempts}`} ${event.type.slice("schema_repair_".length)}`,
+                  metadata,
+                ),
+              );
+              this.emitAgentEvent({ type: "schemaRepair", role, event });
+            },
             {
               request: async (operation, path, reason, requestSignal) => {
                 if (!reason.trim() || reason.length > 500)
@@ -2093,12 +2116,15 @@ export class WorkflowEngine {
             type: "doom_loop_failed",
             agentAttempt: attemptNumber,
             intervention: e.interventions,
+            reason: e.reason,
           });
           await this.persistAttempt(
             authoritative,
             "doom_loop_failed",
-            `${role} could not finalize after repeated tool loops`,
-            { agent: role, attempt: attemptNumber },
+            e.reason === "invalid_output"
+              ? `${role} repeated an invalid final output without progress`
+              : `${role} could not finalize after repeated tool loops`,
+            { agent: role, attempt: attemptNumber, reason: e.reason },
           );
         }
         const category =
