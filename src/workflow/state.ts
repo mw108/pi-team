@@ -67,6 +67,7 @@ import {
   parseResult,
   questionSchema,
   pentestSchema,
+  persistedTestSchema,
   type WorkflowResults,
 } from "../agents/schemas.ts";
 export const phases = [
@@ -217,6 +218,20 @@ export const stateSchema = z.object({
           sourceOutcome: z.literal("BLOCKED").optional(),
           sourceAttempt: z.number().int().positive().optional(),
           paths: z.array(z.string()).optional(),
+          commandId: z.string().optional(),
+          executionId: z.string().uuid().optional(),
+          category: z
+            .enum([
+              "PASS",
+              "TEST_FAILURE",
+              "INVOCATION_ERROR",
+              "INFRASTRUCTURE_ERROR",
+              "INDETERMINATE",
+            ])
+            .optional(),
+          supersededBy: z.string().uuid().optional(),
+          repositoryVerified: z.boolean().optional(),
+          failedAreas: z.array(z.string()).optional(),
         })
         .optional(),
     }),
@@ -624,12 +639,14 @@ export function validateState(value: unknown): WorkflowState {
       throw new Error("Approved dirty path is not in the baseline");
   for (const [key, result] of Object.entries(state.results))
     if ((roles as readonly string[]).includes(key))
-      parseResult(
-        key as Role,
-        key === "commitAgent" && result && typeof result === "object"
-          ? { message: (result as Record<string, unknown>).message }
-          : result,
-      );
+      key === "tester"
+        ? persistedTestSchema.parse(result)
+        : parseResult(
+            key as Role,
+            key === "commitAgent" && result && typeof result === "object"
+              ? { message: (result as Record<string, unknown>).message }
+              : result,
+          );
   return state;
 }
 export function newState(

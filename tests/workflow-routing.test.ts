@@ -364,7 +364,7 @@ test("failed tests never route to commit", () => {
   s.results.tester = {
     status: "FAIL",
     commands: [{ id: "test", exitCode: 1, output: "failure" }],
-    failedAreas: [],
+    failedAreas: ["test"],
     classification: "FIX_LOCAL",
   };
   transition(s);

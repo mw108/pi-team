@@ -141,6 +141,29 @@ test("finite repair limits count additional requests exactly", async () => {
   }
 });
 
+test("contradictory Tester PASS consumes the shared schema repair limit", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.commands = [];
+  cfg.workflow.maxSchemaRepairAttempts = 2;
+  cfg.workflow.doomLoop.maxIdenticalCalls = 10;
+  const state = newState(cwd, "task", cfg, await baseline(cwd));
+  const bad = JSON.stringify({
+    status: "PASS",
+    commands: [],
+    failedAreas: [],
+    classification: "FIX_LOCAL",
+  });
+  const fake = fixture("tester", [bad, bad, bad]);
+  await assert.rejects(
+    () => fake.runner.run("tester", state),
+    AgentOutputError,
+  );
+  assert.equal(fake.prompts, 3);
+  assert.equal(fake.created, 1);
+  assert.equal(state.localFixCycle, 0);
+});
+
 test("zero allows repairs beyond the default with no numeric cap", async () => {
   const cwd = await repository();
   const cfg = config();

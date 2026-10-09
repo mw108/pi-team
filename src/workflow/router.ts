@@ -263,10 +263,25 @@ export function transition(s: WorkflowState) {
       if (
         r.status === "PASS" &&
         r.commands.length &&
-        r.commands.every((c) => c.exitCode === 0)
+        r.commands.every((c) => c.exitCode === 0) &&
+        !r.failedAreas.length &&
+        !r.classification
       )
         s.phase = afterTests(s);
-      else fix(s, r.classification ?? "FIX_LOCAL");
+      else if (
+        r.status === "FAIL" &&
+        r.classification &&
+        r.failedAreas.length &&
+        r.failedAreas.every((id) =>
+          r.commands.some((c) => c.id === id && c.exitCode !== 0),
+        )
+      )
+        fix(s, r.classification);
+      else
+        block(
+          s,
+          "Testing blocked: Tester result lacks consistent, verified remediation evidence",
+        );
       break;
     }
     case "COMMIT":

@@ -8,8 +8,7 @@ import {
   prepareCommit,
   head,
   git,
-  hashes,
-  dirtyPaths,
+  gateSnapshot,
 } from "../src/workflow/git.ts";
 import { checkTool } from "../src/agents/permissions.ts";
 import { validateState } from "../src/workflow/state.ts";
@@ -52,7 +51,7 @@ test("quality gates are rechecked before hook-enabled commit", async () => {
     "#!/bin/sh\nprintf hook > .git/hook-ran\n",
   );
   await chmod(join(cwd, ".git/hooks/pre-commit"), 0o700);
-  s.gateHashes = await hashes(cwd, await dirtyPaths(cwd));
+  s.gateHashes = await gateSnapshot(s);
   s.commitIntent = await prepareCommit(s, ["math.js"], "fix: addition");
   s.results.tester!.status = "FAIL";
   await assert.rejects(() => createCommit(s), /Testing has not passed/);

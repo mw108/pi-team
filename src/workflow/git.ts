@@ -180,6 +180,11 @@ export async function gateSnapshot(s: WorkflowState) {
       ...Object.keys(s.gateHashes ?? {}),
       ...s.baseline.dirtyPaths,
       ...(contract?.success ? workflowScopePaths(s) : []),
+      ...(contract?.success
+        ? contract.data.requiredTests.flatMap((test) =>
+            test.file ? [test.file] : [],
+          )
+        : []),
     ]),
   ];
   return hashes(s.cwd, paths.sort());

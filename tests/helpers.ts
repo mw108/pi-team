@@ -291,7 +291,9 @@ export class FixtureRunner implements AgentRunner {
         status: commands.every((c) => c.exitCode === 0) ? "PASS" : "FAIL",
         commands,
         failedAreas: commands.filter((c) => c.exitCode).map((c) => c.id),
-        classification: "FIX_LOCAL",
+        ...(commands.some((c) => c.exitCode !== 0)
+          ? { classification: "FIX_LOCAL" }
+          : {}),
       };
     }
     return output(role);

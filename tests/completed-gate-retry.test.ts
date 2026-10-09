@@ -24,7 +24,6 @@ async function blockedTester() {
           reason: "No approved command IDs are available",
           commands: [],
           failedAreas: [],
-          classification: "FIX_LOCAL",
         }
       : undefined,
   );

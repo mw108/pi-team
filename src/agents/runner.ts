@@ -49,10 +49,13 @@ import {
 } from "./schemas.ts";
 import { zodToJsonSchema } from "../integrations/schema.ts";
 import type { WorkflowState } from "../workflow/state.ts";
+import { record } from "../workflow/state.ts";
 import {
+  classifyVerifiedCommand,
   currentVerifiedCommandResults,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  supersedingInvocation,
 } from "../workflow/verified-commands.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
@@ -782,7 +785,9 @@ export class PiRunner implements AgentRunner {
         for (const command of required) {
           if (
             current.some(
-              (result) => result.commandIdentity === commandKey(command),
+              (result) =>
+                result.commandIdentity === commandKey(command) &&
+                result.exitCode === 0,
             )
           )
             continue;
@@ -997,39 +1002,59 @@ export class PiRunner implements AgentRunner {
         const required = effectiveConfig(state).commands.filter((c) =>
           allowedCommandCategories("tester").includes(c.purpose),
         );
-        const selectedIds = new Set([
-          ...required.map((command) => command.id),
-          ...result.commands.map((command: { id: string }) => command.id),
-          ...evidence.map((command) => command.id),
-        ]);
-        const allEvidence = [
-          ...current
-            .filter(
-              (item) =>
-                (selectedIds.has(item.command.id) ||
-                  required.some(
-                    (command) => commandKey(command) === item.commandIdentity,
-                  )) &&
-                allowedCommandCategories("tester").includes(
-                  item.command.purpose as "test" | "static",
-                ),
-            )
-            .map((item) => ({
-              id:
-                required.find(
-                  (command) => commandKey(command) === item.commandIdentity,
-                )?.id ?? item.command.id,
-              exitCode: item.exitCode,
-              output: item.output,
-            })),
-          ...evidence.filter(
-            (item) =>
-              !item.timedOut &&
-              !item.aborted &&
-              item.exitCode >= 0 &&
-              !current.some((stored) => stored.command.id === item.id),
-          ),
-        ];
+        // A model-supplied command ID cannot import another agent's failed run.
+        // Configured checks retain the existing exact-command reuse policy.
+        const selected = current.filter(
+          (item) =>
+            allowedCommandCategories("tester").includes(
+              item.command.purpose as "test" | "static",
+            ) &&
+            (required.some(
+              (command) => commandKey(command) === item.commandIdentity,
+            ) ||
+              (item.agent === "tester" && item.attempt === attempt)),
+        );
+        const authoritative: {
+          item: (typeof current)[number];
+          outcome: ReturnType<typeof classifyVerifiedCommand>;
+          id: string;
+        }[] = [];
+        const supersededIdentities = new Set<string>();
+        for (const item of selected) {
+          const outcome = classifyVerifiedCommand(item);
+          if (outcome.category === "INVOCATION_ERROR") {
+            const superseded = await supersedingInvocation(
+              item,
+              current,
+              state.cwd,
+            );
+            if (superseded) {
+              supersededIdentities.add(item.commandIdentity);
+              record(state, "test_invocation_superseded", outcome.reason, {
+                agent: item.agent,
+                attempt,
+                commandId: item.command.id,
+                executionId: item.executionId,
+                supersededBy: superseded.executionId,
+                repositoryVerified: true,
+              });
+              continue;
+            }
+          }
+          authoritative.push({
+            item,
+            outcome,
+            id:
+              required.find(
+                (command) => commandKey(command) === item.commandIdentity,
+              )?.id ?? item.command.id,
+          });
+        }
+        const allEvidence = authoritative.map(({ item, id }) => ({
+          id,
+          exitCode: item.exitCode,
+          output: item.output,
+        }));
         if (commandDenied || result.status === "BLOCKED") {
           result.status = "BLOCKED";
           result.reason = commandDenied
@@ -1039,21 +1064,71 @@ export class PiRunner implements AgentRunner {
           result.failedAreas = [];
           return result;
         }
-        if (!allEvidence.length)
-          throw new Error("Tester produced no verified validation commands");
+        const missing = required.filter(
+          (command) =>
+            !authoritative.some(
+              ({ item }) => item.commandIdentity === commandKey(command),
+            ) &&
+            !supersededIdentities.has(commandKey(command)) &&
+            !current.some(
+              (item) =>
+                item.commandIdentity === commandKey(command) &&
+                item.exitCode === 0 &&
+                item.agent === "tester",
+            ),
+        );
+        const unresolved = authoritative.filter(
+          ({ outcome }) =>
+            outcome.category === "INVOCATION_ERROR" ||
+            outcome.category === "INFRASTRUCTURE_ERROR" ||
+            outcome.category === "INDETERMINATE",
+        );
+        if (!allEvidence.length || missing.length || unresolved.length) {
+          result.status = "BLOCKED";
+          result.reason = unresolved.length
+            ? `${unresolved.map(({ id, outcome }) => `${id}: ${outcome.reason}`).join("; ")}. Run a valid, current verification command.`
+            : `Required validation is missing: ${missing.map((c) => c.id).join(", ") || "no verified commands"}.`;
+          result.commands = compactValidationEvidence(allEvidence);
+          result.failedAreas = [];
+          delete result.classification;
+          record(state, "tester_gate_blocked", result.reason, {
+            agent: "tester",
+            attempt,
+          });
+          return result;
+        }
         // Exit codes and output come from execution, never from model assertions.
         // Keep routing evidence compact in state; detailed execution output is
         // available during the attempt and in the agent log.
         result.commands = compactValidationEvidence(allEvidence);
-        result.status = allEvidence.every((c) => c.exitCode === 0)
+        const proposedStatus = result.status;
+        result.status = authoritative.every(
+          ({ outcome }) => outcome.category === "PASS",
+        )
           ? "PASS"
           : "FAIL";
-        if (result.status === "FAIL")
-          result.failedAreas = allEvidence
-            .filter((c) => c.exitCode !== 0)
-            .map((c) => c.id);
-        if (required.some((c) => !allEvidence.some((e) => e.id === c.id)))
-          throw new Error("Tester skipped a configured validation command");
+        if (result.status === "FAIL") {
+          result.failedAreas = authoritative
+            .filter(({ outcome }) => outcome.category === "TEST_FAILURE")
+            .map(({ id }) => id);
+          result.classification ??= "FIX_LOCAL";
+          result.reason = `Host-verified validation failed: ${result.failedAreas.join(", ")}.`;
+        } else {
+          result.failedAreas = [];
+          delete result.classification;
+          result.reason = "Host-verified validation commands passed.";
+        }
+        if (proposedStatus !== result.status)
+          record(
+            state,
+            "tester_result_reconciled",
+            `Proposed ${proposedStatus}; authoritative ${result.status}`,
+            {
+              agent: "tester",
+              attempt,
+              failedAreas: result.failedAreas,
+            },
+          );
       }
       return result;
     } catch (error) {

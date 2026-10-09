@@ -4,8 +4,28 @@ import { mkdtemp, mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { newState, validateState } from "../src/workflow/state.ts";
+import { transition } from "../src/workflow/router.ts";
 import { StateStore } from "../src/workflow/persistence.ts";
 import { config } from "./helpers.ts";
+test("legacy contradictory Tester state loads but cannot advance the gate", () => {
+  const raw = newState("/tmp", "task", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  raw.phase = "TEST";
+  raw.results.tester = {
+    status: "PASS",
+    commands: [{ id: "test", exitCode: 0, output: "passed" }],
+    failedAreas: [],
+    classification: "FIX_LOCAL",
+  };
+  const loaded = validateState(raw);
+  transition(loaded);
+  assert.equal(loaded.phase, "BLOCKED");
+});
 test("version 1 state without additive approval/config fields migrates conservatively", () => {
   const raw: any = newState("/tmp", "task", config(), {
     head: null,

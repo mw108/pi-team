@@ -96,7 +96,10 @@ import {
   requestSecurityRiskReview,
   securityRiskQuestion,
 } from "./security-risk-review.ts";
-import { recordVerifiedCommandResult } from "./verified-commands.ts";
+import {
+  classifyVerifiedCommand,
+  recordVerifiedCommandResult,
+} from "./verified-commands.ts";
 import {
   getActiveSolverIds,
   getRequiredSuccessfulSolverCount,
@@ -1844,6 +1847,21 @@ export class WorkflowEngine {
               if (!verified) return;
               authoritative.verifiedCommandResults.push(verified);
               if (s !== authoritative) s.verifiedCommandResults.push(verified);
+              if (verified.exitCode !== 0) {
+                const outcome = classifyVerifiedCommand(verified);
+                record(
+                  authoritative,
+                  "test_command_classified",
+                  outcome.reason,
+                  {
+                    agent: role,
+                    attempt: attemptNumber,
+                    commandId: command.id,
+                    executionId: verified.executionId,
+                    category: outcome.category,
+                  },
+                );
+              }
               await this.store.save(authoritative);
               logged?.logger.append({
                 type: "verified_command_result_recorded",
@@ -1878,6 +1896,22 @@ export class WorkflowEngine {
                 maxSchemaRepairAttempts: event.maxSchemaRepairAttempts,
                 failureType: event.failureType,
               };
+              if (
+                role === "tester" &&
+                event.type === "schema_repair_started" &&
+                /Tester (?:PASS|FAIL|BLOCKED) requires/.test(
+                  event.diagnostic ?? "",
+                )
+              )
+                record(
+                  authoritative,
+                  "tester_result_inconsistent",
+                  "Tester status, failed areas, and remediation classification disagree",
+                  {
+                    agent: role,
+                    attempt: attemptNumber,
+                  },
+                );
               logged?.logger.append({
                 ...event,
                 ...metadata,

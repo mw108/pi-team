@@ -265,7 +265,7 @@ export const securitySchema = z.object({
   ),
   summary: text,
 });
-export const testSchema = z.object({
+export const persistedTestSchema = z.object({
   status: z.enum(["PASS", "FAIL", "BLOCKED"]),
   reason: z.string().optional(),
   commands: z.array(
@@ -281,6 +281,35 @@ export const testSchema = z.object({
   ),
   failedAreas: strings,
   classification: z.enum(["FIX_LOCAL", "FIX_DESIGN"]).optional(),
+});
+export const testSchema = persistedTestSchema.superRefine((result, ctx) => {
+  if (
+    result.status === "PASS" &&
+    (result.failedAreas.length || result.classification)
+  )
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "Tester PASS requires empty failedAreas and no remediation classification",
+    });
+  if (
+    result.status === "FAIL" &&
+    (!result.failedAreas.length || !result.classification)
+  )
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "Tester FAIL requires failedAreas and a remediation classification",
+    });
+  if (
+    result.status === "BLOCKED" &&
+    (result.failedAreas.length || result.classification)
+  )
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "Tester BLOCKED requires empty failedAreas and no remediation classification",
+    });
 });
 export const commitSchema = z.object({ message: text }).strict();
 export const completionReportSchema = z.object({
