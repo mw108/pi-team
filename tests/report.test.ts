@@ -412,7 +412,10 @@ test("Reporter has zero tools; repair adds its config and prompt to an older pro
   assert.deepEqual(allowedTools("reporter", config()), []);
   const yamlPath = join(teamRoot(cwd), "team.yaml");
   const original = await readFile(yamlPath, "utf8");
-  const old = original.replace(/\n  reporter:\n(?:    [^\n]*\n)+/, "\n");
+  const old = original.replace(
+    /\r?\n  reporter:\r?\n(?:    [^\r\n]*\r?\n)+/,
+    "\n",
+  );
   await writeFile(yamlPath, old);
   await unlink(join(teamRoot(cwd), "agents", "reporter.md"));
   const result = await initTeam(cwd, "repair");

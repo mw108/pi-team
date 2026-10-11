@@ -17,7 +17,11 @@ import { discoverCommands } from "../agents/discovery.ts";
 import { StateStore } from "../workflow/persistence.ts";
 import { git, dirtyPaths } from "../workflow/git.ts";
 import { checkAskCompatibility } from "./pi-ask.ts";
-import { packagePath } from "./resources.ts";
+import {
+  loadMcpAdapterFactory,
+  packagePath,
+  webAccessExtensionPath,
+} from "./resources.ts";
 import { assertTemperatureSupported } from "../agents/sampling.ts";
 import { formatAgentTimeout, getAgentTimeoutMs } from "../agents/errors.ts";
 import { resolveNetworkRetry } from "../agents/network-retry.ts";
@@ -104,8 +108,37 @@ export async function doctor(cwd: string) {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await import("pi-mcp-adapter");
+    await loadMcpAdapterFactory();
     return `adapter available; ${configured ? "configured" : "not configured"} (connectivity not probed)`;
+  });
+  await check("Web access", async () => {
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir: agentDir(),
+      settingsManager: SettingsManager.inMemory({
+        packages: [],
+        extensions: [],
+      }),
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      additionalExtensionPaths: [webAccessExtensionPath()],
+    });
+    await loader.reload();
+    const result = loader.getExtensions();
+    if (result.errors.length)
+      throw new Error(result.errors.map((e) => e.error).join("; "));
+    const names = result.extensions.flatMap((extension) => [
+      ...extension.tools.keys(),
+    ]);
+    for (const name of ["web_search", "fetch_content"])
+      if (!names.includes(name))
+        throw new Error(`Required tool missing: ${name}`);
+    const version = JSON.parse(
+      await readFile(packagePath("pi-web-access", "package.json"), "utf8"),
+    ).version;
+    return `${version}; web_search and fetch_content registered; ${process.env.EXA_API_KEY ? "direct Exa credential present" : "no direct Exa credential (zero-config provider remains available)"}; connectivity not probed`;
   });
   await check("Configuration", async () => {
     const { config, path } = await loadConfig(cwd);

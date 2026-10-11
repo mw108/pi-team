@@ -4,7 +4,7 @@ A Pi-native development team with isolated role sessions, configurable parallel 
 
 ## Installed environment
 
-This setup uses Pi **0.99.2**, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **3.0.0**, `pi-web-access` **0.32.0**, and the existing Serena **1.7.0**. Node 24+ is required. Exact dependency versions are in `package-lock.json`.
+Local development uses the Pi **1.1.0** declarations, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **5.2.0**, `pi-web-access` **0.38.0**, and the existing Serena **1.7.0**. Node 24+ is required. Exact resolved versions are in `package-lock.json`.
 
 The user-facing `pi` executable is installed under `~/.local/bin`. This project and its four integration packages are registered as local Pi packages. Keep this checkout and its `node_modules` directory available.
 
@@ -223,30 +223,63 @@ A clean Git status means there are no uncommitted changes. Existing changes are 
 
 ## Install from scratch
 
+Pi Team uses npm and its committed npm lockfile. Use Node 24 or newer and the npm version bundled with that Node release; this audit used npm 11. The package has no lifecycle install script.
+
+### Local development or a local Pi package
+
+Pi does not install or modify dependencies for a local-path package. Install the locked dependencies first, then register the absolute checkout path:
+
 ```bash
-npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@0.99.0
+npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@1.1.0
 export PATH="$HOME/.local/bin:$PATH"
 cd /path/to/pi-team
-npm ci --ignore-scripts
+npm ci
 pi install /absolute/path/to/pi-team
-pi install /absolute/path/to/pi-team/node_modules/@eko24ive/pi-ask
-pi install /absolute/path/to/pi-team/node_modules/@bacnh85/pi-serena
-pi install /absolute/path/to/pi-team/node_modules/pi-mcp-adapter
-pi install /absolute/path/to/pi-team/node_modules/pi-web-access
 ```
 
-Pi host-provided extension packages are declared as `peerDependencies` with `"*"` so Pi supplies them at runtime. Pinned versions in `devDependencies` support local typechecking and tests.
+On Windows PowerShell, use the same npm commands and an explicit resolved path:
 
-These local registrations reuse the locked, inspected copies. The integrations also support their documented npm installation form:
+```powershell
+Set-Location G:\Projects\pi-team
+npm ci
+$packagePath = (Resolve-Path .).Path
+pi install $packagePath
+```
+
+Pi Team loads its integration dependencies into isolated child sessions itself. Do not register those packages separately merely to make Pi Team work. Register one separately only when you also want its standalone commands or tools in the parent Pi session.
+
+### npm and Git Pi packages
+
+For an npm or Git source, Pi installs the package dependencies in its managed package directory. Use an explicit source so a package name is not confused with a relative local path:
+
+```bash
+# Available only after this currently private package is published.
+pi install npm:pi-team@<version>
+
+# Pin a reviewed tag or commit when installing from Git.
+pi install git:github.com/<owner>/pi-team@<tag-or-commit>
+```
+
+The npm package is currently marked `private`, so the local-path workflow is the supported installation method for this checkout. A Git installation must include the lockfile and should be pinned to a reviewed ref.
+
+Pi host-provided packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) are declared as `peerDependencies` with `"*"`, following Pi's package contract, so managed installations use the host's copies. Matching 1.1.0 versions in `devDependencies` support local typechecking and tests without bundling an independent host runtime into a managed Pi installation.
+
+The integrations also support their documented standalone npm installation form:
 
 ```bash
 pi install npm:@eko24ive/pi-ask@1.2.0
 pi install npm:@bacnh85/pi-serena@0.9.18
-pi install npm:pi-mcp-adapter@3.0.0
-pi install npm:pi-web-access@0.32.0
+pi install npm:pi-mcp-adapter@5.2.0
+pi install npm:pi-web-access@0.38.0
 ```
 
-Choose one registration per package; registering both the local and npm copies creates duplicate resources. Run `/reload` or restart Pi after registration changes. `pi list` shows active package sources. Pi now uses the `@earendil-works` package scope; this extension is typechecked against the installed Pi 0.99.0 declarations.
+Choose one registration per package; registering both local and npm copies creates duplicate resources. Run `/reload` or restart Pi after registration changes. `pi list` shows active package sources. Pi now uses the `@earendil-works` package scope.
+
+`pi-mcp-adapter` 5.2.0 accepts Pi AI 0.99.x and 1.x, including the current 1.1 line. Pi Team calls its documented `createMcpAdapter({ config })` factory and gives it one isolated Context7 server definition. The package publishes a TypeScript root entry point, so Pi Team resolves that declared entry explicitly through the active TypeScript loader; a regression test verifies the factory, `mcp` tool, command registration, and shutdown hook.
+
+If npm reports `ERESOLVE` mentioning `pi-mcp-adapter@3.0.0` and Pi AI 0.99 or 1.x, the checkout or lockfile is stale. Version 3.0.0 accepted only Pi AI 0.84–0.87 even though that peer was optional. Restore the committed `package.json` and `package-lock.json`, then run `npm ci`; do not use `--force` or `--legacy-peer-deps`.
+
+The npm scripts use Node executables rather than POSIX shell syntax. Temporary validation output uses the operating system's temporary directory, and Prettier preserves the checkout's existing LF or CRLF line endings. Linux-only Bubblewrap support remains optional and is skipped on Windows and macOS.
 
 ## Team configuration
 
@@ -454,9 +487,19 @@ export CONTEXT7_API_KEY='your-key'
 
 See [mcp.example.json](config/mcp.example.json). The runner uses an isolated `createMcpAdapter` configuration with only `resolve-library-id` and `query-docs`, rather than importing unrelated MCP servers. Researcher, Solvers, Reviewer, Implementor, Code Reviewer and Security Reviewer receive documentation access. Critic, Tester and Commit Agent do not. Query documentation only when external API/version/library behavior matters. The Researcher retains material external source references in state.
 
+The user-level adapter file is optional for this isolated integration. If it is absent, Pi Team starts with empty Context7 headers; a missing credential or unavailable server is reported as a tool/integration error rather than an extension-load failure. `CONTEXT7_API_KEY` takes precedence when present.
+
 ### Web research
 
-`pi-web-access` provides `web_search` and `fetch_content` to the Researcher. The setup uses the existing `EXA_API_KEY` environment variable and an Exa provider configuration in `~/.pi/agent/web-search.json`; no search engine is implemented. Ensure Pi inherits the credential from its launching shell. Curator UI is disabled for unattended Researcher sessions. Other roles do not receive web tools by default.
+Pi Team supports `pi-web-access` 0.38.0, which provides `web_search` and `fetch_content` to the Researcher through Pi's normal extension registration and runtime tool discovery. It is separate from the Context7-only `pi-mcp-adapter` integration. Pi Team does not implement a search engine, proxy these calls through MCP, or grant the web tools to other roles by default. Curator UI remains disabled for unattended Researcher sessions.
+
+For direct Exa API access, set `EXA_API_KEY` in the shell that launches Pi and select Exa in `~/.pi/agent/web-search.json`. The key is optional at extension startup: without it, the upstream extension can use its documented zero-configuration Exa MCP provider, subject to network availability and provider limits. Missing configuration or credentials must not prevent unrelated Pi-Team roles from starting. Never put keys in repository configuration, prompts, tool arguments, or workflow state.
+
+`web_search` accepts one query or a bounded query list and returns source-linked titles, URLs, snippets/provider answers, and structured results. A valid empty provider response is a successful zero-result search. Provider HTTP failures, malformed responses, and cancellations are returned as failed tool calls rather than fabricated results. Direct Exa searches have the upstream 60-second request deadline and also honor caller cancellation.
+
+`fetch_content` accepts one URL or a bounded URL list and supports readable and raw text modes. Direct HTTP and Jina fetches default to a 30-second timeout; set a positive `fetch.timeout` value in `web-search.json` when another bound is required. Responses are streamed through a size limit, unsupported binary bodies are rejected, and full content is kept in the extension's bounded private cache while only bounded slices enter model context.
+
+Fetched pages and search results are untrusted data, never instructions. The extension rejects non-HTTP remote URLs, blocks loopback/private/link-local and cloud-metadata destinations by default, revalidates redirects, strips provider credentials on cross-origin redirects, and keeps remote hosted extraction fallbacks opt-in. `ssrf.allowRanges`, authenticated browser-profile fetching, custom provider endpoints, proxies, and hosted fetch providers weaken or move parts of that trust boundary; enable them only after reviewing the upstream security documentation. Pi-Team's own command sandbox does not isolate third-party extension code.
 
 Activity labels describe capabilities: `web_search` is “Web search” whether Exa or another supported provider supplies it; `fetch_content` is “Web research.” The installed MCP adapter exposes a generic `mcp` tool with a nested tool name. Only known Context7 calls render as “Context7”; unknown MCP calls render as “MCP tool.” No separate `pi-exa` extension is installed in this setup. Project-specific tools can be classified in `.pi/team/team.yaml`, for example:
 
@@ -717,6 +760,8 @@ Pre-existing dirty paths are blocked for editing until the Orchestrator obtains 
 
 ```bash
 cd /path/to/pi-team
+npm ci
+npm ls --all
 npm run check
 npm run doctor  # also available inside Pi as /team doctor
 npm run smoke
@@ -725,7 +770,9 @@ node --import tsx scripts/progress-smoke.ts
 node --import tsx scripts/live.ts
 ```
 
-`check` runs TypeScript checking and workflow tests covering routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, project-local configuration, progress and real local commits in temporary repositories. `smoke` directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. `project-local-smoke.ts` initializes a temporary repository, loads a customized project prompt through the actual Pi session factory, runs a deterministic fixture workflow from a subdirectory and checks prompt-drift gating; it writes `docs/project-local-validation.json` and does not invoke remote inference. `progress-smoke.ts` runs delayed fixture agents through complete workflows with pentest both disabled and enabled; it writes `docs/progress-validation.json`. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
+`check` runs TypeScript checking and workflow tests covering dependency metadata, adapter and web-extension registration, deterministic mocked `web_search`/`fetch_content` requests, missing optional web and Context7 configuration, errors, cancellation, fetch timeouts, response limits, SSRF redirects, routing, loop limits, state, corruption, resume, structured-output correction, solver concurrency/failure, permissions, project-local configuration, progress and real local commits in temporary repositories. The web fixtures bind only to an operating-system-assigned loopback port, clean up their Pi session and server, and make no external request. The GitHub Actions workflow repeats `npm ci`, `npm ls --all`, and `npm run check` on Ubuntu, Windows, and macOS with Node 24. A configured matrix is future verification; do not treat a platform as tested until its job has actually passed.
+
+`smoke` is the optional live integration level: it directly invokes Serena, Context7 and web tools and updates `docs/integration-validation.json`. Run it manually only when the configured providers, credentials, and network access are intentionally available; it is not part of ordinary CI, must use shell-provided credentials, and should make only the minimal provider calls already defined by the script. A deterministic mocked success proves the Pi integration contract, not real provider connectivity. `project-local-smoke.ts` initializes a temporary repository, loads a customized project prompt through the actual Pi session factory, runs a deterministic fixture workflow from a subdirectory and checks prompt-drift gating; it writes `docs/project-local-validation.json` and does not invoke remote inference. `progress-smoke.ts` runs delayed fixture agents through complete workflows with pentest both disabled and enabled; it writes `docs/progress-validation.json`. `live.ts` creates a temporary repository and invokes the actual `/team` command through Pi SDK, including enabled pentest/security gates; it writes `docs/live-validation.json`. It requires a working configured model and does not overwrite this project's code.
 
 If the model is missing, inspect `/model`, `models.json` and the selected role's provider/model ID. The role IDs must match Pi's registry. If the ngrok endpoint changes, update the base URL and verify the model:
 
@@ -735,7 +782,7 @@ node --import tsx scripts/configure-endpoint.ts https://your-endpoint.example
 
 That helper uses the installed Pi llama.cpp discovery client and registers only an already loaded model. It sets only placeholder model assignments; manually chosen role models are preserved. Inspect `models.json` after changing endpoints.
 
-If Serena fails, check `serena --version`, `SERENA_PYTHON`, project languages and LSP availability; use `/serena-restart`. If Context7 fails, check authentication, `/mcp-adapter` and the two allowed tool names. If search fails, confirm that the launching process has `EXA_API_KEY`. If a question opens in print/RPC mode, resume in interactive Pi. If commands are unavailable, select safe discovered commands in the approval form or preconfigure reviewed repository argv entries for a new task. If the working tree changes after review, inspect and restart the appropriate review rather than committing stale approval.
+If Serena fails, check `serena --version`, `SERENA_PYTHON`, project languages and LSP availability; use `/serena-restart`. If Context7 fails, check authentication, `/mcp-adapter` and the two allowed tool names. If direct Exa search fails, confirm that the launching process inherited `EXA_API_KEY`, review the selected provider and timeout in `web-search.json`, and use `npm run doctor` to verify registration without making a network request. Upstream failures remain distinguishable in their messages and HTTP status, while Pi marks complete provider/fetch failure as `isError`; Pi-Team does not add automatic retries or permissions. If a question opens in print/RPC mode, resume in interactive Pi. If commands are unavailable, select safe discovered commands in the approval form or preconfigure reviewed repository argv entries for a new task. If the working tree changes after review, inspect and restart the appropriate review rather than committing stale approval.
 
 ## Update and uninstall
 

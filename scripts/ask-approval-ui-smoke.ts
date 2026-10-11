@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { askApproval } from "../src/integrations/pi-ask.ts";
 export default function smoke(pi: ExtensionAPI) {
   pi.registerCommand("ask-approval-smoke", {
@@ -29,7 +31,7 @@ export default function smoke(pi: ExtensionAPI) {
         values?.includes("synthetic-lint"),
       );
       await writeFile(
-        "/private/tmp/pi-team-approval-ui-validation.json",
+        join(tmpdir(), "pi-team-approval-ui-validation.json"),
         JSON.stringify(
           {
             at: new Date().toISOString(),

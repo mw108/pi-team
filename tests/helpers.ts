@@ -207,6 +207,9 @@ export async function repository() {
     "import assert from 'node:assert/strict';import {test} from 'node:test';import {add} from '../math.js';test('addition',()=>assert.equal(add(2,3),5));\n",
   );
   await git(cwd, ["init"]);
+  // Keep fixture bytes deterministic when the host Git configuration enables
+  // Windows working-tree conversion.
+  await git(cwd, ["config", "core.autocrlf", "false"]);
   await initTeam(cwd);
   await git(cwd, ["config", "user.name", "Pi Team Test"]);
   await git(cwd, ["config", "user.email", "pi-team-test@example.invalid"]);

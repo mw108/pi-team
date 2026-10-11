@@ -602,10 +602,11 @@ test("timed out read-only attempts persist history, logs, output and retry UI", 
   assert.match(first, /\[REDACTED\]/);
   assert.doesNotMatch(first, /topsecret|reasoning|scratchpad/);
   assert.match(first, /"type":"retry"/);
-  assert.equal(
-    (await stat(logs.path(state.id, "researcher", 1))).mode & 0o777,
-    0o600,
-  );
+  if (process.platform !== "win32")
+    assert.equal(
+      (await stat(logs.path(state.id, "researcher", 1))).mode & 0o777,
+      0o600,
+    );
   assert.ok(
     logs
       .path(state.id, "researcher", 1)

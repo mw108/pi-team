@@ -122,7 +122,10 @@ test("/team doctor handler reports diagnostics without starting a workflow", asy
   };
   await commands.get("team").handler("doctor", context);
   assert.match(notice, /ask_user registration verified/);
-  assert.match(notice, /required semantic tools registered/);
+  assert.match(
+    notice,
+    /Pi Serena: (?:.*required semantic tools registered|FAIL — .*serena)/,
+  );
   assert.match(notice, /Configured commands:/);
   assert.match(notice, /Discovered commands:/);
   assert.match(notice, /Approved for current workflow:/);

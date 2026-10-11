@@ -7,6 +7,7 @@ import {
   dirname,
   isAbsolute,
   join,
+  parse,
   relative,
   resolve,
   sep,
@@ -136,7 +137,12 @@ function trustedAvailableBubblewrap(network: "deny" | "allow") {
 
 function mountParents(path: string): string[] {
   const parents: string[] = [];
-  for (let current = dirname(path); current !== sep; current = dirname(current))
+  const root = parse(path).root;
+  for (
+    let current = dirname(path);
+    current !== root;
+    current = dirname(current)
+  )
     parents.unshift(current);
   return parents.flatMap((parent) => ["--dir", parent]);
 }

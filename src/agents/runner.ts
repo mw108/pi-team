@@ -33,7 +33,12 @@ import { deleteTool, contractPathRequestTool } from "./files.ts";
 import { gitInspectTool } from "../workflow/git.ts";
 import { projectInstructionsPrompt } from "../workflow/project-instructions.ts";
 import { AgentLogStore, AttemptLogger } from "../workflow/agent-logs.ts";
-import { packagePath, context7Config } from "../integrations/resources.ts";
+import {
+  packagePath,
+  context7Config,
+  loadMcpAdapterFactory,
+  webAccessExtensionPath,
+} from "../integrations/resources.ts";
 import { rolePrompt, digest } from "./registry.ts";
 import { contextFor, sanitizeContextForProvider } from "./context.ts";
 import { redactVisibleText } from "./redaction.ts";
@@ -399,11 +404,15 @@ export class PiRunner implements AgentRunner {
     )
       paths.push(packagePath("@bacnh85/pi-serena", "extensions/index.ts"));
     if (allowedTools(role, config).includes("mcp")) {
-      let createMcpAdapter: typeof import("pi-mcp-adapter").createMcpAdapter;
+      let createMcpAdapter;
       try {
-        ({ createMcpAdapter } = await import("pi-mcp-adapter"));
+        createMcpAdapter = await loadMcpAdapterFactory();
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND")
+        if (
+          (error as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND" ||
+          (error instanceof Error &&
+            error.message.startsWith("Cannot locate package"))
+        )
           throw new Error(
             "MCP capability unavailable: install pi-mcp-adapter",
             {
@@ -415,7 +424,7 @@ export class PiRunner implements AgentRunner {
       factories.push(createMcpAdapter({ config: await context7Config() }));
     }
     if (allowedTools(role, config).includes("web_search"))
-      paths.push(packagePath("pi-web-access", "dist/index.js"));
+      paths.push(webAccessExtensionPath());
     const mutations =
       (role === "implementor" ||
         (role === "tester" && config.tester.mayModifyTests)) &&

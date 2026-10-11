@@ -66,8 +66,8 @@ export async function dirtyPaths(cwd: string) {
 }
 export async function baseline(cwd: string) {
   const canonical = await realpath(cwd);
-  await git(cwd, ["rev-parse", "--show-toplevel"]).then((root) => {
-    if (root.trim() !== canonical)
+  await git(cwd, ["rev-parse", "--show-toplevel"]).then(async (root) => {
+    if ((await realpath(root.trim())) !== canonical)
       throw new Error("Start /team at the Git repository root");
   });
   return {

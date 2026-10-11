@@ -4,6 +4,8 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { packagePath } from "../src/integrations/resources.ts";
 export default async function smoke(pi: ExtensionAPI) {
@@ -73,7 +75,7 @@ export default async function smoke(pi: ExtensionAPI) {
       const passed =
         !details.cancelled && details.answers?.smoke?.values?.[0] === "tested";
       await writeFile(
-        "/private/tmp/pi-team-ask-validation.json",
+        join(tmpdir(), "pi-team-ask-validation.json"),
         JSON.stringify(
           {
             at: new Date().toISOString(),

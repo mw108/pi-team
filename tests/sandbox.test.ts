@@ -130,10 +130,8 @@ test("Bubblewrap argv keeps repository writable, hides team internals, and denie
             arg === "--tmpfs" && denied[i + 1] === join(cwd, ".pi/team", name),
         ),
       );
-    assert.equal(
-      denied.includes(process.env.HOME ?? "unavailable-home"),
-      false,
-    );
+    if (process.platform !== "win32" && process.env.HOME)
+      assert.equal(denied.includes(process.env.HOME), false);
     const allowed = bubblewrapArgs(command("", "pentest"), cwd, "allow");
     assert.equal(allowed.includes("--unshare-net"), false);
   } finally {

@@ -2,8 +2,15 @@ import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { agentDir } from "../config/loader.ts";
+
+export type CreateMcpAdapter = (options?: {
+  config?: unknown;
+  configPath?: string;
+}) => ExtensionFactory;
+
 const require = createRequire(import.meta.url);
 export function packagePath(name: string, relativePath: string) {
   try {
@@ -23,11 +30,30 @@ export function packagePath(name: string, relativePath: string) {
     }
   }
 }
-export async function context7Config() {
+
+/** Resolve the published Pi extension entry used by child agent sessions. */
+export function webAccessExtensionPath() {
+  return packagePath("pi-web-access", "dist/index.js");
+}
+
+/** Load the adapter's published TypeScript entry through the active TS loader. */
+export async function loadMcpAdapterFactory(): Promise<CreateMcpAdapter> {
+  const entry = pathToFileURL(packagePath("pi-mcp-adapter", "index.ts")).href;
+  const module = (await import(entry)) as {
+    createMcpAdapter?: CreateMcpAdapter;
+  };
+  if (typeof module.createMcpAdapter !== "function")
+    throw new Error(
+      "Incompatible pi-mcp-adapter: createMcpAdapter export is unavailable",
+    );
+  return module.createMcpAdapter;
+}
+
+export async function context7Config(directory = agentDir()) {
   let headers: Record<string, string> = {};
   try {
     const config = JSON.parse(
-      await readFile(join(agentDir(), "mcp-adapter.json"), "utf8"),
+      await readFile(join(directory, "mcp-adapter.json"), "utf8"),
     );
     headers = config.mcpServers?.context7?.headers ?? {};
   } catch (e) {

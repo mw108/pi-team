@@ -4,7 +4,10 @@ import { isAbsolute, relative } from "node:path";
 function safePath(value: unknown, cwd: string): string | undefined {
   if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value))
     return;
-  const path = isAbsolute(value) ? relative(cwd, value) : value;
+  const path = (isAbsolute(value) ? relative(cwd, value) : value).replace(
+    /\\/g,
+    "/",
+  );
   if (path === ".." || path.startsWith("../") || isAbsolute(path)) return;
   if (
     path

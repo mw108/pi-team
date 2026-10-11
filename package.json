@@ -6,15 +6,15 @@
   "description": "Deterministic, resumable development team for Pi",
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "scripts": {
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test --test-concurrency=4 tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run format:check && npm test",
-    "format": "prettier --write src tests scripts config templates README.md docs/investigation.md package.json tsconfig.json",
-    "format:check": "prettier --check src tests scripts config templates README.md docs/investigation.md package.json tsconfig.json",
+    "format": "prettier --write src tests scripts config templates .github README.md docs/investigation.md package.json tsconfig.json .prettierrc.json",
+    "format:check": "prettier --check src tests scripts config templates .github README.md docs/investigation.md package.json tsconfig.json .prettierrc.json",
     "doctor": "tsx scripts/doctor.ts",
     "smoke": "tsx scripts/smoke.ts",
     "pi": "pi"
@@ -22,8 +22,8 @@
   "dependencies": {
     "@bacnh85/pi-serena": "0.9.18",
     "@eko24ive/pi-ask": "1.2.0",
-    "pi-mcp-adapter": "3.0.0",
-    "pi-web-access": "0.32.0",
+    "pi-mcp-adapter": "^5.2.0",
+    "pi-web-access": "0.38.0",
     "yaml": "2.8.3",
     "zod": "3.25.76",
     "zod-to-json-schema": "3.25.1"
@@ -31,11 +31,13 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.99.0",
-    "@earendil-works/pi-coding-agent": "0.99.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "@types/node": "^24.0.0",
     "prettier": "^3.9.9",
     "tsx": "^4.22.0",

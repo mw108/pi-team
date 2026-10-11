@@ -1217,7 +1217,7 @@ export class WorkflowEngine {
     config: TeamConfig,
     definition?: TeamDefinition,
   ) {
-    const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
+    const root = projectRootSync(this.cwd);
     if (root !== this.cwd)
       throw new Error("Run /team from the repository root");
     const snapshot = await snapshotDefinition(
