@@ -84,15 +84,43 @@ test(
   { skip: process.platform !== "win32", concurrency: false },
   async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-team batch space "));
-    const oldPath = process.env.PATH;
-    const oldPathExt = process.env.PATHEXT;
+    const names = [
+      "PATH",
+      "PATHEXT",
+      "APPDATA",
+      "LOCALAPPDATA",
+      "USERPROFILE",
+      "HOMEDRIVE",
+      "HOMEPATH",
+      "COMPOSER_HOME",
+    ] as const;
+    const oldEnvironment = Object.fromEntries(
+      names.map((name) => [name, process.env[name]]),
+    );
     try {
       await writeFile(
         join(root, "composer.cmd"),
-        '@echo off\r\necho [%~1][%~2][%~3]\r\nif "%~1"=="fail" exit /b 7\r\n',
+        [
+          "@echo off",
+          "echo [%~1][%~2][%~3]",
+          "echo APPDATA=[%APPDATA%]",
+          "echo LOCALAPPDATA=[%LOCALAPPDATA%]",
+          "echo USERPROFILE=[%USERPROFILE%]",
+          "echo HOMEDRIVE=[%HOMEDRIVE%]",
+          "echo HOMEPATH=[%HOMEPATH%]",
+          "echo COMPOSER_HOME=[%COMPOSER_HOME%]",
+          'if "%~1"=="fail" exit /b 7',
+          "",
+        ].join("\r\n"),
       );
-      process.env.PATH = `${root};${oldPath ?? ""}`;
+      process.env.PATH = `${root};${oldEnvironment.PATH ?? ""}`;
       process.env.PATHEXT = ".EXE;.CMD;.BAT;.COM";
+      process.env.APPDATA = "C:\\Users\\fixture\\AppData\\Roaming";
+      process.env.LOCALAPPDATA = "C:\\Users\\fixture\\AppData\\Local";
+      process.env.USERPROFILE = "C:\\Users\\fixture";
+      process.env.HOMEDRIVE = "C:";
+      process.env.HOMEPATH = "\\Users\\fixture";
+      process.env.COMPOSER_HOME = "C:\\Composer Home";
       const passed = await execute(
         {
           id: "composer-pass",
@@ -110,6 +138,12 @@ test(
       );
       assert.equal(passed.resolution?.kind, "batch");
       assert.match(passed.resolvedExecutable ?? "", /composer\.cmd$/i);
+      const outputLines = (passed.stdout ?? "").split(/\r?\n/);
+      for (const name of names.slice(2))
+        assert.ok(
+          outputLines.includes(`${name}=[${process.env[name]}]`),
+          `${name} was not passed to the batch child`,
+        );
       const failed = await execute(
         {
           id: "composer-fail",
@@ -127,10 +161,66 @@ test(
         "NONZERO_EXIT",
       );
     } finally {
-      if (oldPath === undefined) delete process.env.PATH;
-      else process.env.PATH = oldPath;
-      if (oldPathExt === undefined) delete process.env.PATHEXT;
-      else process.env.PATHEXT = oldPathExt;
+      for (const name of names) {
+        const oldValue = oldEnvironment[name];
+        if (oldValue === undefined) delete process.env[name];
+        else process.env[name] = oldValue;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "real Windows Composer receives APPDATA through the Pi-Team command launcher",
+  { skip: process.platform !== "win32", concurrency: false },
+  async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "pi-team-composer-smoke-"));
+    const oldAppData = process.env.APPDATA;
+    const oldComposerHome = process.env.COMPOSER_HOME;
+    try {
+      try {
+        await resolveWindowsExecutable("composer", root, process.env);
+      } catch (error) {
+        if (
+          error instanceof ExecutableResolutionError &&
+          error.code === "EXECUTABLE_NOT_FOUND"
+        ) {
+          t.skip("Composer is not installed on PATH");
+          return;
+        }
+        throw error;
+      }
+      process.env.APPDATA = join(root, "AppData", "Roaming");
+      delete process.env.COMPOSER_HOME;
+      await mkdir(process.env.APPDATA, { recursive: true });
+      await writeFile(
+        join(root, "composer.json"),
+        JSON.stringify({
+          name: "pi-team/composer-environment-smoke",
+          scripts: {
+            test: "@php -r \"fwrite(STDOUT, 'pi-team-composer-ok');\"",
+          },
+        }),
+      );
+      const result = await execute(
+        {
+          id: "real-composer-test",
+          executable: "composer",
+          args: ["run", "test"],
+          purpose: "test",
+          timeoutMs: 30_000,
+        },
+        root,
+      );
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.match(result.stdout ?? "", /pi-team-composer-ok/);
+      assert.equal(result.resolution?.kind, "batch");
+    } finally {
+      if (oldAppData === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = oldAppData;
+      if (oldComposerHome === undefined) delete process.env.COMPOSER_HOME;
+      else process.env.COMPOSER_HOME = oldComposerHome;
       await rm(root, { recursive: true, force: true });
     }
   },

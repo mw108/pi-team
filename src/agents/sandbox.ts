@@ -79,21 +79,39 @@ export interface PreparedExecution {
   cleanup(): Promise<void>;
 }
 
-function baseEnvironment(): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(
-      ([key]) =>
-        [
-          "path",
-          "pathext",
-          "systemroot",
-          "windir",
-          "comspec",
-          "lang",
-          "term",
-        ].includes(key.toLowerCase()) || /^LC_[A-Z_]+$/.test(key),
-    ),
-  );
+/** Copy only runtime-location metadata; credentials remain excluded. */
+export function commandEnvironment(
+  host: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  const copy = (name: string) => {
+    const value =
+      platform === "win32"
+        ? Object.entries(host).find(
+            ([key]) => key.toLowerCase() === name.toLowerCase(),
+          )?.[1]
+        : host[name];
+    if (value !== undefined) result[name] = value;
+  };
+  for (const name of ["PATH", "LANG", "TERM"]) copy(name);
+  for (const [name, value] of Object.entries(host))
+    if (/^LC_[A-Z_]+$/.test(name) && value !== undefined) result[name] = value;
+  if (platform === "win32")
+    for (const name of [
+      "PATHEXT",
+      "SystemRoot",
+      "WINDIR",
+      "ComSpec",
+      "APPDATA",
+      "LOCALAPPDATA",
+      "USERPROFILE",
+      "HOMEDRIVE",
+      "HOMEPATH",
+      "COMPOSER_HOME",
+    ])
+      copy(name);
+  return result;
 }
 
 /** A repository-controlled PATH entry must never be able to replace the sandbox backend. */
@@ -138,7 +156,7 @@ export function bubblewrapAvailable(
       "--",
       "/bin/true",
     ],
-    { env: baseEnvironment(), stdio: "ignore", timeout: 3000 },
+    { env: commandEnvironment(), stdio: "ignore", timeout: 3000 },
   );
   return probe.status === 0 && !probe.error;
 }
@@ -271,7 +289,7 @@ export async function prepareExecution(
   try {
     await mkdir(home);
     await mkdir(temp);
-    const env = baseEnvironment();
+    const env = commandEnvironment();
     const sandbox: SandboxDetails = supported
       ? {
           mode: "bubblewrap",
@@ -286,7 +304,7 @@ export async function prepareExecution(
           filesystemIsolation: false,
         };
     env.HOME = supported ? "/tmp/home" : home;
-    env.USERPROFILE = env.HOME;
+    env.USERPROFILE ??= env.HOME;
     env.TMPDIR = env.TMP = env.TEMP = supported ? "/tmp/work" : temp;
     env.XDG_CONFIG_HOME = join(env.HOME, ".config");
     env.XDG_CACHE_HOME = join(env.HOME, ".cache");

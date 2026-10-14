@@ -17,6 +17,7 @@ import { execute } from "../src/agents/commands.ts";
 import {
   bubblewrapArgs,
   bubblewrapAvailable,
+  commandEnvironment,
   sandboxSetupFailure,
   SandboxSetupError,
   SandboxUnavailableError,
@@ -32,6 +33,54 @@ function command(source: string, purpose: "test" | "pentest" = "test") {
     timeoutMs: 5000,
   };
 }
+
+test("Windows command environment preserves runtime locations without credentials", () => {
+  const env = commandEnvironment(
+    {
+      Path: "C:\\Tools",
+      PathExt: ".EXE;.CMD",
+      SystemRoot: "C:\\Windows",
+      APPDATA: "C:\\Users\\fixture\\AppData\\Roaming",
+      LocalAppData: "C:\\Users\\fixture\\AppData\\Local",
+      UserProfile: "C:\\Users\\fixture",
+      HomeDrive: "C:",
+      HomePath: "\\Users\\fixture",
+      Composer_Home: "D:\\Composer Home",
+      OPENAI_API_KEY: "secret",
+      AWS_SECRET_ACCESS_KEY: "secret",
+      SSH_AUTH_SOCK: "secret",
+    },
+    "win32",
+  );
+  assert.deepEqual(env, {
+    PATH: "C:\\Tools",
+    PATHEXT: ".EXE;.CMD",
+    SystemRoot: "C:\\Windows",
+    APPDATA: "C:\\Users\\fixture\\AppData\\Roaming",
+    LOCALAPPDATA: "C:\\Users\\fixture\\AppData\\Local",
+    USERPROFILE: "C:\\Users\\fixture",
+    HOMEDRIVE: "C:",
+    HOMEPATH: "\\Users\\fixture",
+    COMPOSER_HOME: "D:\\Composer Home",
+  });
+});
+
+test("command environment handles missing Windows variables and preserves POSIX behavior", () => {
+  assert.deepEqual(commandEnvironment({ PATH: "C:\\Tools" }, "win32"), {
+    PATH: "C:\\Tools",
+  });
+  assert.deepEqual(
+    commandEnvironment(
+      {
+        PATH: "/usr/bin",
+        APPDATA: "/not/a/posix/runtime-variable",
+        COMPOSER_HOME: "/not/inherited",
+      },
+      "linux",
+    ),
+    { PATH: "/usr/bin" },
+  );
+});
 
 test("sandbox defaults and unknown values", () => {
   assert.deepEqual(config().execution.sandbox, {
