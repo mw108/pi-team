@@ -14,6 +14,12 @@ import {
 } from "node:path";
 import type { Command, TeamConfig } from "../config/schema.ts";
 import { commandNetworkPolicy } from "./command-policy.ts";
+import {
+  resolveWindowsCommandProcessor,
+  resolveWindowsExecutable,
+  windowsBatchCommandLine,
+  type ExecutableResolution,
+} from "./executable-resolution.ts";
 
 export type SandboxDetails = {
   mode: "bubblewrap" | "constrained-host" | "none";
@@ -67,6 +73,8 @@ export interface PreparedExecution {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  resolution?: ExecutableResolution;
+  windowsVerbatimArguments?: boolean;
   sandbox: SandboxDetails;
   cleanup(): Promise<void>;
 }
@@ -75,10 +83,15 @@ function baseEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
     Object.entries(process.env).filter(
       ([key]) =>
-        key === "PATH" ||
-        key === "LANG" ||
-        key === "TERM" ||
-        /^LC_[A-Z_]+$/.test(key),
+        [
+          "path",
+          "pathext",
+          "systemroot",
+          "windir",
+          "comspec",
+          "lang",
+          "term",
+        ].includes(key.toLowerCase()) || /^LC_[A-Z_]+$/.test(key),
     ),
   );
 }
@@ -277,11 +290,35 @@ export async function prepareExecution(
     env.TMPDIR = env.TMP = env.TEMP = supported ? "/tmp/work" : temp;
     env.XDG_CONFIG_HOME = join(env.HOME, ".config");
     env.XDG_CACHE_HOME = join(env.HOME, ".cache");
+    let launchExecutable = supported ? executable! : command.executable;
+    let launchArgs = supported
+      ? bubblewrapArgs(command, cwd, network)
+      : command.args;
+    let resolution: ExecutableResolution | undefined;
+    let windowsVerbatimArguments: boolean | undefined;
+    if (!supported && process.platform === "win32") {
+      resolution = await resolveWindowsExecutable(command.executable, cwd, env);
+      if (resolution.kind === "batch") {
+        launchExecutable = await resolveWindowsCommandProcessor(env);
+        launchArgs = [
+          "/d",
+          "/s",
+          "/v:off",
+          "/c",
+          windowsBatchCommandLine(resolution.resolved!, command.args),
+        ];
+        windowsVerbatimArguments = true;
+      } else {
+        launchExecutable = resolution.resolved!;
+      }
+    }
     return {
-      executable: supported ? executable! : command.executable,
-      args: supported ? bubblewrapArgs(command, cwd, network) : command.args,
+      executable: launchExecutable,
+      args: launchArgs,
       cwd,
       env,
+      resolution,
+      windowsVerbatimArguments,
       sandbox,
       cleanup: () => rm(root, { recursive: true, force: true }),
     };

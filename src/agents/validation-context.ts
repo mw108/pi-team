@@ -5,12 +5,18 @@ import {
   staticCommandMatches,
 } from "./command-policy.ts";
 import { commandKey, detectedCommandId, effectiveConfig } from "./discovery.ts";
+import type { VerifiedCommandResult } from "../workflow/verified-commands.ts";
 
 export interface CandidateValidationCommand {
   executable: string;
   args: string[];
   purpose: string;
   source: string;
+  intent?: string;
+  platform?: "any" | "win32" | "posix";
+  requiresShell?: boolean;
+  interpreter?: string;
+  equivalentOf?: string;
 }
 
 /** Only plain, whitespace-delimited argv is accepted from free-text hints. */
@@ -50,7 +56,10 @@ export function parseValidationHint(value: string) {
   return parsed.success ? { executable, args } : undefined;
 }
 
-export function testerValidationContext(state: WorkflowState) {
+export function testerValidationContext(
+  state: WorkflowState,
+  verified: VerifiedCommandResult[] = [],
+) {
   const candidates: CandidateValidationCommand[] = [];
   const seen = new Set<string>();
   const add = (
@@ -93,7 +102,29 @@ export function testerValidationContext(state: WorkflowState) {
   }
   for (const discovered of state.discoveredCommands) {
     if (discovered.category !== "test") continue;
-    add(discovered.command, "Run discovered test", "discovered");
+    const before = candidates.length;
+    add(discovered.command, "Run discovered test", discovered.source);
+    if (candidates.length !== before)
+      Object.assign(candidates.at(-1)!, {
+        intent: discovered.category,
+        platform: discovered.execution?.platform ?? "any",
+        requiresShell: discovered.execution?.requiresShell ?? false,
+        interpreter: discovered.execution?.interpreter,
+        equivalentOf: discovered.execution?.equivalentOf,
+      });
+  }
+  for (const result of verified) {
+    if (
+      result.exitCode !== 0 ||
+      result.agent === "tester" ||
+      !["test", "static"].includes(result.command.purpose)
+    )
+      continue;
+    add(
+      result.command,
+      "Re-run previously successful host-verified validation",
+      `verified:${result.agent}:attempt-${result.attempt}`,
+    );
   }
   for (const command of configured)
     add(command, `Run ${command.purpose} check`, "approved.commands");

@@ -76,6 +76,11 @@ export async function discoverCommands(
     source: string,
     category: DiscoveredCommand["category"],
     confidence: DiscoveredCommand["confidence"] = "high",
+    execution: DiscoveredCommand["execution"] = {
+      platform: "any",
+      launcher: "path",
+      requiresShell: false,
+    },
   ) {
     const id = detectedCommandId({ executable, args });
     const value = commandSchema.safeParse({
@@ -89,7 +94,13 @@ export async function discoverCommands(
       value.success &&
       !found.some((c) => commandKey(c.command) === commandKey(value.data))
     )
-      found.push({ command: value.data, source, category, confidence });
+      found.push({
+        command: value.data,
+        source,
+        category,
+        confidence,
+        execution,
+      });
   }
   function category(name: string): DiscoveredCommand["category"] | undefined {
     if (/^(test|tests)(?:[:_-]|$)/.test(name) && !/watch/.test(name))
@@ -103,9 +114,11 @@ export async function discoverCommands(
     if (/^(check|analyse|analyze|static-analysis)$/.test(name))
       return "static-analysis";
   }
+  let composerDocument: Record<string, any> | undefined;
   for (const file of ["package.json", "composer.json"]) {
     try {
       const doc = JSON.parse((await read(file)) ?? "");
+      if (file === "composer.json") composerDocument = doc;
       if (
         doc.scripts &&
         typeof doc.scripts === "object" &&
@@ -154,9 +167,60 @@ export async function discoverCommands(
       "pyproject.toml [tool.pytest.ini_options]",
       "test",
     );
+  const phpunitProxy = await read("vendor/bin/phpunit");
   for (const file of ["phpunit.xml", "phpunit.xml.dist"])
-    if ((await read(file))?.includes("<phpunit"))
-      add("vendor/bin/phpunit", [], file, "test", "medium");
+    if ((await read(file))?.includes("<phpunit") && phpunitProxy) {
+      if (process.platform === "win32")
+        add(
+          "php",
+          ["vendor/bin/phpunit"],
+          `${file} + vendor/bin/phpunit`,
+          "test",
+          "high",
+          {
+            platform: "win32",
+            launcher: "interpreter",
+            requiresShell: false,
+            interpreter: "php",
+            equivalentOf: "vendor/bin/phpunit",
+            reason:
+              "Composer's extensionless PHPUnit proxy is a PHP script on Windows",
+          },
+        );
+      else
+        add(
+          "vendor/bin/phpunit",
+          [],
+          `${file} + vendor/bin/phpunit`,
+          "test",
+          "high",
+          {
+            platform: "posix",
+            launcher: "native",
+            requiresShell: false,
+          },
+        );
+    }
+  const artisan = await read("artisan");
+  const composerRequires = {
+    ...(composerDocument?.require ?? {}),
+    ...(composerDocument?.["require-dev"] ?? {}),
+  };
+  if (artisan && Object.hasOwn(composerRequires, "laravel/framework"))
+    add(
+      "php",
+      ["artisan", "test", "--no-coverage"],
+      "artisan + composer.json require.laravel/framework",
+      "test",
+      "high",
+      {
+        platform: "any",
+        launcher: "interpreter",
+        requiresShell: false,
+        interpreter: "php",
+        reason: "Laravel's checked-in Artisan test entry point is available",
+      },
+    );
   for (const file of ["Makefile", "justfile"]) {
     const text = await read(file);
     if (text)

@@ -12,6 +12,7 @@ import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { agentDir } from "../config/loader.ts";
+import { commandSchema } from "../config/schema.ts";
 import {
   allowedTools,
   checkTool,
@@ -63,6 +64,7 @@ import {
   supersedingInvocation,
 } from "../workflow/verified-commands.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
+import { ExecutableResolutionError } from "./executable-resolution.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
 import {
   AgentOutputError,
@@ -136,7 +138,7 @@ export type RuntimeContractApprover = {
 export type { GuardEvent } from "./doom-loop.ts";
 
 export const testerCommandInstructions =
-  " Implementor checks[] are not execution evidence, but may be candidate commands to execute. Use candidateValidationCommands for missing checks: call team_command with exact executable and args plus a concise purpose, or use an exact approved command ID. commandAuthorizationHints are informational static policy; the host decides authorization. team_command executes one command; it does not discover or list commands. team_command({}) is invalid and must never be used. If no candidates exist, inspect project files with available read/grep/find/ls tools, or return BLOCKED if no safe command can be determined.";
+  ' Implementor checks[] are not execution evidence, but may be candidate commands to execute. Use candidateValidationCommands for missing checks. Form A executes an existing command: {"id":"detected-..."}. Form B requests one explicit command: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run tests"}. Never combine Form A and Form B. commandAuthorizationHints are informational static policy; the host decides authorization. team_command executes one command; it does not discover or list commands. team_command({}) is invalid and must never be used. An EXECUTABLE_NOT_FOUND result means the process did not start and is not a test failure; choose an evidence-backed suggested alternative and call team_command again in this attempt. Every alternative requires its own normal authorization. Previous-agent verified commands are suggestions only and do not satisfy this Tester gate. If no candidates exist, inspect project files with available read/grep/find/ls tools, or return BLOCKED if no safe command can be determined.';
 
 export function effectiveAgentSystemPrompt(
   role: Role,
@@ -584,6 +586,62 @@ export class PiRunner implements AgentRunner {
                 () => approvedCommandsForRole(role, effectiveConfig(s, role)),
                 commandResult,
                 commandDenied,
+                role === "tester"
+                  ? async (failed) => {
+                      const current = currentVerifiedCommandResults(
+                        s,
+                        await repositoryEvidenceState(s),
+                      );
+                      const suggestions = [
+                        ...s.config.commands
+                          .filter((command) =>
+                            allowedCommandCategories("tester").includes(
+                              command.purpose,
+                            ),
+                          )
+                          .map((command) => ({
+                            command,
+                            source: "workflow.commands",
+                            reason: `Configured ${command.purpose} validation`,
+                          })),
+                        ...s.discoveredCommands
+                          .filter((candidate) => candidate.category === "test")
+                          .map((candidate) => ({
+                            command: candidate.command,
+                            source: candidate.source,
+                            reason:
+                              candidate.execution?.reason ??
+                              "Discovered project test command",
+                          })),
+                        ...current
+                          .filter(
+                            (result) =>
+                              result.exitCode === 0 &&
+                              result.agent !== "tester" &&
+                              ["test", "static"].includes(
+                                result.command.purpose,
+                              ),
+                          )
+                          .map((result) => ({
+                            command: commandSchema.parse({
+                              ...result.command,
+                              timeoutMs: 120000,
+                            }),
+                            source: `verified:${result.agent}:attempt-${result.attempt}`,
+                            reason:
+                              "Previously successful host-verified validation on this repository snapshot",
+                          })),
+                      ];
+                      const seen = new Set<string>();
+                      return suggestions.filter(({ command }) => {
+                        const key = commandKey(command);
+                        if (key === commandKey(failed) || seen.has(key))
+                          return false;
+                        seen.add(key);
+                        return true;
+                      });
+                    }
+                  : undefined,
               ),
               gitInspectTool(s),
               localHttpTool(config),
@@ -796,7 +854,9 @@ export class PiRunner implements AgentRunner {
             current.some(
               (result) =>
                 result.commandIdentity === commandKey(command) &&
-                result.exitCode === 0,
+                result.exitCode === 0 &&
+                result.agent === "tester" &&
+                result.attempt === attempt,
             )
           )
             continue;
@@ -818,6 +878,29 @@ export class PiRunner implements AgentRunner {
               timedOut: result.timedOut,
               durationMs: result.durationMs,
               sandbox: result.sandbox,
+            });
+          } catch (error) {
+            if (!(error instanceof ExecutableResolutionError)) throw error;
+            const failures = (input.commandStartupFailures ??= []) as any[];
+            failures.push({
+              code: error.code,
+              osError:
+                error.code === "EXECUTABLE_NOT_FOUND" ? "ENOENT" : undefined,
+              requestedCommand: commandSummary(command.id, command),
+              workingDirectory: state.cwd,
+              platform: process.platform,
+              processStarted: false,
+              resolution: error.resolution,
+              nextAction:
+                "Use an evidence-backed candidateValidationCommand through team_command; normal command authorization applies.",
+            });
+            validationLog.append({
+              type: "command_resolution_failed",
+              commandId: command.id,
+              code: error.code,
+              processStarted: false,
+              platform: process.platform,
+              resolution: error.resolution,
             });
           } finally {
             activity?.(undefined);
@@ -1011,17 +1094,14 @@ export class PiRunner implements AgentRunner {
         const required = effectiveConfig(state).commands.filter((c) =>
           allowedCommandCategories("tester").includes(c.purpose),
         );
-        // A model-supplied command ID cannot import another agent's failed run.
-        // Configured checks retain the existing exact-command reuse policy.
+        // Previous host evidence is useful context, never current Tester proof.
         const selected = current.filter(
           (item) =>
             allowedCommandCategories("tester").includes(
               item.command.purpose as "test" | "static",
             ) &&
-            (required.some(
-              (command) => commandKey(command) === item.commandIdentity,
-            ) ||
-              (item.agent === "tester" && item.attempt === attempt)),
+            item.agent === "tester" &&
+            item.attempt === attempt,
         );
         const authoritative: {
           item: (typeof current)[number];

@@ -8,8 +8,9 @@ import {
   parseValidationHint,
   testerValidationContext,
 } from "../src/agents/validation-context.ts";
-import { commandTool } from "../src/agents/commands.ts";
+import { commandTool, execute } from "../src/agents/commands.ts";
 import { testerCommandInstructions } from "../src/agents/runner.ts";
+import { recordVerifiedCommandResult } from "../src/workflow/verified-commands.ts";
 import { config, contract, repository } from "./helpers.ts";
 
 test("incident context exposes three candidates and static policy without invented evidence", async () => {
@@ -99,6 +100,37 @@ test("Reviewer exact command wins deduplication and unsafe hints are ignored", a
     assert.equal(parseValidationHint(unsafe), undefined);
 });
 
+test("current successful host evidence is a Tester suggestion, not approved gate evidence", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.commands = [];
+  const state = newState(cwd, "check", cfg, await baseline(cwd));
+  const command = {
+    id: "prior-test",
+    executable: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    purpose: "test" as const,
+    timeoutMs: 1000,
+  };
+  const evidence = await execute(command, cwd);
+  const verified = await recordVerifiedCommandResult(
+    state,
+    command,
+    evidence,
+    "implementor",
+    1,
+  );
+  assert.ok(verified);
+  state.verifiedCommandResults.push(verified);
+  const context = await contextFor("tester", state);
+  const suggestion = context.candidateValidationCommands.find(
+    (candidate: any) => candidate.executable === process.execPath,
+  );
+  assert.equal(suggestion.source, "verified:implementor:attempt-1");
+  assert.match(suggestion.purpose, /Re-run previously successful/);
+  assert.equal(context.approvedCommandIds.includes("prior-test"), false);
+});
+
 test("Tester instructions and tool description rule out empty discovery", async () => {
   const prompt = await readFile(
     new URL("../templates/agents/tester.md", import.meta.url),
@@ -115,9 +147,16 @@ test("Tester instructions and tool description rule out empty discovery", async 
   assert.match(testerCommandInstructions, /may be candidate commands/);
   assert.match(testerCommandInstructions, /does not discover or list/);
   assert.match(testerCommandInstructions, /team_command\(\{\}\) is invalid/);
+  assert.match(testerCommandInstructions, /Never combine Form A and Form B/);
+  assert.match(
+    testerCommandInstructions,
+    /Previous-agent verified commands are suggestions only/,
+  );
   const cfg = config();
   const tool = commandTool("tester", cfg, "/tmp", []);
   assert.match(tool.description, /Execute one concrete command/);
   assert.match(tool.description, /does not list or discover commands/);
   assert.match(tool.description, /team_command\(\{\}\) is invalid/);
+  assert.match(tool.description, /Form A/);
+  assert.match(tool.description, /Form B/);
 });

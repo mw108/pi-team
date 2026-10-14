@@ -343,7 +343,7 @@ test("real incident: Implementor PHP approval does not bypass Tester approval or
   assert.equal(state.agentFailures, 0);
 });
 
-test("Tester reuses Implementor evidence after restart and reruns after source mutation", async () => {
+test("Tester sees Implementor evidence as context but reruns configured checks for its own gate", async () => {
   const cwd = await repository();
   const cfg = config();
   const countPath = join(cwd, ".run-count");
@@ -406,15 +406,15 @@ test("Tester reuses Implementor evidence after restart and reruns after source m
   const reused = (await runner.run("tester", loaded)) as any;
   assert.equal(reused.status, "PASS");
   assert.equal(reused.commands[0].id, "count-test");
-  assert.equal(input.verifiedCommandResults[0].agent, "implementor");
-  assert.equal(await readFile(countPath, "utf8"), "x");
+  assert.equal(input.verifiedCommandResults[0].agent, "tester");
+  assert.equal(await readFile(countPath, "utf8"), "xx");
   await writeFile(
     join(cwd, "math.js"),
     "export const add = (a, b) => a + b;\n",
   );
   const rerun = (await runner.run("tester", loaded)) as any;
   assert.equal(rerun.status, "PASS");
-  assert.equal(await readFile(countPath, "utf8"), "xx");
+  assert.equal(await readFile(countPath, "utf8"), "xxx");
   assert.equal(input.verifiedCommandResults[0].agent, "tester");
 });
 

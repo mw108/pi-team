@@ -10,7 +10,12 @@ import {
   staticCommandMatches,
 } from "./command-policy.ts";
 import { commandKey } from "./discovery.ts";
-import { commandSummary } from "./command-observability.ts";
+import { commandSummary, redactCommandArgs } from "./command-observability.ts";
+import { redactVisibleText } from "./redaction.ts";
+import {
+  ExecutableResolutionError,
+  type ExecutableResolution,
+} from "./executable-resolution.ts";
 import {
   normalizedRuntimeCommand,
   type RuntimeCommandRequest,
@@ -40,8 +45,21 @@ export interface CommandEvidence {
   aborted?: boolean;
   durationMs?: number;
   completedAt?: string;
+  processStarted?: true;
+  platform?: NodeJS.Platform;
+  requestedExecutable?: string;
+  resolvedExecutable?: string;
+  resolution?: ExecutableResolution;
   sandbox: SandboxDetails;
 }
+export interface CommandAlternative {
+  command: Command;
+  source: string;
+  reason: string;
+}
+export type CommandFallbackProvider = (
+  failed: Command,
+) => Promise<CommandAlternative[]>;
 export async function execute(
   command: Command,
   cwd: string,
@@ -66,6 +84,8 @@ export async function execute(
         env: prepared.env,
         shell: false,
         detached: process.platform !== "win32",
+        windowsHide: true,
+        windowsVerbatimArguments: prepared.windowsVerbatimArguments,
         stdio: ["ignore", "pipe", "pipe"],
       });
       const collector = new CommandOutputCollector();
@@ -92,11 +112,34 @@ export async function execute(
       child.on("error", (e) => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", kill);
-        reject(
-          prepared.sandbox.mode === "bubblewrap"
-            ? new SandboxSetupError(`Bubblewrap could not start: ${e.message}`)
-            : e,
-        );
+        if (prepared.sandbox.mode === "bubblewrap") {
+          reject(
+            new SandboxSetupError(`Bubblewrap could not start: ${e.message}`),
+          );
+          return;
+        }
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "EACCES") {
+          reject(
+            new ExecutableResolutionError(
+              code === "ENOENT" ? "EXECUTABLE_NOT_FOUND" : "PERMISSION_DENIED",
+              code === "ENOENT"
+                ? `Executable could not be started: ${command.executable}`
+                : `Permission denied while starting executable: ${command.executable}`,
+              prepared.resolution ?? {
+                requested: command.executable,
+                resolved: prepared.executable,
+                kind: "native",
+                source: "explicit",
+                searchedPathEntries: 0,
+                searchedExtensions: [],
+              },
+              { cause: e },
+            ),
+          );
+          return;
+        }
+        reject(e);
       });
       child.on("close", (code) => {
         clearTimeout(timer);
@@ -122,6 +165,12 @@ export async function execute(
           aborted: signal?.aborted ?? false,
           durationMs: Math.max(0, Date.now() - startedAt),
           completedAt: new Date().toISOString(),
+          processStarted: true,
+          platform: process.platform,
+          requestedExecutable: command.executable,
+          resolvedExecutable:
+            prepared.resolution?.resolved ?? prepared.executable,
+          resolution: prepared.resolution,
           sandbox: prepared.sandbox,
         });
       });
@@ -187,12 +236,14 @@ export function commandTool(
   currentCommands?: () => Command[],
   onResult?: CommandResultObserver,
   onDenial?: (status: "denied" | "pending") => void,
+  fallbackProvider?: CommandFallbackProvider,
 ): ToolDefinition {
   const allowed = approvedCommandsForRole(role, config);
+  const failedStarts = new Set<string>();
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute one concrete command. Provide either id or executable + args + purpose; do not provide both forms. team_command({}) is invalid. This tool does not list or discover commands. Example: {"executable":"php","args":["artisan","test","tests/Unit/ConfigTest.php"],"purpose":"Run required unit test"}. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    description: `Execute one concrete command using exactly one form. Form A: {"id":"detected-..."}. Form B: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run required tests"}; do not provide both forms. team_command({}) is invalid. This tool does not list or discover commands. An alternative suggested after EXECUTABLE_NOT_FOUND must be submitted as a new call and receives normal authorization. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
     parameters: Type.Object(
       {
         id: Type.Optional(Type.String()),
@@ -268,12 +319,64 @@ export function commandTool(
           authorizationSource = "runtime";
         }
       }
-      const result = await execute(
-        command,
-        cwd,
-        signal,
-        config.execution.sandbox,
-      );
+      let result: CommandEvidence;
+      try {
+        result = await execute(command, cwd, signal, config.execution.sandbox);
+      } catch (error) {
+        if (!(error instanceof ExecutableResolutionError)) throw error;
+        failedStarts.add(commandKey(command));
+        const alternatives = ((await fallbackProvider?.(command)) ?? []).filter(
+          ({ command: alternative }) =>
+            commandKey(alternative) !== commandKey(command) &&
+            !failedStarts.has(commandKey(alternative)) &&
+            JSON.stringify(redactCommandArgs(alternative.args)) ===
+              JSON.stringify(alternative.args),
+        );
+        const safeAlternatives = alternatives.map(
+          ({ command: alternative, source, reason }) => ({
+            ...commandSummary(alternative.id, alternative),
+            source: redactVisibleText(source.slice(0, 256)),
+            reason: redactVisibleText(reason.slice(0, 500)),
+            requiresApproval: true,
+          }),
+        );
+        const requested = commandSummary(command.id, command);
+        const failure = {
+          status: "failed",
+          code: error.code,
+          category:
+            error.code === "PERMISSION_DENIED"
+              ? "PERMISSION_DENIED"
+              : error.code === "UNSAFE_BATCH_ARGUMENT"
+                ? "INVOCATION_ERROR"
+                : "EXECUTABLE_NOT_FOUND",
+          osError: error.code === "EXECUTABLE_NOT_FOUND" ? "ENOENT" : undefined,
+          message: redactVisibleText(error.message),
+          requestedCommand: requested,
+          workingDirectory: cwd,
+          platform: process.platform,
+          processStarted: false,
+          resolution: {
+            requested: redactVisibleText(error.resolution.requested),
+            resolved: error.resolution.resolved
+              ? redactVisibleText(error.resolution.resolved)
+              : undefined,
+            kind: error.resolution.kind,
+            source: error.resolution.source,
+            searchedPathEntries: error.resolution.searchedPathEntries,
+            searchedExtensions: error.resolution.searchedExtensions,
+          },
+          fallbackAvailable: safeAlternatives.length > 0,
+          suggestedAlternatives: safeAlternatives,
+          nextAction: safeAlternatives.length
+            ? "Choose an evidence-backed alternative and call team_command with its exact executable, args, and purpose. Normal authorization still applies."
+            : "Check PATH/PATHEXT or inspect project files for a valid command. Do not install or update global tools without explicit user approval.",
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(failure) }],
+          details: failure,
+        };
+      }
       evidence.push(result);
       await onResult?.(command, result);
       return {

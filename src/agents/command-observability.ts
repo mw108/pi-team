@@ -136,6 +136,25 @@ export function commandOutcomeForLog(result: unknown, isError: boolean) {
         message: "Command approval denied",
       },
     };
+  if (
+    details.processStarted === false &&
+    typeof details.code === "string" &&
+    typeof details.message === "string"
+  )
+    return {
+      success: false,
+      processStarted: false,
+      error: {
+        category:
+          details.code === "EXECUTABLE_NOT_FOUND"
+            ? ("execution" as const)
+            : details.code === "PERMISSION_DENIED"
+              ? ("policy" as const)
+              : ("validation" as const),
+        code: details.code,
+        message,
+      },
+    };
   const exitCode =
     typeof details.exitCode === "number" ? details.exitCode : undefined;
   const timedOut = details.timedOut === true;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFile, readFile, symlink } from "node:fs/promises";
+import { writeFile, readFile, symlink, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { discoverCommands, effectiveConfig } from "../src/agents/discovery.ts";
 import { execute, commandTool } from "../src/agents/commands.ts";
@@ -43,6 +43,8 @@ test("Composer scripts and PHPUnit discovery", async () => {
     }),
   );
   await writeFile(join(cwd, "phpunit.xml"), "<phpunit/>");
+  await mkdir(join(cwd, "vendor/bin"), { recursive: true });
+  await writeFile(join(cwd, "vendor/bin/phpunit"), "<?php echo 'ok';");
   const commands = await discoverCommands(cwd);
   assert.ok(
     commands.some(
@@ -51,8 +53,59 @@ test("Composer scripts and PHPUnit discovery", async () => {
         c.command.args.join(" ") === "run test",
     ),
   );
+  const phpunit = commands.find((c) =>
+    process.platform === "win32"
+      ? c.command.executable === "php" &&
+        c.command.args[0] === "vendor/bin/phpunit"
+      : c.command.executable === "vendor/bin/phpunit",
+  );
+  assert.ok(phpunit);
+  assert.equal(phpunit.execution?.requiresShell, false);
+  if (process.platform === "win32") {
+    assert.equal(phpunit.execution?.interpreter, "php");
+    assert.equal(phpunit.execution?.equivalentOf, "vendor/bin/phpunit");
+  }
+});
+
+test("Laravel evidence adds a portable Artisan test candidate without replacing Composer scripts", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "composer.json"),
+    JSON.stringify({
+      require: { "laravel/framework": "^12.0" },
+      scripts: { test: "php artisan test" },
+    }),
+  );
+  await writeFile(join(cwd, "artisan"), "<?php");
+  const commands = await discoverCommands(cwd);
   assert.ok(
-    commands.some((c) => c.command.executable === "vendor/bin/phpunit"),
+    commands.some(
+      (candidate) =>
+        candidate.command.executable === "composer" &&
+        candidate.command.args.join(" ") === "run test",
+    ),
+  );
+  const artisan = commands.find(
+    (candidate) =>
+      candidate.command.executable === "php" &&
+      candidate.command.args.join(" ") === "artisan test --no-coverage",
+  );
+  assert.ok(artisan);
+  assert.match(artisan.source, /artisan.*composer\.json/);
+  assert.equal(artisan.execution?.launcher, "interpreter");
+});
+
+test("PHPUnit configuration without an installed proxy does not invent an executable", async () => {
+  const cwd = await repository();
+  await writeFile(join(cwd, "phpunit.xml"), "<phpunit/>");
+  const commands = await discoverCommands(cwd);
+  assert.equal(
+    commands.some(
+      (candidate) =>
+        candidate.command.executable === "vendor/bin/phpunit" ||
+        candidate.command.args[0] === "vendor/bin/phpunit",
+    ),
+    false,
   );
 });
 test("duplicate command sources deduplicated and malformed data ignored", async () => {

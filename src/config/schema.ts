@@ -124,6 +124,17 @@ export const discoveredCommandSchema = z.object({
     "format-check",
     "other",
   ]),
+  execution: z
+    .object({
+      platform: z.enum(["any", "win32", "posix"]).default("any"),
+      launcher: z.enum(["path", "native", "interpreter"]).default("path"),
+      requiresShell: z.boolean().default(false),
+      interpreter: z.string().optional(),
+      equivalentOf: z.string().optional(),
+      reason: z.string().optional(),
+    })
+    .strict()
+    .optional(),
 });
 const filePermissionPattern = z
   .string()

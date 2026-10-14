@@ -8,6 +8,10 @@ import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { testerValidationContext } from "./validation-context.ts";
 import { projectInstructionsForAgent } from "../workflow/project-instructions.ts";
+import {
+  currentVerifiedCommandResults,
+  repositoryEvidenceState,
+} from "../workflow/verified-commands.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -124,7 +128,13 @@ export async function contextFor(
     context.approvedCommands = effectiveConfig(s, role).commands.filter((c) =>
       allowedCommandCategories(role).includes(c.purpose),
     );
-    Object.assign(context, testerValidationContext(s));
+    Object.assign(
+      context,
+      testerValidationContext(
+        s,
+        currentVerifiedCommandResults(s, await repositoryEvidenceState(s)),
+      ),
+    );
     context.candidateValidationCommandList = (
       context.candidateValidationCommands as {
         executable: string;

@@ -29,8 +29,10 @@ export const similarCommandRuleSchema = z
     const safe =
       rule.category === "test" &&
       ((rule.executable === "php" &&
-        JSON.stringify(rule.argsPrefix) ===
-          JSON.stringify(["artisan", "test"])) ||
+        (JSON.stringify(rule.argsPrefix) ===
+          JSON.stringify(["artisan", "test"]) ||
+          JSON.stringify(rule.argsPrefix) ===
+            JSON.stringify(["vendor/bin/phpunit"]))) ||
         (rule.executable === "vendor/bin/phpunit" &&
           rule.argsPrefix.length === 0));
     if (!safe)
@@ -52,8 +54,8 @@ export function normalizedRuntimeCommand(
   const request = runtimeCommandRequestSchema.parse(input);
   const obviousTest =
     (request.executable === "php" &&
-      request.args[0] === "artisan" &&
-      request.args[1] === "test") ||
+      ((request.args[0] === "artisan" && request.args[1] === "test") ||
+        request.args[0]?.replaceAll("\\", "/") === "vendor/bin/phpunit")) ||
     request.executable === "vendor/bin/phpunit" ||
     (request.executable === "composer" && request.args[0] === "test");
   const category =
@@ -130,9 +132,11 @@ export function proposeSimilarRule(
   const prefix =
     exe === "php" && args[0] === "artisan" && args[1] === "test"
       ? ["artisan", "test"]
-      : exe === "vendor/bin/phpunit"
-        ? []
-        : undefined;
+      : exe === "php" && args[0]?.replaceAll("\\", "/") === "vendor/bin/phpunit"
+        ? [args[0]]
+        : exe === "vendor/bin/phpunit"
+          ? []
+          : undefined;
   if (!prefix || command.purpose !== "test") return;
   const rule: SimilarCommandRule = {
     executable: exe,
