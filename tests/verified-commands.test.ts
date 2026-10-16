@@ -701,6 +701,11 @@ test("HAPAK invocation from Code Reviewer does not contaminate repaired Tester P
   );
   assert.equal(prompts, 2);
   assert.deepEqual(repairs, [
+    "json_repair_started",
+    "json_repair_failed",
+    "ai_json_repair_started",
+    "ai_json_repair_failed",
+    "local_json_repair_exhausted",
     "schema_repair_started",
     "schema_repair_succeeded",
   ]);

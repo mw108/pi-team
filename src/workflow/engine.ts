@@ -1889,14 +1889,25 @@ export class WorkflowEngine {
             },
             (event) => {
               if (control.intention || control.settled) return;
-              const metadata = {
-                agent: role,
-                attempt: attemptNumber,
-                repairAttempt: event.repairAttempt,
-                maxSchemaRepairAttempts: event.maxSchemaRepairAttempts,
-                failureType: event.failureType,
-              };
+              const modelRepair = "repairAttempt" in event;
+              const metadata = modelRepair
+                ? {
+                    agent: role,
+                    attempt: attemptNumber,
+                    repairAttempt: event.repairAttempt,
+                    maxSchemaRepairAttempts: event.maxSchemaRepairAttempts,
+                    failureType: event.failureType,
+                  }
+                : {
+                    agent: role,
+                    attempt: attemptNumber,
+                    method: event.method,
+                    originalFailureType: event.originalFailureType,
+                    schemaValid: event.schemaValid,
+                    skippedReason: event.skippedReason,
+                  };
               if (
+                modelRepair &&
                 role === "tester" &&
                 event.type === "schema_repair_started" &&
                 /Tester (?:PASS|FAIL|BLOCKED) requires/.test(
@@ -1920,7 +1931,9 @@ export class WorkflowEngine {
                 this.persistAttempt(
                   authoritative,
                   event.type,
-                  `${role} schema repair ${event.repairAttempt}${event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.maxSchemaRepairAttempts}`} ${event.type.slice("schema_repair_".length)}`,
+                  modelRepair
+                    ? `${role} schema repair ${event.repairAttempt}${event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.maxSchemaRepairAttempts}`} ${event.type.slice("schema_repair_".length)}`
+                    : `${role} ${event.type.replaceAll("_", " ")}${event.method ? ` (${event.method})` : ""}`,
                   metadata,
                 ),
               );

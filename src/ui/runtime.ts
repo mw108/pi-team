@@ -286,10 +286,15 @@ export class ProgressRuntime {
             : undefined,
       };
     else if (event.type === "schemaRepair" && existing) {
-      existing.controlActivity =
-        event.event.type === "schema_repair_started" ||
-        event.event.type === "schema_repair_failed"
-          ? `schema repair ${event.event.repairAttempt}${event.event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.event.maxSchemaRepairAttempts}`}`
+      if ("repairAttempt" in event.event)
+        existing.controlActivity =
+          event.event.type === "schema_repair_started" ||
+          event.event.type === "schema_repair_failed"
+            ? `schema repair ${event.event.repairAttempt}${event.event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.event.maxSchemaRepairAttempts}`}`
+            : undefined;
+      else
+        existing.controlActivity = event.event.type.endsWith("_started")
+          ? `local JSON repair (${event.event.method})`
           : undefined;
     } else if (event.type === "steer" && existing)
       existing.controlActivity = "Steering message queued";

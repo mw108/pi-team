@@ -100,6 +100,7 @@ import {
   type MutationObserver,
 } from "./mutation-attribution.ts";
 import { parseTextualToolCall } from "./textual-tool-call.ts";
+import type { LocalJsonRepairEvent } from "./local-json-repair.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -110,7 +111,7 @@ export type ActivityObserver = (
   result?: unknown,
 ) => void;
 export type OutputObserver = (text: string) => void;
-export type SchemaRepairEvent = {
+export type ModelSchemaRepairEvent = {
   type:
     | "schema_repair_started"
     | "schema_repair_failed"
@@ -121,6 +122,7 @@ export type SchemaRepairEvent = {
   failureType: "parse" | "schema" | "finalization";
   diagnostic?: string;
 };
+export type SchemaRepairEvent = ModelSchemaRepairEvent | LocalJsonRepairEvent;
 export type RuntimeFileApprover = (
   operation: "read" | "write",
   path: string,
@@ -932,7 +934,8 @@ export class PiRunner implements AgentRunner {
       let result: any;
       let schemaRepairAttempts = 0;
       let repairPending = false;
-      let lastOutputFailureType: SchemaRepairEvent["failureType"] = "schema";
+      let lastOutputFailureType: ModelSchemaRepairEvent["failureType"] =
+        "schema";
       const maxSchemaRepairAttempts =
         state.config.workflow.maxSchemaRepairAttempts;
       const parseFinal = () => {
@@ -949,7 +952,13 @@ export class PiRunner implements AgentRunner {
             redactVisibleText(text.slice(0, 2048)),
             true,
           );
-        return parseText(role, text, outputRecovered);
+        const latest = session.messages
+          .filter((message) => message.role === "assistant")
+          .at(-1) as any;
+        return parseText(role, text, outputRecovered, {
+          modelOutputTruncated: latest?.stopReason === "length",
+          onLocalRepair: schemaRepair,
+        });
       };
       const validateFinal = async () => {
         while (true) {

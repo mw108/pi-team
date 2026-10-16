@@ -3,6 +3,11 @@ import { posix } from "node:path";
 import { assertRelative } from "./permissions.ts";
 import { AgentOutputError } from "./errors.ts";
 import { redactVisibleText } from "./redaction.ts";
+import {
+  inspectLocalJsonRepairCandidate,
+  repairJsonLocally,
+  type LocalJsonRepairEvent,
+} from "./local-json-repair.ts";
 
 export const roles = [
   "orchestrator",
@@ -403,6 +408,18 @@ export type OutputRecovery = {
   discardedPreview: string;
 };
 
+export type ParseTextOptions = {
+  modelOutputTruncated?: boolean;
+  onLocalRepair?: (event: LocalJsonRepairEvent) => void;
+};
+
+export function extractJsonCandidate(text: string): string {
+  return text
+    .trim()
+    .replace(/^```(?:json)?\s*/, "")
+    .replace(/\s*```$/, "");
+}
+
 function leadingJsonEnd(text: string): number | undefined {
   if (text[0] !== "{" && text[0] !== "[") return undefined;
   const closing: string[] = [text[0] === "{" ? "}" : "]"];
@@ -431,67 +448,74 @@ export function parseText<R extends Role>(
   role: R,
   text: string,
   onRecovered?: (recovery: OutputRecovery) => void,
+  options: ParseTextOptions = {},
 ): AgentResult<R> {
   const preview = redactVisibleText(text.slice(0, 2048));
-  const trimmed = text
-    .trim()
-    .replace(/^```(?:json)?\s*/, "")
-    .replace(/\s*```$/, "");
+  const candidate = extractJsonCandidate(text);
   let value: unknown;
+  let originalFailure: AgentOutputError | undefined;
   try {
-    value = JSON.parse(trimmed);
+    value = JSON.parse(candidate);
   } catch (originalError) {
-    const end = leadingJsonEnd(trimmed);
-    const trailing = end === undefined ? "" : trimmed.slice(end);
-    if (!trailing || !/^[\s}\]]+$/.test(trailing) || !/[}\]]/.test(trailing))
-      throw new AgentOutputError(
-        "parse",
-        role,
-        preview,
-        false,
-        redactVisibleText(String(originalError).slice(0, 500)),
-      );
-    try {
-      value = JSON.parse(trimmed.slice(0, end));
-    } catch {
-      throw new AgentOutputError(
-        "parse",
-        role,
-        preview,
-        false,
-        redactVisibleText(String(originalError).slice(0, 500)),
-      );
-    }
-    let result: AgentResult<R>;
-    try {
-      result = parseResult(role, value);
-    } catch (error) {
-      throw new AgentOutputError(
-        "schema",
-        role,
-        preview,
-        false,
-        schemaDiagnostic(error),
-      );
-    }
-    onRecovered?.({
-      reason: "trailing_closing_delimiter",
-      discardedLength: trailing.length,
-      discardedPreview: trailing.slice(0, 32),
-    });
-    return result;
-  }
-  try {
-    return parseResult(role, value);
-  } catch (error) {
-    throw new AgentOutputError(
-      "schema",
+    originalFailure = new AgentOutputError(
+      "parse",
       role,
       preview,
       false,
-      schemaDiagnostic(error),
+      redactVisibleText(String(originalError).slice(0, 500)),
     );
   }
+
+  if (!originalFailure) {
+    const inspection = inspectLocalJsonRepairCandidate(
+      candidate,
+      options.modelOutputTruncated,
+    );
+    if (!inspection.safe)
+      originalFailure = new AgentOutputError(
+        "parse",
+        role,
+        preview,
+        false,
+        inspection.diagnostic,
+      );
+    else
+      try {
+        return parseResult(role, value);
+      } catch (error) {
+        originalFailure = new AgentOutputError(
+          "schema",
+          role,
+          preview,
+          false,
+          schemaDiagnostic(error),
+        );
+      }
+  }
+
+  const repaired = repairJsonLocally({
+    candidate,
+    originalFailureType:
+      originalFailure!.kind === "schema" ? "schema" : "parse",
+    ...(originalFailure!.kind === "schema"
+      ? { originalParsedValue: value }
+      : {}),
+    modelOutputTruncated: options.modelOutputTruncated,
+    validate: (candidateValue) => parseResult(role, candidateValue),
+    onEvent: options.onLocalRepair,
+  });
+  if (repaired !== undefined) {
+    const end = leadingJsonEnd(candidate);
+    const trailing = end === undefined ? "" : candidate.slice(end);
+    if (trailing && /^[\s}\]]+$/.test(trailing) && /[}\]]/.test(trailing))
+      onRecovered?.({
+        reason: "trailing_closing_delimiter",
+        discardedLength: trailing.trimEnd().length,
+        discardedPreview: trailing.trimEnd().slice(0, 32),
+      });
+    return repaired;
+  }
+  throw originalFailure!;
 }
 
 function schemaDiagnostic(error: unknown): string {

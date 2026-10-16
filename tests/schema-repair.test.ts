@@ -415,6 +415,20 @@ test("successful repair records progress without charging an agent failure", asy
   assert.equal(state.agentFailures, 0);
   assert.deepEqual(
     state.history
+      .filter((entry) => entry.event.includes("repair"))
+      .map((entry) => entry.event),
+    [
+      "json_repair_started",
+      "json_repair_failed",
+      "ai_json_repair_started",
+      "ai_json_repair_failed",
+      "local_json_repair_exhausted",
+      "schema_repair_started",
+      "schema_repair_succeeded",
+    ],
+  );
+  assert.deepEqual(
+    state.history
       .filter((entry) => entry.event.startsWith("schema_repair_"))
       .map((entry) => entry.event),
     ["schema_repair_started", "schema_repair_succeeded"],

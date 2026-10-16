@@ -79,8 +79,8 @@ test("structured output rejects other malformed content with typed failures", ()
   for (const raw of [
     valid + valid,
     valid + " explanation",
-    valid.slice(0, -1),
-    '{"requirements":["x"] "summary":"y"}',
+    '{"requirements":["x"],"summary":"unfinished}',
+    '{"requirements":["x"],"summary":}',
     "Here is the JSON:\n" + valid,
   ]) {
     assert.throws(
