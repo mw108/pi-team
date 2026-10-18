@@ -183,6 +183,32 @@ export const configSchema = z
           .union([z.literal(0), z.number().int().min(1000).max(86400000)])
           .default(300000),
         requestTimeoutMs: z.number().int().min(0).optional(),
+        modelPreflight: z
+          .object({
+            coldStartTimeoutMs: z
+              .number()
+              .int()
+              .min(1000)
+              .max(86400000)
+              .default(600000),
+            pollIntervalMs: z.number().int().min(100).max(60000).default(3000),
+            maxPollIntervalMs: z
+              .number()
+              .int()
+              .min(100)
+              .max(60000)
+              .default(10000),
+          })
+          .strict()
+          .superRefine((value, ctx) => {
+            if (value.maxPollIntervalMs < value.pollIntervalMs)
+              ctx.addIssue({
+                code: "custom",
+                path: ["maxPollIntervalMs"],
+                message: "maxPollIntervalMs must be at least pollIntervalMs",
+              });
+          })
+          .default({}),
         networkRetry: z
           .object({
             maxRetries: z.number().int().min(0).default(10),

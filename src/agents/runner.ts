@@ -327,6 +327,7 @@ export class PiRunner implements AgentRunner {
       providerRequest: number,
     ) => void,
     contractApproval?: RuntimeContractApprover,
+    preflightLifecycle?: { start(): void; end(): void },
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
       selected = config.agents[role];
@@ -379,12 +380,22 @@ export class PiRunner implements AgentRunner {
       Date.now,
       providerProgress,
       undefined,
-      (requestModel, options, signal, onEvent, onUpdate) =>
-        ensureRouterModelReady(runtime, requestModel, options, {
-          signal,
-          onEvent,
-          onUpdate,
-        }),
+      async (requestModel, options, signal, onEvent, onUpdate) => {
+        preflightLifecycle?.start();
+        try {
+          await ensureRouterModelReady(runtime, requestModel, options, {
+            signal,
+            onEvent,
+            onUpdate,
+            coldStartTimeoutMs:
+              config.workflow.modelPreflight.coldStartTimeoutMs,
+            pollIntervalMs: config.workflow.modelPreflight.pollIntervalMs,
+            maxPollIntervalMs: config.workflow.modelPreflight.maxPollIntervalMs,
+          });
+        } finally {
+          preflightLifecycle?.end();
+        }
+      },
       providerEvent,
       providerProgress,
       resolveRequestTimeout(config, role),
@@ -717,6 +728,10 @@ export class PiRunner implements AgentRunner {
     let executionSignal: AbortSignal | undefined;
     let timeoutStartedAt: number | undefined;
     let timedOut = false;
+    let agentTimeoutElapsed = (): number | null => null;
+    let agentTimeoutRemaining = (): number | null => null;
+    let pauseAgentTimeout = () => {};
+    let resumeAgentTimeout = () => {};
     const doomConfig = resolveDoomLoop(effectiveConfig(state), role);
     const entry: ActiveAgentSession = {
       workflowId: state.id,
@@ -767,13 +782,8 @@ export class PiRunner implements AgentRunner {
           agentTimeoutMode:
             agentTimeoutMs === undefined ? "unlimited" : "limited",
           agentTimeoutElapsedMs:
-            timeoutStartedAt === undefined
-              ? null
-              : Date.now() - timeoutStartedAt,
-          agentTimeoutRemainingMs:
-            agentTimeoutMs === undefined || timeoutStartedAt === undefined
-              ? null
-              : Math.max(0, agentTimeoutMs - (Date.now() - timeoutStartedAt)),
+            timeoutStartedAt === undefined ? null : agentTimeoutElapsed(),
+          agentTimeoutRemainingMs: agentTimeoutRemaining(),
           agentTimeoutTriggered: timedOut,
           doomLoop: {
             interventions: entry.doomLoopInterventions ?? 0,
@@ -805,6 +815,10 @@ export class PiRunner implements AgentRunner {
       },
       normalizedResponse,
       contractApproval,
+      {
+        start: () => pauseAgentTimeout(),
+        end: () => resumeAgentTimeout(),
+      },
     );
     entry.session = session;
     try {
@@ -818,6 +832,8 @@ export class PiRunner implements AgentRunner {
     executionSignal = executionAbort.signal;
     timeoutStartedAt = Date.now();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let remainingMs = timeoutMs;
+    let activeStartedAt: number | undefined;
     let abortTask: Promise<void> | undefined;
     const abort = () => {
       if (abortTask) return;
@@ -831,11 +847,51 @@ export class PiRunner implements AgentRunner {
       }
       abortTask = session.abort().catch(() => {});
     };
-    if (timeoutMs !== undefined)
+    const scheduleTimeout = () => {
+      if (
+        timeoutMs === undefined ||
+        remainingMs === undefined ||
+        executionAbort.signal.aborted
+      )
+        return;
+      activeStartedAt = Date.now();
       timer = setTimeout(() => {
         timedOut = true;
         abort();
-      }, timeoutMs);
+      }, remainingMs);
+    };
+    pauseAgentTimeout = () => {
+      if (timeoutMs === undefined || activeStartedAt === undefined) return;
+      remainingMs = Math.max(0, remainingMs! - (Date.now() - activeStartedAt));
+      activeStartedAt = undefined;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    };
+    resumeAgentTimeout = () => {
+      if (timeoutMs === undefined || activeStartedAt !== undefined) return;
+      if ((remainingMs ?? 0) <= 0) {
+        timedOut = true;
+        abort();
+        return;
+      }
+      scheduleTimeout();
+    };
+    agentTimeoutElapsed = () =>
+      timeoutMs === undefined
+        ? null
+        : Math.max(
+            0,
+            timeoutMs -
+              (remainingMs ?? 0) +
+              (activeStartedAt === undefined
+                ? 0
+                : Date.now() - activeStartedAt),
+          );
+    agentTimeoutRemaining = () =>
+      timeoutMs === undefined
+        ? null
+        : Math.max(0, timeoutMs - (agentTimeoutElapsed() ?? 0));
+    scheduleTimeout();
     signal?.addEventListener("abort", abort, { once: true });
     try {
       if (signal?.aborted) throw new Error("Workflow interrupted");

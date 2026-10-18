@@ -162,6 +162,10 @@ export async function doctor(cwd: string) {
     lines.push(
       `maxResearchClarifications: ${config.workflow.maxResearchClarifications === 0 ? "unlimited" : config.workflow.maxResearchClarifications}`,
     );
+    const preflight = config.workflow.modelPreflight;
+    lines.push(
+      `Model preflight: ${preflight.coldStartTimeoutMs} ms cold-start deadline; ${preflight.pollIntervalMs}–${preflight.maxPollIntervalMs} ms polling`,
+    );
     lines.push(
       `Doom-loop detector: enabled ${doom.enabled ? "yes" : "no"}; window ${doom.windowSize} calls; identical threshold ${doom.maxIdenticalCalls}; repeated-pattern threshold ${doom.maxRepeatedPattern}; interventions ${doom.maxInterventions}`,
     );

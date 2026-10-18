@@ -277,7 +277,11 @@ test("allow once authorizes one matching mutation, preserves original contract, 
   assert.deepEqual(contract.filesToModify, ["math.js"]);
   assert.deepEqual(
     f.requests[0].options.map((option: any) => option.label),
-    ["Ja", "Ja für diesen Workflow", "Nein"],
+    ["Yes", "Yes for this workflow", "No"],
+  );
+  assert.deepEqual(
+    f.requests[0].options.map((option: any) => option.value),
+    ["allow_once", "allow_workflow", "deny"],
   );
   assert.equal(approvalParams(f.requests[0]).questions[0].type, "single");
   assert.match(

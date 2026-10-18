@@ -25,6 +25,7 @@ const runtimeWorkflow = new Set([
   "maxToolCalls",
   "agentTimeoutMs",
   "requestTimeoutMs",
+  "modelPreflight",
   "networkRetry",
   "doomLoop",
 ]);

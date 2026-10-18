@@ -59,17 +59,17 @@ export class RuntimeCommandApprovalCoordinator {
       options: [
         {
           value: "allow_once",
-          label: "Ja",
+          label: "Yes",
           description: "Allow one matching mutation request",
         },
         {
           value: "allow_workflow",
-          label: "Ja für diesen Workflow",
+          label: "Yes for this workflow",
           description: "Allow this exact path and operation for this workflow",
         },
         {
           value: "deny",
-          label: "Nein",
+          label: "No",
           description: "Do not authorize this change",
         },
       ],

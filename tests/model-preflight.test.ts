@@ -25,6 +25,7 @@ import { renderProgress } from "../src/ui/progress.ts";
 import { newState } from "../src/workflow/state.ts";
 import { AttemptLogger } from "../src/workflow/agent-logs.ts";
 import { config } from "./helpers.ts";
+import { configSchema } from "../src/config/schema.ts";
 
 let port = 19000;
 const base = () => `http://127.0.0.1:${++port}`;
@@ -36,6 +37,29 @@ const model = (id: string, baseUrl: string) =>
     api: "openai-completions",
     baseUrl,
   }) as Model<Api>;
+
+test("model preflight configuration defaults and validates bounded polling", () => {
+  const withoutPreflight = config();
+  delete (withoutPreflight.workflow as any).modelPreflight;
+  const defaults = configSchema.parse(withoutPreflight).workflow.modelPreflight;
+  assert.deepEqual(defaults, {
+    coldStartTimeoutMs: 600000,
+    pollIntervalMs: 3000,
+    maxPollIntervalMs: 10000,
+  });
+  const baseConfig = config();
+  for (const modelPreflight of [
+    { ...defaults, coldStartTimeoutMs: 999 },
+    { ...defaults, pollIntervalMs: 99 },
+    { ...defaults, pollIntervalMs: 5000, maxPollIntervalMs: 4000 },
+  ])
+    assert.throws(() =>
+      configSchema.parse({
+        ...baseConfig,
+        workflow: { ...baseConfig.workflow, modelPreflight },
+      }),
+    );
+});
 type Status = {
   value: string;
   failed?: boolean;
@@ -90,6 +114,58 @@ function withSse(server: Router, initial: unknown[] = []): SseRouter {
     connections: () => connections,
     closed: () => closed,
   };
+}
+
+function controlledJsonResponse(signal: AbortSignal) {
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let settled = false;
+  let aborts = 0;
+  const encoder = new TextEncoder();
+  const abort = () => {
+    if (settled) return;
+    settled = true;
+    aborts++;
+    controller?.error(signal.reason ?? new Error("Request aborted"));
+    signal.removeEventListener("abort", abort);
+  };
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(stream) {
+        controller = stream;
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      },
+      cancel() {
+        settled = true;
+        signal.removeEventListener("abort", abort);
+      },
+    }),
+    { headers: { "Content-Type": "application/json" } },
+  );
+  return {
+    response,
+    complete(value: unknown) {
+      if (settled) return;
+      settled = true;
+      controller?.enqueue(encoder.encode(JSON.stringify(value)));
+      controller?.close();
+      signal.removeEventListener("abort", abort);
+    },
+    aborts: () => aborts,
+  };
+}
+
+function cancellableResponse(status: number) {
+  let cancellations = 0;
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      cancel() {
+        cancellations++;
+      },
+    }),
+    { status },
+  );
+  return { response, cancellations: () => cancellations };
 }
 const loading = (model: string, value: unknown, status = "loading") => ({
   model,
@@ -217,7 +293,7 @@ test("capability 404s are cached per provider endpoint", async () => {
   const other = lazyBackend(id, { loadStatus: 200 });
   await ready(id, other, { baseUrl: base() });
   assert.ok(other.calls.includes("POST /models/load"));
-  assert.ok(!other.calls.some((call) => call.includes("chat/completions")));
+  assert.ok(other.calls.some((call) => call.includes("chat/completions")));
 });
 
 test("SSE and explicit load capabilities are independent", async () => {
@@ -225,7 +301,7 @@ test("SSE and explicit load capabilities are independent", async () => {
   const explicit = lazyBackend(id, { sseStatus: 404, loadStatus: 200 });
   await ready(id, explicit);
   assert.ok(explicit.calls.includes("POST /models/load"));
-  assert.ok(!explicit.calls.some((call) => call.includes("chat/completions")));
+  assert.ok(explicit.calls.some((call) => call.includes("chat/completions")));
   const lazy = lazyBackend(id, { sseStatus: 200 });
   await ready(id, lazy);
   assert.ok(lazy.calls.includes("POST /chat/completions"));
@@ -274,6 +350,56 @@ test("load 500 and auth failures do not trigger warmup", async () => {
   }
 });
 
+test("transient explicit-load HTTP response is retried only after readiness check", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  let inventories = 0;
+  let loads = 0;
+  const fetchMock = (async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/models") {
+      inventories++;
+      return Response.json({
+        data: [
+          {
+            id: "a",
+            status: { value: inventories >= 3 ? "loaded" : "unloaded" },
+          },
+        ],
+      });
+    }
+    if (path === "/models/sse") return new Response(null, { status: 404 });
+    if (path === "/models/load") {
+      loads++;
+      return loads === 1
+        ? new Response(null, { status: 503 })
+        : Response.json({ success: true });
+    }
+    assert.fail(`Unexpected request: ${path}`);
+  }) as typeof fetch;
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    {
+      pollIntervalMs: 1,
+      maxPollIntervalMs: 2,
+      coldStartTimeoutMs: 100,
+      onEvent: (event) => events.push(event),
+    },
+  );
+  assert.equal(loads, 2);
+  assert.ok(inventories >= 3);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "model_preflight_transient_error" &&
+        event.phase === "explicit_load" &&
+        event.httpStatus === 503,
+    ),
+  );
+});
+
 test("warmup requires HTTP 200 JSON with nonempty choices", async () => {
   const cases: Array<[LazyBackendOptions, RegExp]> = [
     [
@@ -283,7 +409,7 @@ test("warmup requires HTTP 200 JSON with nonempty choices", async () => {
     [{ warmupStatus: 500 }, /HTTP 500/],
     [{ warmupBody: '{"object":"ok"}' }, /no chat-completion choices/],
     [{ warmupBody: '{"choices":[]}' }, /no chat-completion choices/],
-    [{ warmupBody: "not-json" }, /no chat-completion choices/],
+    [{ warmupBody: "not-json" }, /returned malformed JSON/],
   ];
   for (const [config, expected] of cases) {
     const server = lazyBackend("a", config);
@@ -309,7 +435,547 @@ test("warmup ignores normal request timeout but obeys preflight abort", async ()
       { fetch: late.fetch, timeoutMs: 1 },
       { signal: AbortSignal.timeout(10) },
     ),
-    /Model preflight timed out while warming up/,
+    /cancelled.*timeout/i,
+  );
+});
+
+test("transient warmup failure is followed by model-specific readiness polling", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  let inventories = 0;
+  let warmups = 0;
+  let loads = 0;
+  const fetchMock = (async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/models") {
+      inventories++;
+      return Response.json({
+        data: [
+          inventories === 1
+            ? { id: "a" }
+            : { id: "a", status: { value: "loaded" } },
+        ],
+      });
+    }
+    if (path === "/models/sse") return new Response(null, { status: 404 });
+    if (path === "/models/load") {
+      loads++;
+      return new Response(null, { status: 404 });
+    }
+    if (path === "/chat/completions") {
+      warmups++;
+      const cause = Object.assign(new Error("connection reset"), {
+        code: "ECONNRESET",
+      });
+      throw new TypeError("fetch failed", { cause });
+    }
+    assert.fail(`Unexpected request: ${path}`);
+  }) as typeof fetch;
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    {
+      pollIntervalMs: 1,
+      maxPollIntervalMs: 2,
+      coldStartTimeoutMs: 100,
+      onEvent: (event) => events.push(event),
+    },
+  );
+  assert.equal(loads, 1);
+  assert.equal(warmups, 1);
+  assert.ok(inventories >= 2);
+  const transient = events.find(
+    (event) => event.type === "model_preflight_transient_error",
+  );
+  assert.equal(transient?.phase, "warmup");
+  assert.equal(transient?.lastErrorCode, "ECONNRESET");
+  assert.equal(transient?.error?.cause?.code, "ECONNRESET");
+  assert.equal(events.at(-1)?.type, "model_preflight_ready");
+});
+
+test("bounded warmup request timeout recovers when server-side loading continues", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  let inventories = 0;
+  const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/models") {
+      inventories++;
+      return Response.json({
+        data: [
+          inventories === 1
+            ? { id: "a" }
+            : { id: "a", status: { value: "loaded" } },
+        ],
+      });
+    }
+    if (path === "/models/sse" || path === "/models/load")
+      return new Response(null, { status: 404 });
+    if (path === "/chat/completions")
+      return new Promise<Response>((_, reject) =>
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(init.signal?.reason),
+          { once: true },
+        ),
+      );
+    assert.fail(`Unexpected request: ${path}`);
+  }) as typeof fetch;
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    {
+      requestTimeoutMs: 5,
+      pollIntervalMs: 1,
+      maxPollIntervalMs: 2,
+      coldStartTimeoutMs: 100,
+      onEvent: (event) => events.push(event),
+    },
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "model_preflight_transient_error" &&
+        event.phase === "warmup" &&
+        event.error?.name === "TimeoutError",
+    ),
+  );
+  assert.equal(events.at(-1)?.type, "model_preflight_ready");
+});
+
+test("finite response deadline stays active through body consumption and is cleaned up", async () => {
+  const url = base();
+  let body: ReturnType<typeof controlledJsonResponse> | undefined;
+  let requestSignal: AbortSignal | undefined;
+  const fetchMock = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requestSignal = init?.signal ?? undefined;
+    assert.ok(requestSignal);
+    body = controlledJsonResponse(requestSignal);
+    return body.response;
+  }) as typeof fetch;
+  const task = ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    { requestTimeoutMs: 50, coldStartTimeoutMs: 200 },
+  );
+  await waitUntil(() => body !== undefined);
+  body!.complete({ data: [{ id: "a", status: { value: "loaded" } }] });
+  await task;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(requestSignal?.aborted, false);
+  assert.equal(body!.aborts(), 0);
+});
+
+test("headers followed by a stalled body time out and recover by polling", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  let inventories = 0;
+  let stalled: ReturnType<typeof controlledJsonResponse> | undefined;
+  const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(new URL(String(input)).pathname, "/models");
+    inventories++;
+    if (inventories === 1) {
+      assert.ok(init?.signal);
+      stalled = controlledJsonResponse(init.signal);
+      return stalled.response;
+    }
+    return Response.json({
+      data: [{ id: "a", status: { value: "loaded" } }],
+    });
+  }) as typeof fetch;
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    {
+      requestTimeoutMs: 10,
+      pollIntervalMs: 1,
+      maxPollIntervalMs: 2,
+      coldStartTimeoutMs: 200,
+      onEvent: (event) => events.push(event),
+    },
+  );
+  assert.equal(stalled?.aborts(), 1);
+  assert.ok(inventories >= 2);
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "model_preflight_transient_error" &&
+        event.phase === "inventory" &&
+        event.classification === "transient" &&
+        event.error?.name === "TimeoutError",
+    ),
+  );
+  assert.equal(events.at(-1)?.type, "model_preflight_ready");
+});
+
+test("body-timeout cold-start recovery proceeds to real agent execution", async () => {
+  const url = base();
+  let inventories = 0;
+  let inference = 0;
+  const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    assert.equal(new URL(String(input)).pathname, "/models");
+    inventories++;
+    if (inventories === 1) {
+      assert.ok(init?.signal);
+      return controlledJsonResponse(init.signal).response;
+    }
+    return Response.json({
+      data: [{ id: "a", status: { value: "loaded" } }],
+    });
+  }) as typeof fetch;
+  const pi = runtime(url, () => inference++);
+  const provider: ProviderRequestEvent[] = [];
+  configureNetworkRetry(
+    pi,
+    { maxRetries: 0, delayMs: 1 },
+    () => undefined,
+    undefined,
+    (event) => provider.push(event),
+    Date.now,
+    undefined,
+    () => () => {},
+    (selected, options, signal, onEvent, onUpdate) =>
+      ensureRouterModelReady(
+        pi,
+        selected,
+        { ...options, fetch: fetchMock },
+        {
+          signal,
+          requestTimeoutMs: 10,
+          pollIntervalMs: 1,
+          maxPollIntervalMs: 2,
+          coldStartTimeoutMs: 200,
+          onEvent,
+          onUpdate,
+        },
+      ),
+  );
+  const result = await pi
+    .streamSimple(model("a", url), { messages: [] })
+    .result();
+  assert.equal(result.stopReason, "stop");
+  assert.equal(inference, 1);
+  assert.equal(
+    provider.filter((event) => event.type === "provider_request_start").length,
+    1,
+  );
+});
+
+test("parent cancellation interrupts response body consumption", async () => {
+  const url = base();
+  const controller = new AbortController();
+  const events: ModelPreflightEvent[] = [];
+  let body: ReturnType<typeof controlledJsonResponse> | undefined;
+  const fetchMock = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init?.signal);
+    body = controlledJsonResponse(init.signal);
+    return body.response;
+  }) as typeof fetch;
+  const task = ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    {
+      signal: controller.signal,
+      requestTimeoutMs: 100,
+      coldStartTimeoutMs: 200,
+      onEvent: (event) => events.push(event),
+    },
+  );
+  await waitUntil(() => body !== undefined);
+  controller.abort(new Error("cancel during response body"));
+  await assert.rejects(task, /cancelled.*cancel during response body/i);
+  await waitUntil(() => body!.aborts() === 1);
+  assert.equal(events.at(-1)?.type, "model_preflight_cancelled");
+});
+
+test("cold-start deadline expires during body consumption with timeout diagnostics", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  let body: ReturnType<typeof controlledJsonResponse> | undefined;
+  const fetchMock = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    assert.ok(init?.signal);
+    body = controlledJsonResponse(init.signal);
+    return body.response;
+  }) as typeof fetch;
+  await assert.rejects(
+    ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      {
+        requestTimeoutMs: 100,
+        coldStartTimeoutMs: 15,
+        onEvent: (event) => events.push(event),
+      },
+    ),
+    /cold-start deadline exceeded/i,
+  );
+  assert.equal(body?.aborts(), 1);
+  const terminal = events.at(-1);
+  assert.equal(terminal?.type, "model_preflight_timeout");
+  assert.equal(terminal?.classification, "transient");
+  assert.equal(terminal?.error?.cause?.name, "TimeoutError");
+});
+
+test("malformed finite JSON produces a specific permanent diagnostic", async () => {
+  const url = base();
+  const events: ModelPreflightEvent[] = [];
+  const fetchMock = (async () =>
+    new Response("{not-json", {
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+  await assert.rejects(
+    ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      { onEvent: (event) => events.push(event) },
+    ),
+    /Provider \/models returned malformed JSON/,
+  );
+  const terminal = events.at(-1);
+  assert.equal(terminal?.type, "model_preflight_failed");
+  assert.equal(terminal?.classification, "permanent");
+  assert.equal(terminal?.error?.cause?.name, "SyntaxError");
+});
+
+test("unused finite and unsupported SSE response bodies are cancelled", async () => {
+  const url = base();
+  let inventories = 0;
+  let sse: ReturnType<typeof cancellableResponse> | undefined;
+  let load: ReturnType<typeof cancellableResponse> | undefined;
+  const fetchMock = (async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/models") {
+      inventories++;
+      return Response.json({
+        data: [
+          {
+            id: "a",
+            status: { value: inventories === 1 ? "unloaded" : "loaded" },
+          },
+        ],
+      });
+    }
+    if (path === "/models/sse") {
+      sse = cancellableResponse(404);
+      return sse.response;
+    }
+    if (path === "/models/load") {
+      load = cancellableResponse(200);
+      return load.response;
+    }
+    assert.fail(`Unexpected request: ${path}`);
+  }) as typeof fetch;
+  await ensureRouterModelReady(
+    runtime(url),
+    model("a", url),
+    { fetch: fetchMock },
+    { pollIntervalMs: 1, maxPollIntervalMs: 2 },
+  );
+  assert.equal(sse?.cancellations(), 1);
+  assert.equal(load?.cancellations(), 1);
+});
+
+test("SSE hands off after headers without waiting for stream completion", async () => {
+  const regular = router({
+    a: [
+      { value: "loading" },
+      { value: "loading" },
+      { value: "loading" },
+      { value: "loaded" },
+    ],
+  });
+  let requestSignal: AbortSignal | undefined;
+  let cancellations = 0;
+  const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new URL(String(input)).pathname !== "/models/sse")
+      return regular.fetch(input, init);
+    requestSignal = init?.signal ?? undefined;
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        cancel() {
+          cancellations++;
+        },
+      }),
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+  const task = ready(
+    "a",
+    { ...regular, fetch: fetchMock },
+    {
+      requestTimeoutMs: 5,
+      pollIntervalMs: 10,
+      coldStartTimeoutMs: 200,
+    },
+  );
+  await waitUntil(() => requestSignal !== undefined);
+  await new Promise((resolve) => setTimeout(resolve, 8));
+  assert.equal(requestSignal?.aborted, false);
+  await task;
+  assert.equal(cancellations, 1);
+});
+
+test("concurrent callers retain independent cancellation while reading one shared body", async () => {
+  const url = base();
+  const firstController = new AbortController();
+  let body: ReturnType<typeof controlledJsonResponse> | undefined;
+  let fetches = 0;
+  let requestSignal: AbortSignal | undefined;
+  const fetchMock = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    fetches++;
+    requestSignal = init?.signal ?? undefined;
+    assert.ok(requestSignal);
+    body = controlledJsonResponse(requestSignal);
+    return body.response;
+  }) as typeof fetch;
+  const server: Router = {
+    fetch: fetchMock,
+    calls: [],
+    loadCount: () => 0,
+  };
+  const first = ready("a", server, {
+    baseUrl: url,
+    signal: firstController.signal,
+    requestTimeoutMs: 100,
+  });
+  const second = ready("a", server, {
+    baseUrl: url,
+    requestTimeoutMs: 100,
+  });
+  await waitUntil(() => body !== undefined);
+  firstController.abort(new Error("first caller left"));
+  await assert.rejects(first, /cancelled.*first caller left/i);
+  assert.equal(requestSignal?.aborted, false);
+  body!.complete({ data: [{ id: "a", status: { value: "loaded" } }] });
+  await second;
+  assert.equal(fetches, 1);
+  assert.equal(body!.aborts(), 0);
+});
+
+test("HTTP 503 inventory failure and uncertain fetch failure are recoverable", async () => {
+  for (const firstFailure of [
+    () => new Response(null, { status: 503 }),
+    () => {
+      throw new TypeError("fetch failed");
+    },
+  ]) {
+    const url = base();
+    const events: ModelPreflightEvent[] = [];
+    let calls = 0;
+    const fetchMock = (async () => {
+      calls++;
+      if (calls === 1) {
+        const result = firstFailure();
+        if (result instanceof Response) return result;
+      }
+      return Response.json({
+        data: [{ id: "a", status: { value: "loaded" } }],
+      });
+    }) as typeof fetch;
+    await ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      {
+        pollIntervalMs: 1,
+        maxPollIntervalMs: 2,
+        coldStartTimeoutMs: 100,
+        onEvent: (event) => events.push(event),
+      },
+    );
+    const transient = events.find(
+      (event) => event.type === "model_preflight_transient_error",
+    );
+    assert.ok(transient);
+    if (transient.httpStatus === undefined)
+      assert.equal(transient.classification, "uncertain");
+    else assert.equal(transient.httpStatus, 503);
+    assert.equal(events.at(-1)?.type, "model_preflight_ready");
+  }
+});
+
+test("structured preflight transport codes recover with their cause chain intact", async () => {
+  for (const code of [
+    "ETIMEDOUT",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+  ]) {
+    const url = base();
+    const events: ModelPreflightEvent[] = [];
+    let calls = 0;
+    const fetchMock = (async () => {
+      calls++;
+      if (calls === 1) {
+        const cause = Object.assign(new Error(code), { code });
+        throw new TypeError("fetch failed", { cause });
+      }
+      return Response.json({
+        data: [{ id: "a", status: { value: "loaded" } }],
+      });
+    }) as typeof fetch;
+    await ensureRouterModelReady(
+      runtime(url),
+      model("a", url),
+      { fetch: fetchMock },
+      {
+        pollIntervalMs: 1,
+        maxPollIntervalMs: 2,
+        coldStartTimeoutMs: 100,
+        onEvent: (event) => events.push(event),
+      },
+    );
+    const transient = events.find(
+      (event) => event.type === "model_preflight_transient_error",
+    );
+    assert.equal(transient?.classification, "transient");
+    assert.equal(transient?.lastErrorCode, code);
+    assert.equal(transient?.error?.cause?.code, code);
+  }
+});
+
+test("cold-start deadline is total, precise, and separate from caller cancellation", async () => {
+  const events: ModelPreflightEvent[] = [];
+  const server = router({ a: [{ value: "loading" }] });
+  await assert.rejects(
+    ready("a", server, {
+      events,
+      pollIntervalMs: 2,
+      maxPollIntervalMs: 4,
+      coldStartTimeoutMs: 20,
+      requestTimeoutMs: 10,
+    }),
+    /cold-start deadline exceeded.*a/i,
+  );
+  const terminal = events.at(-1);
+  assert.equal(terminal?.type, "model_preflight_timeout");
+  assert.equal(terminal?.eventuallyReady, false);
+  assert.ok((terminal?.attempts ?? 0) > 1);
+  assert.equal(
+    events.filter((event) => event.type === "model_load_requested").length,
+    0,
+  );
+});
+
+test("already-aborted caller emits cancellation and starts no HTTP request", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("superseded attempt"));
+  const server = router({ a: [{ value: "loaded" }] });
+  const events: ModelPreflightEvent[] = [];
+  await assert.rejects(
+    ready("a", server, { signal: controller.signal, events }),
+    /cancelled.*superseded attempt/i,
+  );
+  assert.deepEqual(server.calls, []);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["model_preflight_started", "model_preflight_cancelled"],
   );
 });
 
@@ -429,7 +1095,7 @@ test("capability cache separates provider IDs on one base URL", async () => {
   );
   assert.ok(second.calls.includes("GET /models/sse"));
   assert.ok(second.calls.includes("POST /models/load"));
-  assert.ok(!second.calls.some((call) => call.includes("chat/completions")));
+  assert.ok(second.calls.some((call) => call.includes("chat/completions")));
 });
 function router(
   sequences: Record<string, Status[]>,
@@ -506,6 +1172,9 @@ async function ready(
     events?: ModelPreflightEvent[];
     updates?: ModelPreflightUpdate[];
     pollIntervalMs?: number;
+    maxPollIntervalMs?: number;
+    coldStartTimeoutMs?: number;
+    requestTimeoutMs?: number;
   } = {},
 ) {
   const baseUrl = options.baseUrl ?? base();
@@ -516,6 +1185,9 @@ async function ready(
     {
       signal: options.signal,
       pollIntervalMs: options.pollIntervalMs ?? 1,
+      maxPollIntervalMs: options.maxPollIntervalMs ?? 5,
+      coldStartTimeoutMs: options.coldStartTimeoutMs,
+      requestTimeoutMs: options.requestTimeoutMs,
       onEvent: (event) => options.events?.push(event),
       onUpdate: (update) => options.updates?.push(update),
     },
@@ -832,7 +1504,7 @@ test("already loaded model starts inference without load or wait", async () => {
   assert.deepEqual(server.calls, ["GET /models"]);
   assert.deepEqual(
     events.map((event) => event.type),
-    ["model_preflight_start", "model_status", "model_preflight_ready"],
+    ["model_preflight_started", "model_status", "model_preflight_ready"],
   );
 });
 
@@ -844,9 +1516,15 @@ test("unloaded model is loaded once and awaited", async () => {
   await ready("a", server, { events });
   assert.equal(server.loadCount(), 1);
   assert.deepEqual(
-    events.map((event) => event.type),
+    events
+      .map((event) => event.type)
+      .filter(
+        (type) =>
+          type !== "model_preflight_loading" &&
+          type !== "model_preflight_polling",
+      ),
     [
-      "model_preflight_start",
+      "model_preflight_started",
       "model_status",
       "model_preflight_sse_unsupported",
       "model_load_requested",
@@ -952,9 +1630,10 @@ test("unknown model fails without load or substitution", async () => {
 });
 
 test("ordinary OpenAI-compatible model list is validated and explicitly loaded", async () => {
-  const server = router({ a: [{ value: "loaded" }] }, true);
+  const server = lazyBackend("a", { loadStatus: 200 });
   await ready("a", server);
   assert.equal(server.loadCount(), 1);
+  assert.ok(server.calls.includes("POST /chat/completions"));
 });
 
 test("built-in OpenAI provider is not probed", async () => {
@@ -971,7 +1650,15 @@ test("built-in OpenAI provider is not probed", async () => {
 
 test("unsupported provider still starts its first inference request", async () => {
   const url = base();
-  const server = router({ a: [{ value: "loaded" }] }, true);
+  const calls: string[] = [];
+  const server: Router = {
+    calls,
+    loadCount: () => 0,
+    fetch: (async (input: RequestInfo | URL) => {
+      calls.push(`GET ${new URL(String(input)).pathname}`);
+      return Response.json({ object: "list", models: [] });
+    }) as typeof fetch,
+  };
   let inference = 0;
   const pi = runtime(url, () => inference++);
   const provider: ProviderRequestEvent[] = [];
@@ -1056,9 +1743,11 @@ test("JSONL records status transitions without a line per identical poll", async
       .split("\n")
       .map((line) => JSON.parse(line));
     assert.deepEqual(
-      lines.map((line) => line.type),
+      lines
+        .map((line) => line.type)
+        .filter((type) => type !== "model_preflight_polling"),
       [
-        "model_preflight_start",
+        "model_preflight_started",
         "model_status",
         "model_preflight_sse_unsupported",
         "model_status",

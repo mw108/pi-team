@@ -286,6 +286,33 @@ test("deterministic runner fixture: positive timeout, unlimited completion, canc
   assert.equal(aborts, 2);
 });
 
+test("agent wall-clock budget pauses during model preflight", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.workflow.agentTimeoutMs = 1000;
+  cfg.agents.researcher.timeoutMs = 1000;
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const state = await engine.start("Cold-start timeout fixture", cfg);
+  const runner = new PiRunner();
+  runner.createSession = async (...args: any[]) => {
+    const lifecycle = args.at(-1) as { start(): void; end(): void };
+    return {
+      messages: [{ role: "assistant", stopReason: "end" }],
+      prompt: async () => {
+        lifecycle.start();
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        lifecycle.end();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      },
+      abort: async () => {},
+      getLastAssistantText: () => JSON.stringify(output("researcher")),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+    } as any;
+  };
+  assert.deepEqual(await runner.run("researcher", state), output("researcher"));
+});
+
 test("unlimited attempts log clear mode, cancellation, and provider failures do not hard retry", async () => {
   const cwd = await repository();
   const cfg = config();
@@ -416,6 +443,10 @@ test("doctor displays unlimited and positive agent timeouts", async () => {
     /network retry: unlimited max retries; 3000 ms delay/,
   );
   assert.match(result.lines.join("\n"), /solver1: .*timeout 900000 ms/);
+  assert.match(
+    result.lines.join("\n"),
+    /Model preflight: 600000 ms cold-start deadline; 3000–10000 ms polling/,
+  );
   assert.doesNotMatch(result.lines.join("\n"), /timeout 0 ms/);
   cfg.agents.researcher.timeoutMs = -1;
   await writeFile(join(cwd, ".pi", "team", "team.yaml"), YAML.stringify(cfg));

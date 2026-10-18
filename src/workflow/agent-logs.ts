@@ -252,7 +252,7 @@ export class AgentLogStore {
             : "started"
           : event.type === "provider_request_start"
             ? `provider request ${event.providerRequest} started`
-            : event.type === "model_preflight_start"
+            : event.type === "model_preflight_started"
               ? `checking model ${event.model}`
               : event.type === "model_status"
                 ? `model ${event.model}: ${event.status}`
@@ -339,6 +339,16 @@ export class AgentLogStore {
                                                                               "agent_complete"
                                                                             ? "completed"
                                                                             : undefined;
+      if (event.type === "model_preflight_loading")
+        label = `starting model ${event.model}`;
+      if (event.type === "model_preflight_polling")
+        label = `polling model ${event.model}`;
+      if (event.type === "model_preflight_transient_error")
+        label = `model preflight transient ${event.phase}: ${event.message}`;
+      if (event.type === "model_preflight_timeout")
+        label = `model preflight timed out: ${event.message}`;
+      if (event.type === "model_preflight_cancelled")
+        label = `model preflight cancelled: ${event.message}`;
       if (event.type === "model_preflight_sse_unsupported")
         label = "model progress stream unsupported";
       if (event.type === "model_preflight_explicit_load_unsupported")
