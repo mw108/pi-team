@@ -85,26 +85,54 @@ export function isContractOperationAllowed(
   operation: ContractOperation,
 ): boolean {
   if (!contract) return false;
+  const identity = policyPath(path);
   switch (operation) {
     case "create":
-      return contract.filesToCreate.includes(path);
+      return contract.filesToCreate.some(
+        (candidate) => policyPath(candidate) === identity,
+      );
     case "modify":
-      return contract.filesToModify.includes(path);
+      return contract.filesToModify.some(
+        (candidate) => policyPath(candidate) === identity,
+      );
     case "delete":
-      return contract.filesToDelete.includes(path);
+      return contract.filesToDelete.some(
+        (candidate) => policyPath(candidate) === identity,
+      );
   }
 }
 export type ContractPathApproval = {
   path: string;
   operation: ContractOperation;
+  source?: "runtime_request" | "repository_change_user_approval";
 };
 export function effectiveContractPaths(
   contract: Contract | undefined,
   approvals: ContractPathApproval[] = [],
 ) {
-  return [
-    ...new Set([...contractPaths(contract), ...approvals.map((a) => a.path)]),
-  ];
+  const paths = [...contractPaths(contract), ...approvals.map((a) => a.path)];
+  return paths.filter(
+    (path, index) =>
+      paths.findIndex(
+        (candidate) => policyPath(candidate) === policyPath(path),
+      ) === index,
+  );
+}
+export function isWorkflowContractOperationAllowed(
+  contract: Contract | undefined,
+  approvals: ContractPathApproval[],
+  path: string,
+  operation: ContractOperation,
+): boolean {
+  const identity = policyPath(path);
+  return (
+    isContractOperationAllowed(contract, path, operation) ||
+    approvals.some(
+      (approval) =>
+        approval.operation === operation &&
+        policyPath(approval.path) === identity,
+    )
+  );
 }
 export function workflowScopePaths(s: WorkflowState): string[] {
   return [
@@ -119,6 +147,19 @@ export function workflowScopePaths(s: WorkflowState): string[] {
 }
 export function contractIdentity(contract: Contract): string {
   return createHash("sha256").update(JSON.stringify(contract)).digest("hex");
+}
+export function effectiveContractIdentity(
+  contract: Contract,
+  approvals: ContractPathApproval[] = [],
+): string {
+  const extensions = approvals
+    .map(({ path, operation }) => ({ path: policyPath(path), operation }))
+    .sort((a, b) =>
+      `${a.path}:${a.operation}`.localeCompare(`${b.path}:${b.operation}`),
+    );
+  return createHash("sha256")
+    .update(JSON.stringify({ contract, extensions }))
+    .digest("hex");
 }
 export function assertRelative(path: string) {
   if (classifyPath(path) === "forbidden")
@@ -170,11 +211,16 @@ export async function validateContractPathRequest(cwd: string, path: string) {
   return key;
 }
 export async function validateContractPaths(cwd: string, contract: Contract) {
+  const identities = new Set<string>();
   for (const path of contractPaths(contract)) {
     assertRelative(path);
     const actual = await assertWithin(cwd, path);
     if (policyPath(actual) !== policyPath(path))
       throw new Error(`Contract path aliases another repository path: ${path}`);
+    const identity = policyPath(path);
+    if (identities.has(identity))
+      throw new Error(`Contract paths collide by filesystem identity: ${path}`);
+    identities.add(identity);
   }
   for (const path of [
     ...contract.requiredTests.flatMap((test) => (test.file ? [test.file] : [])),
@@ -294,7 +340,9 @@ export async function checkTool(
     }
     const inContract = isContractOperationAllowed(contract, path, operation);
     const approved = dirtyPolicy?.workflowContractApprovals?.some(
-      (item) => item.operation === operation && item.path === path,
+      (item) =>
+        item.operation === operation &&
+        policyPath(item.path) === policyPath(path),
     );
     if (
       !inContract &&

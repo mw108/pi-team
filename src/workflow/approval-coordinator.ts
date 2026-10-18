@@ -18,6 +18,7 @@ import { redactVisibleText } from "./agent-logs.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import type { WorkflowState, ApprovalRequest } from "./state.ts";
+import { policyPath } from "../agents/path-policy.ts";
 
 export type AttemptControl = {
   workflowId: string;
@@ -94,7 +95,9 @@ export class RuntimeCommandApprovalCoordinator {
     if (!current()) return "deny";
     const granted = () =>
       s.workflowApprovedContractPaths.some(
-        (item) => item.operation === operation && item.path === path,
+        (item) =>
+          item.operation === operation &&
+          policyPath(item.path) === policyPath(path),
       );
     if (granted()) return "workflow";
     const pending = {
@@ -151,7 +154,11 @@ export class RuntimeCommandApprovalCoordinator {
       if (!choice || !["allow_once", "allow_workflow", "deny"].includes(choice))
         return "deny";
       if (choice === "allow_workflow" && !granted())
-        s.workflowApprovedContractPaths.push({ path, operation });
+        s.workflowApprovedContractPaths.push({
+          path,
+          operation,
+          source: "runtime_request",
+        });
       s.pendingContractPaths = s.pendingContractPaths.filter(
         (item) => item.requestId !== pending.requestId,
       );

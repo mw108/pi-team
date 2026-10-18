@@ -94,6 +94,7 @@ export function approvalParams(request: ApprovalRequest) {
           "runtimeCommand",
           "runtimeFile",
           "contractPath",
+          "contractExtension",
           "securityRisk",
           "credentialFinding",
         ].includes(request.kind)

@@ -68,7 +68,7 @@ test("version 2 state loads without inventing semantic drift metadata", () => {
   assert.equal(loaded.driftConfigSnapshot, undefined);
   assert.equal(loaded.config.workflow.requestTimeoutMs, undefined);
 });
-test("older version 3 states default the dedicated Researcher count to zero", () => {
+test("older version 3 states default additive clarification and Contract-extension fields", () => {
   const raw: any = newState("/tmp", "task", config(), {
     head: null,
     dirtyPaths: [],
@@ -78,8 +78,10 @@ test("older version 3 states default the dedicated Researcher count to zero", ()
   });
   delete raw.researchClarificationCount;
   delete raw.config.workflow.maxResearchClarifications;
+  delete raw.pendingContractExtensions;
   assert.equal(validateState(raw).researchClarificationCount, 0);
   assert.equal(validateState(raw).config.workflow.maxResearchClarifications, 5);
+  assert.deepEqual(validateState(raw).pendingContractExtensions, []);
 });
 test("version 1 string test requirements migrate without inventing paths", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));

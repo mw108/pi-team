@@ -45,6 +45,7 @@ async function workflow(
     secretText?: string;
     credentialChoices?: string[];
     changeRepositoryAfterApproval?: boolean;
+    contractExtensionChoices?: string[];
     noChanges?: boolean;
   } = {},
 ) {
@@ -139,6 +140,8 @@ async function workflow(
           await writeFile(join(cwd, "unexpected.txt"), "unreviewed change\n");
         return options.credentialChoices?.splice(0, 1) ?? [];
       }
+      if (request.kind === "contractExtension")
+        return options.contractExtensionChoices?.splice(0, 1);
       return [];
     },
   });
@@ -330,16 +333,19 @@ test("pre-existing dirty excluded path remains untouched while normal file commi
   assert.match(await readFile(join(cwd, ".env"), "utf8"), /workflow change/);
 });
 
-test("unexpected .gitignore change still blocks before Commit Agent", async () => {
+test("unexpected .gitignore change waits for Contract extension approval before Commit Agent", async () => {
   const { state, engine, runner } = await workflow(
     ["config/app.php"],
     ["config/app.php"],
     { unexpectedPath: ".gitignore" },
   );
-  assert.equal(state.phase, "BLOCKED");
-  assert.match(
-    state.blocker ?? "",
-    /Repository contains changes outside the Implementation Contract: \.gitignore/,
+  assert.equal(state.phase, "WAITING_USER");
+  assert.deepEqual(
+    state.pendingContractExtensions.map(({ path, operation }) => ({
+      path,
+      operation,
+    })),
+    [{ path: ".gitignore", operation: "create" }],
   );
   assert.equal(runner.counts.commitAgent, undefined);
   assert.deepEqual(
@@ -348,17 +354,15 @@ test("unexpected .gitignore change still blocks before Commit Agent", async () =
   );
 });
 
-test("unexpected generated output blocks before Commit Agent", async () => {
+test("unexpected generated output waits for Contract extension approval", async () => {
   const { state, runner } = await workflow(
     ["config/app.php"],
     ["config/app.php"],
     { unexpectedPath: "generated.txt" },
   );
-  assert.equal(state.phase, "BLOCKED");
-  assert.match(
-    state.blocker ?? "",
-    /outside the Implementation Contract: generated\.txt/,
-  );
+  assert.equal(state.phase, "WAITING_USER");
+  assert.equal(state.pendingContractExtensions[0]?.path, "generated.txt");
+  assert.equal(state.pendingContractExtensions[0]?.operation, "create");
   assert.equal(runner.counts.commitAgent, undefined);
 });
 
@@ -537,8 +541,8 @@ test("credential approval does not bypass independent repository checks", async 
     credentialChoices: ["allow_workflow"],
     changeRepositoryAfterApproval: true,
   });
-  assert.equal(state.phase, "BLOCKED");
-  assert.match(state.blocker ?? "", /outside the Implementation Contract/);
+  assert.equal(state.phase, "WAITING_USER");
+  assert.equal(state.pendingContractExtensions[0]?.path, "unexpected.txt");
   assert.equal(state.commit, undefined);
   assert.equal(state.workflowApprovedCredentialFindings.length, 1);
 });

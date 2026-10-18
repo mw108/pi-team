@@ -308,7 +308,7 @@ test("workflow grant survives reload and authorizes another mutating agent only 
   await writeFile(join(f.cwd, path), "old\n");
   assert.equal(await f.decide(path), "workflow");
   assert.deepEqual(f.state.workflowApprovedContractPaths, [
-    { path, operation: "modify" },
+    { path, operation: "modify", source: "runtime_request" },
   ]);
   const loaded = await f.engine.store.load(f.state.id);
   assert.deepEqual(
@@ -358,7 +358,7 @@ test("workflow grant survives reload and authorizes another mutating agent only 
   transition(f.state);
   assert.equal(f.state.phase, "IMPLEMENT");
   assert.deepEqual(f.state.workflowApprovedContractPaths, [
-    { path, operation: "modify" },
+    { path, operation: "modify", source: "runtime_request" },
   ]);
   const other = await f.engine.start("Another workflow", config());
   assert.deepEqual(other.workflowApprovedContractPaths, []);
@@ -515,7 +515,11 @@ test("pending scope approval after restart offers workflow approval without repl
   );
   assert.match(seen[0].prompt, /Existing tests require it/);
   assert.deepEqual(result.workflowApprovedContractPaths, [
-    { path: "extra.js", operation: "modify" },
+    {
+      path: "extra.js",
+      operation: "modify",
+      source: "runtime_request",
+    },
   ]);
   assert.equal(result.pendingContractPaths.length, 0);
   assert.equal(result.agentFailures, 0);

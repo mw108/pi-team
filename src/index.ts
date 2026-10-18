@@ -51,6 +51,8 @@ async function finalText(state: WorkflowState) {
     return "Team workflow aborted; repository changes preserved.";
   if (state.pendingRuntimeCommands?.length)
     return `Waiting for command approval (${state.pendingRuntimeCommands.length} request${state.pendingRuntimeCommands.length === 1 ? "" : "s"}). Run /team resume ${state.id} to review.`;
+  if (state.pendingContractExtensions?.length)
+    return `Approval required for ${state.pendingContractExtensions.length} repository change${state.pendingContractExtensions.length === 1 ? "" : "s"} outside the Implementation Contract. Run /team resume ${state.id} to review.`;
   if (state.phase === "BLOCKED")
     return renderBlocked(
       state,

@@ -49,6 +49,7 @@ export const approvalSchema = z.object({
     "runtimeCommand",
     "runtimeFile",
     "contractPath",
+    "contractExtension",
     "sensitivePaths",
     "orphanedImplementation",
     "securityRisk",
@@ -288,6 +289,9 @@ export const stateSchema = z.object({
         .object({
           path: exactPath,
           operation: z.enum(["create", "modify", "delete"]),
+          source: z
+            .enum(["runtime_request", "repository_change_user_approval"])
+            .optional(),
         })
         .strict(),
     )
@@ -304,6 +308,25 @@ export const stateSchema = z.object({
           path: exactPath,
           operation: z.enum(["create", "modify", "delete"]),
           reason: z.string().min(1).max(500),
+        })
+        .strict(),
+    )
+    .default([]),
+  pendingContractExtensions: z
+    .array(
+      z
+        .object({
+          workflowId: z.string().uuid(),
+          requestId: z.string().uuid(),
+          path: exactPath,
+          operation: z.enum(["create", "modify", "delete"]),
+          detectedPhase: z.enum([
+            "CODE_REVIEW",
+            "PENTEST",
+            "SECURITY_REVIEW",
+            "TEST",
+            "COMMIT",
+          ]),
         })
         .strict(),
     )
@@ -629,8 +652,24 @@ export function validateState(value: unknown): WorkflowState {
     )
       throw new Error("Pending contract path identity mismatch");
   for (const approval of state.workflowApprovedContractPaths)
-    if (policyPath(approval.path) !== approval.path)
-      throw new Error("Contract path approval identity mismatch");
+    policyPath(approval.path);
+  for (const pending of state.pendingContractExtensions)
+    if (pending.workflowId !== state.id)
+      throw new Error("Pending contract extension identity mismatch");
+  const pendingExtensionIdentities = new Set<string>();
+  for (const pending of state.pendingContractExtensions) {
+    const identity = `${pending.operation}:${policyPath(pending.path)}`;
+    if (pendingExtensionIdentities.has(identity))
+      throw new Error("Duplicate pending contract extension");
+    pendingExtensionIdentities.add(identity);
+  }
+  const extensionIdentities = new Set<string>();
+  for (const approval of state.workflowApprovedContractPaths) {
+    const identity = `${approval.operation}:${policyPath(approval.path)}`;
+    if (extensionIdentities.has(identity))
+      throw new Error("Duplicate contract path approval");
+    extensionIdentities.add(identity);
+  }
   for (const path of state.completedOneShotContractPaths)
     if (policyPath(path) !== path)
       throw new Error("One-shot contract mutation identity mismatch");
@@ -685,6 +724,7 @@ export function newState(
     workflowApprovedContractPaths: [],
     completedOneShotContractPaths: [],
     pendingContractPaths: [],
+    pendingContractExtensions: [],
     approvedDirtyPaths: [],
     approvedSensitivePaths: [],
     workflowApprovedCredentialFindings: [],

@@ -16,7 +16,7 @@ import { commandSchema } from "../config/schema.ts";
 import {
   allowedTools,
   checkTool,
-  contractIdentity,
+  effectiveContractIdentity,
   type ContractOperation,
   validateContractPaths,
 } from "./permissions.ts";
@@ -516,7 +516,10 @@ export class PiRunner implements AgentRunner {
               approvedSensitivePaths:
                 s.results.reviewer &&
                 s.sensitiveApprovalContractHash ===
-                  contractIdentity(contractSchema.parse(s.results.reviewer))
+                  effectiveContractIdentity(
+                    contractSchema.parse(s.results.reviewer),
+                    s.workflowApprovedContractPaths,
+                  )
                   ? s.approvedSensitivePaths
                   : [],
               authorizeSensitive: (operation, path) =>

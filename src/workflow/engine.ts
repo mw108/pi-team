@@ -3,7 +3,7 @@ import {
   type AttemptControl,
 } from "./approval-coordinator.ts";
 import { appendFile, readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { resolve } from "node:path";
 import { projectRootSync } from "../config/project.ts";
@@ -29,7 +29,7 @@ import {
 } from "../agents/schemas.ts";
 import {
   assertRelative,
-  contractIdentity,
+  effectiveContractIdentity,
   contractPaths,
   isContractOperationAllowed,
   workflowScopePaths,
@@ -40,7 +40,6 @@ import {
   classifyPath,
   policyPath,
   isWithinPath,
-  isSensitiveReadPath,
   permissionPatternMatches,
 } from "../agents/path-policy.ts";
 import {
@@ -72,6 +71,10 @@ import {
   dirtyPaths,
   gateSnapshot,
   unexpectedWorkflowPaths,
+  unexpectedWorkflowChanges,
+  assertContractExtensionEligible,
+  ContractExtensionApprovalRequired,
+  type UnexpectedWorkflowChange,
   classifyOrphanedImplementation,
   classifyAttributedImplementation,
   discardAttributedImplementation,
@@ -188,6 +191,156 @@ export class WorkflowEngine {
   private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
   private credentialOneShot: CredentialFindingIdentity[] = [];
+  private contractExtensionPrompt(
+    change: UnexpectedWorkflowChange,
+  ): ApprovalRequest {
+    const operation =
+      change.operation[0].toUpperCase() + change.operation.slice(1);
+    return {
+      kind: "contractExtension",
+      title: "File outside Implementation Contract",
+      prompt: `Repository contains a change outside the Implementation Contract:\n\n${change.path}\n\nOperation: ${operation}\n\nWhat do you want to do?`,
+      options: [
+        {
+          value: "include",
+          label: "Include",
+          description:
+            "Include this exact path and operation for this workflow",
+        },
+        {
+          value: "deny",
+          label: "Deny",
+          description: "Keep the path outside the authorized scope and block",
+        },
+      ],
+    };
+  }
+  private async queueContractExtensionApproval(
+    s: WorkflowState,
+    changes?: UnexpectedWorkflowChange[],
+  ): Promise<boolean> {
+    let unexpected: UnexpectedWorkflowChange[];
+    try {
+      unexpected = changes ?? (await unexpectedWorkflowChanges(s));
+      if (!unexpected.length) return true;
+      for (const change of unexpected)
+        await assertContractExtensionEligible(s, change);
+    } catch (error) {
+      record(
+        s,
+        "contract_extension_rejected_by_security",
+        getErrorMessage(error),
+      );
+      block(
+        s,
+        `Contract extension rejected by repository security: ${getErrorMessage(error)}`,
+      );
+      await this.store.save(s);
+      return false;
+    }
+    const resume = s.phase === "WAITING_USER" ? s.resumePhase : s.phase;
+    if (s.phase !== "WAITING_USER") s.resumePhase = s.phase;
+    const pendingByIdentity = new Map(
+      s.pendingContractExtensions.map((item) => [
+        `${item.operation}:${policyPath(item.path)}`,
+        item,
+      ]),
+    );
+    s.pendingContractExtensions = unexpected.map((change) => {
+      const identity = `${change.operation}:${policyPath(change.path)}`;
+      const existing = pendingByIdentity.get(identity);
+      if (existing) return existing;
+      const detectedPhase = (
+        [
+          "CODE_REVIEW",
+          "PENTEST",
+          "SECURITY_REVIEW",
+          "TEST",
+          "COMMIT",
+        ] as Phase[]
+      ).includes(resume as Phase)
+        ? (resume as
+            "CODE_REVIEW" | "PENTEST" | "SECURITY_REVIEW" | "TEST" | "COMMIT")
+        : "CODE_REVIEW";
+      const pending = {
+        workflowId: s.id,
+        requestId: randomUUID(),
+        path: change.path,
+        operation: change.operation,
+        detectedPhase,
+      };
+      record(
+        s,
+        "contract_extension_approval_requested",
+        JSON.stringify({
+          workflowId: s.id,
+          phase: pending.detectedPhase,
+          path: pending.path,
+          operation: pending.operation,
+        }),
+      );
+      return pending;
+    });
+    s.phase = "WAITING_USER";
+    delete s.blocker;
+    await this.store.save(s);
+    this.ui.progress(s);
+    return false;
+  }
+  private async ensureSensitivePathApproval(s: WorkflowState) {
+    const contract = s.results.reviewer
+      ? contractSchema.parse(s.results.reviewer)
+      : undefined;
+    if (!contract) return true;
+    const identity = effectiveContractIdentity(
+      contract,
+      s.workflowApprovedContractPaths,
+    );
+    if (s.sensitiveApprovalContractHash !== identity) {
+      const currentScope = new Set(workflowScopePaths(s).map(policyPath));
+      s.approvedSensitivePaths = s.approvedSensitivePaths.filter(
+        (path) =>
+          currentScope.has(policyPath(path)) &&
+          classifyPath(path) === "requires_user_approval",
+      );
+      s.sensitiveApprovalContractHash = identity;
+    }
+    const sensitive = [
+      ...new Set(
+        workflowScopePaths(s).filter(
+          (path) =>
+            classifyPath(path) === "requires_user_approval" &&
+            !s.config.permissions.files.allowWrite.some((pattern) =>
+              permissionPatternMatches(pattern, path),
+            ) &&
+            !s.runtimeFileApprovals.some(
+              (grant) =>
+                grant.operation === "write" && grant.path === policyPath(path),
+            ) &&
+            !s.approvedSensitivePaths.includes(policyPath(path)),
+        ),
+      ),
+    ];
+    if (!sensitive.length) return true;
+    await this.requestApproval(s, {
+      kind: "sensitivePaths",
+      title: "Allow sensitive file changes?",
+      prompt: `Sensitive files requested for modification:\n\n${sensitive.map((path) => `- ${path}`).join("\n")}\n\nReason:\n${contract.goal}\n\nApproval applies to these exact paths in this workflow and this effective contract scope only.`,
+      options: [
+        {
+          value: "allow",
+          label: "Allow for this workflow",
+          description: "Approve the displayed exact paths for this workflow",
+        },
+        {
+          value: "deny",
+          label: "Deny",
+          description: "Block the workflow",
+        },
+      ],
+    });
+    return false;
+  }
   private async requestCredentialFindingApproval(
     s: WorkflowState,
     error: CredentialApprovalRequired,
@@ -610,6 +763,7 @@ export class WorkflowEngine {
         state.pendingRuntimeCommands.length ||
         state.pendingRuntimeFiles.length ||
         state.pendingContractPaths.length ||
+        state.pendingContractExtensions.length ||
         state.driftCandidate
       )
         throw new Error(
@@ -1970,7 +2124,9 @@ export class WorkflowEngine {
                 if (
                   already ||
                   authoritative.workflowApprovedContractPaths.some(
-                    (item) => item.path === key && item.operation === operation,
+                    (item) =>
+                      policyPath(item.path) === policyPath(key) &&
+                      item.operation === operation,
                   )
                 )
                   return true;
@@ -2518,13 +2674,14 @@ export class WorkflowEngine {
             choice === "allow_workflow" &&
             !s.workflowApprovedContractPaths.some(
               (item) =>
-                item.path === pending.path &&
+                policyPath(item.path) === policyPath(pending.path) &&
                 item.operation === pending.operation,
             )
           )
             s.workflowApprovedContractPaths.push({
               path: pending.path,
               operation: pending.operation,
+              source: "runtime_request",
             });
           s.pendingContractPaths = s.pendingContractPaths.filter(
             (item) => item.requestId !== pending.requestId,
@@ -2827,6 +2984,178 @@ export class WorkflowEngine {
           continue;
         }
         if (s.phase === "WAITING_USER") {
+          if (s.pendingContractExtensions.length) {
+            const pending = s.pendingContractExtensions[0];
+            let selected: string[] | undefined;
+            try {
+              selected = await this.ui.approve?.(
+                this.contractExtensionPrompt(pending),
+              );
+            } catch {
+              await this.store.save(s);
+              break;
+            }
+            if (!selected?.length) {
+              await this.store.save(s);
+              break;
+            }
+            if (
+              selected.length !== 1 ||
+              !["include", "deny"].includes(selected[0])
+            )
+              throw new Error(
+                "Contract extension approval requires Include or Deny",
+              );
+            const current = await unexpectedWorkflowChanges(s);
+            const matching = current.find(
+              (change) =>
+                change.operation === pending.operation &&
+                policyPath(change.path) === policyPath(pending.path),
+            );
+            if (!matching) {
+              record(
+                s,
+                "contract_extension_approval_cancelled",
+                JSON.stringify({
+                  workflowId: s.id,
+                  path: pending.path,
+                  operation: pending.operation,
+                  reason: "repository_changed",
+                }),
+              );
+              s.pendingContractExtensions = s.pendingContractExtensions.filter(
+                (item) => item.requestId !== pending.requestId,
+              );
+              if (current.length) {
+                await this.queueContractExtensionApproval(s, current);
+                continue;
+              }
+              s.phase = s.resumePhase ?? pending.detectedPhase;
+              delete s.resumePhase;
+              await this.store.save(s);
+              continue;
+            }
+            try {
+              await assertContractExtensionEligible(s, matching);
+            } catch (error) {
+              record(
+                s,
+                "contract_extension_rejected_by_security",
+                getErrorMessage(error),
+              );
+              block(
+                s,
+                `Contract extension rejected by repository security: ${getErrorMessage(error)}`,
+              );
+              await this.store.save(s);
+              break;
+            }
+            if (selected[0] === "deny") {
+              record(
+                s,
+                "contract_extension_approval_denied",
+                JSON.stringify({
+                  workflowId: s.id,
+                  phase: pending.detectedPhase,
+                  path: pending.path,
+                  operation: pending.operation,
+                  decision: "deny",
+                }),
+              );
+              s.pendingContractExtensions = [];
+              delete s.resumePhase;
+              block(
+                s,
+                `Contract extension denied: ${pending.path} (${pending.operation}). Working tree preserved.`,
+              );
+              await this.store.save(s);
+              break;
+            }
+            if (
+              !s.workflowApprovedContractPaths.some(
+                (approval) =>
+                  approval.operation === pending.operation &&
+                  policyPath(approval.path) === policyPath(pending.path),
+              )
+            )
+              s.workflowApprovedContractPaths.push({
+                path: pending.path,
+                operation: pending.operation,
+                source: "repository_change_user_approval",
+              });
+            record(
+              s,
+              "contract_extension_approval_granted",
+              JSON.stringify({
+                workflowId: s.id,
+                phase: pending.detectedPhase,
+                path: pending.path,
+                operation: pending.operation,
+                decision: "include",
+                source: "user_approval",
+              }),
+            );
+            if (s.gateHashes && pending.detectedPhase !== "CODE_REVIEW") {
+              for (const role of [
+                "codeReviewer",
+                "pentester",
+                "securityReviewer",
+                "tester",
+                "commitAgent",
+              ] as const) {
+                if (s.results[role])
+                  (s.results as Record<string, unknown>)[`previous_${role}`] =
+                    s.results[role];
+                delete s.results[role];
+              }
+              delete s.gateHashes;
+              delete s.securityRiskReview;
+              delete s.commitSelection;
+              delete s.reportInput;
+              s.resumePhase = "CODE_REVIEW";
+              record(
+                s,
+                "contract_extension_quality_gates_invalidated",
+                JSON.stringify({
+                  path: pending.path,
+                  operation: pending.operation,
+                  resumePhase: "CODE_REVIEW",
+                }),
+              );
+            }
+            s.pendingContractExtensions = s.pendingContractExtensions.filter(
+              (item) => item.requestId !== pending.requestId,
+            );
+            const remaining = await unexpectedWorkflowChanges(s);
+            record(
+              s,
+              "contract_extension_revalidated",
+              JSON.stringify({
+                path: pending.path,
+                operation: pending.operation,
+                remaining: remaining.length,
+              }),
+            );
+            if (remaining.length) {
+              await this.queueContractExtensionApproval(s, remaining);
+              continue;
+            }
+            s.pendingContractExtensions = [];
+            s.phase = s.resumePhase ?? pending.detectedPhase;
+            delete s.resumePhase;
+            record(
+              s,
+              "contract_extension_resume",
+              JSON.stringify({
+                workflowId: s.id,
+                phase: s.phase,
+                path: pending.path,
+                operation: pending.operation,
+              }),
+            );
+            await this.store.save(s);
+            continue;
+          }
           if (
             s.pendingCredentialFinding &&
             s.pendingApproval?.kind === "credentialFinding"
@@ -3128,7 +3457,10 @@ export class WorkflowEngine {
                 );
             } else if (request.kind === "sensitivePaths") {
               const contract = contractSchema.parse(s.results.reviewer);
-              const identity = contractIdentity(contract);
+              const identity = effectiveContractIdentity(
+                contract,
+                s.workflowApprovedContractPaths,
+              );
               const required = [
                 ...new Set(
                   workflowScopePaths(s)
@@ -3328,48 +3660,7 @@ export class WorkflowEngine {
           const contract = contractSchema.parse(s.results.reviewer);
           const paths = workflowScopePaths(s);
           await validateContractPaths(this.cwd, contract);
-          const identity = contractIdentity(contract);
-          if (s.sensitiveApprovalContractHash !== identity) {
-            s.approvedSensitivePaths = [];
-            s.sensitiveApprovalContractHash = identity;
-          }
-          const sensitive = [
-            ...new Set(
-              paths.filter(
-                (path) =>
-                  classifyPath(path) === "requires_user_approval" &&
-                  !isSensitiveReadPath(path) &&
-                  !s.config.permissions.files.allowWrite.some((pattern) =>
-                    permissionPatternMatches(pattern, path),
-                  ),
-              ),
-            ),
-          ];
-          if (
-            sensitive.some(
-              (path) => !s.approvedSensitivePaths.includes(policyPath(path)),
-            )
-          ) {
-            await this.requestApproval(s, {
-              kind: "sensitivePaths",
-              title: "Allow sensitive file changes?",
-              prompt: `Sensitive files requested for modification:\n\n${sensitive.map((path) => `- ${path}`).join("\n")}\n\nReason:\n${contract.goal}\n\nApproval applies to these exact paths in this workflow and this contract only.`,
-              options: [
-                {
-                  value: "allow",
-                  label: "Allow for this workflow",
-                  description:
-                    "Approve the displayed exact paths for this contract",
-                },
-                {
-                  value: "deny",
-                  label: "Deny",
-                  description: "Block implementation",
-                },
-              ],
-            });
-            continue;
-          }
+          if (!(await this.ensureSensitivePathApproval(s))) continue;
           const overlap = paths.filter(
             (path) =>
               s.baseline.dirtyPaths.includes(path) &&
@@ -3409,14 +3700,8 @@ export class WorkflowEngine {
             "COMMIT",
           ].includes(s.phase)
         ) {
-          const unexpected = await unexpectedWorkflowPaths(s);
-          if (unexpected.length) {
-            block(
-              s,
-              `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
-            );
-            break;
-          }
+          if (!(await this.queueContractExtensionApproval(s))) continue;
+          if (!(await this.ensureSensitivePathApproval(s))) continue;
           const snapshot = await gateSnapshot(s);
           if (
             s.gateHashes &&
@@ -3456,6 +3741,10 @@ export class WorkflowEngine {
               this.credentialOneShot,
             );
           } catch (error) {
+            if (error instanceof ContractExtensionApprovalRequired) {
+              await this.queueContractExtensionApproval(s, error.changes);
+              continue;
+            }
             if (!(error instanceof CredentialApprovalRequired)) throw error;
             await this.requestCredentialFindingApproval(s, error);
             continue;
@@ -3918,6 +4207,12 @@ export class WorkflowEngine {
             this.emitAgentEvent({ type: "complete", role: "commitAgent" });
             record(s, "agent_completed", "commitAgent");
           } catch (error) {
+            if (error instanceof ContractExtensionApprovalRequired) {
+              delete s.inFlight;
+              delete s.commitIntent;
+              await this.queueContractExtensionApproval(s, error.changes);
+              continue;
+            }
             if (error instanceof CredentialApprovalRequired) {
               delete s.inFlight;
               delete s.commitIntent;

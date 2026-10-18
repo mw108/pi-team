@@ -39,6 +39,7 @@ export function pendingFixRequirements(
     state.pendingRuntimeCommands.length ||
     state.pendingRuntimeFiles.length ||
     state.pendingContractPaths.length ||
+    state.pendingContractExtensions.length ||
     state.inFlight ||
     state.manualRetry ||
     state.driftCandidate
@@ -428,7 +429,8 @@ async function planWorkflowRecovery(
     !state.pendingResearchQuestions?.length &&
     !state.pendingRuntimeCommands?.length &&
     !state.pendingRuntimeFiles?.length &&
-    !state.pendingContractPaths?.length
+    !state.pendingContractPaths?.length &&
+    !state.pendingContractExtensions?.length
   )
     return {
       kind: "continue",
@@ -445,14 +447,16 @@ async function planWorkflowRecovery(
     state.pendingApproval ||
     state.pendingRuntimeCommands?.length ||
     state.pendingRuntimeFiles?.length ||
-    state.pendingContractPaths?.length
+    state.pendingContractPaths?.length ||
+    state.pendingContractExtensions?.length
   )
     return {
       kind: "waiting-user",
       reason:
         state.pendingRuntimeCommands?.length ||
         state.pendingRuntimeFiles?.length ||
-        state.pendingContractPaths?.length
+        state.pendingContractPaths?.length ||
+        state.pendingContractExtensions?.length
           ? "Waiting for tool approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
           : "Workflow is waiting for user input.",
     };
@@ -494,6 +498,30 @@ async function planWorkflowRecovery(
       reason:
         "Waiting for user review of accepted security risks. Continue to open the confirmation.",
     };
+  if (
+    state.phase === "BLOCKED" &&
+    state.blocker?.startsWith(
+      "Repository contains changes outside the Implementation Contract:",
+    )
+  ) {
+    const stopped = state.history.findLast(
+      (event) => event.event === "blocked",
+    )?.phase;
+    if (
+      stopped &&
+      ["CODE_REVIEW", "PENTEST", "SECURITY_REVIEW", "TEST", "COMMIT"].includes(
+        stopped,
+      ) &&
+      (await head(cwd)) === state.baseline.head
+    )
+      return {
+        kind: "continue",
+        nextPhase: stopped,
+        agentId: getPhaseRoles(state, stopped)?.[0] ?? "codeReviewer",
+        reason:
+          "The legacy out-of-contract blocker can be re-evaluated with the current repository and the new approval flow.",
+      };
+  }
   const interrupted = interruptedMutationRecovery(state);
   if (interrupted) {
     const classification = await classifyAttributedImplementation(

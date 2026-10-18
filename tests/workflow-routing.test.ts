@@ -118,7 +118,7 @@ test("FIX_DESIGN leaves old implementation paths that fail a narrowed commit", a
   s.results.tester = output("tester");
   await assert.rejects(
     () => prepareCommit(s, ["math.js"], "fix"),
-    /Repository contains changes outside the Implementation Contract: old\.js/,
+    /Approval required for repository changes outside the Implementation Contract: old\.js \(modify\)/,
   );
 });
 for (const choice of ["keep", "discard", "abort"] as const)

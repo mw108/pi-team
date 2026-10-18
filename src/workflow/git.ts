@@ -2,15 +2,17 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, lstat, realpath, unlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   assertRelative,
-  contractIdentity,
+  effectiveContractIdentity,
   assertWithin,
   contractPaths,
   workflowScopePaths,
+  isWorkflowContractOperationAllowed,
+  type ContractOperation,
 } from "../agents/permissions.ts";
 import { contractSchema } from "../agents/schemas.ts";
 import {
@@ -199,23 +201,118 @@ export async function runtimeArtifacts(cwd: string): Promise<Set<string>> {
     .filter(Boolean);
   return new Set(untracked.filter((path) => path === ".phpunit.result.cache"));
 }
-export async function unexpectedWorkflowPaths(
+export type UnexpectedWorkflowChange = {
+  path: string;
+  operation: ContractOperation;
+};
+export async function assertContractExtensionEligible(
   s: WorkflowState,
-): Promise<string[]> {
+  change: UnexpectedWorkflowChange,
+): Promise<void> {
+  const { path } = change;
+  assertRelative(path);
+  if (
+    path.includes("\\") ||
+    /[?*\[\]]/.test(path) ||
+    posix.normalize(path) !== path ||
+    path === "." ||
+    path.endsWith("/")
+  )
+    throw new Error("Contract extension requires an exact normalized path");
+  const actual = await assertWithin(s.cwd, path);
+  if (policyPath(actual) !== policyPath(path))
+    throw new Error(`Repository path aliases another path: ${path}`);
+  try {
+    if ((await lstat(join(s.cwd, path))).isSymbolicLink())
+      throw new Error(
+        `Symbolic-link changes require manual inspection: ${path}`,
+      );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (await head(s.cwd)) {
+    const tree = await git(s.cwd, ["ls-tree", "HEAD", "--", path]);
+    if (/^120000\s/m.test(tree))
+      throw new Error(
+        `Symbolic-link changes require manual inspection: ${path}`,
+      );
+  }
+}
+async function pathsAtHead(cwd: string, paths: string[]): Promise<Set<string>> {
+  if (!(await head(cwd)) || !paths.length) return new Set();
+  const output = await git(cwd, [
+    "ls-tree",
+    "-r",
+    "--name-only",
+    "-z",
+    "HEAD",
+    "--",
+    ...paths,
+  ]);
+  return new Set(output.split("\0").filter(Boolean).map(policyPath));
+}
+async function pathExists(cwd: string, path: string): Promise<boolean> {
+  try {
+    await lstat(join(cwd, path));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+/** Classifies repository changes against HEAD so rename pairs become delete/create. */
+export async function unexpectedWorkflowChanges(
+  s: WorkflowState,
+): Promise<UnexpectedWorkflowChange[]> {
   const contract = s.results.reviewer
     ? contractSchema.safeParse(s.results.reviewer)
     : undefined;
-  const allowed = new Set([
-    ...s.baseline.dirtyPaths,
-    ...(contract?.success ? workflowScopePaths(s) : []),
-  ]);
-  const artifacts = await runtimeArtifacts(s.cwd);
-  return (await dirtyPaths(s.cwd)).filter(
-    (path) =>
-      !path.startsWith(".pi/team/") &&
-      !allowed.has(path) &&
-      !artifacts.has(path),
+  const dirty = (await dirtyPaths(s.cwd)).filter(
+    (path) => !path.startsWith(".pi/team/"),
   );
+  const identities = new Map<string, string>();
+  for (const path of dirty) {
+    const identity = policyPath(path);
+    const previous = identities.get(identity);
+    if (previous && previous !== path)
+      throw new Error(
+        `Repository paths collide by case-insensitive identity: ${previous}, ${path}`,
+      );
+    identities.set(identity, path);
+  }
+  const tracked = await pathsAtHead(s.cwd, dirty);
+  const artifacts = await runtimeArtifacts(s.cwd);
+  const artifactIdentities = new Set([...artifacts].map(policyPath));
+  const baseline = new Set(s.baseline.dirtyPaths.map(policyPath));
+  const changes: UnexpectedWorkflowChange[] = [];
+  for (const path of dirty) {
+    const identity = policyPath(path);
+    if (baseline.has(identity) || artifactIdentities.has(identity)) continue;
+    const exists = await pathExists(s.cwd, path);
+    const operation: ContractOperation = tracked.has(identity)
+      ? exists
+        ? "modify"
+        : "delete"
+      : "create";
+    const allowed =
+      (contract?.success &&
+        isWorkflowContractOperationAllowed(
+          contract.data,
+          s.workflowApprovedContractPaths,
+          path,
+          operation,
+        )) ||
+      s.completedOneShotContractPaths.some(
+        (candidate) => policyPath(candidate) === identity,
+      );
+    if (!allowed) changes.push({ path, operation });
+  }
+  return changes;
+}
+export async function unexpectedWorkflowPaths(
+  s: WorkflowState,
+): Promise<string[]> {
+  return (await unexpectedWorkflowChanges(s)).map((change) => change.path);
 }
 type DiscardEvidence = NonNullable<WorkflowState["priorImplementation"]>;
 export async function classifyAttributedImplementation(
@@ -328,11 +425,9 @@ export async function determineAuthoritativeCommitSelection(
   s: WorkflowState,
   oneShot: readonly CredentialFindingIdentity[] = [],
 ) {
-  const unexpected = await unexpectedWorkflowPaths(s);
+  const unexpected = await unexpectedWorkflowChanges(s);
   if (unexpected.length)
-    throw new Error(
-      `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
-    );
+    throw new ContractExtensionApprovalRequired(unexpected);
   const allowed = new Set(workflowScopePaths(s));
   const baselineDirty = new Set(s.baseline.dirtyPaths);
   const visible = (await dirtyPaths(s.cwd)).filter(
@@ -408,7 +503,8 @@ export async function prepareCommit(
         grant.operation === "write" &&
         grant.path === policyPath(path),
     ) ||
-    (s.sensitiveApprovalContractHash === contractIdentity(contract) &&
+    (s.sensitiveApprovalContractHash ===
+      effectiveContractIdentity(contract, s.workflowApprovedContractPaths) &&
       s.approvedSensitivePaths.includes(policyPath(path)));
   for (const path of allowed) {
     assertRelative(path);
@@ -425,11 +521,9 @@ export async function prepareCommit(
     JSON.stringify(await gateSnapshot(s)) !== JSON.stringify(s.gateHashes)
   )
     throw new Error("Reviewed files changed before commit");
-  const unexpected = await unexpectedWorkflowPaths(s);
+  const unexpected = await unexpectedWorkflowChanges(s);
   if (unexpected.length)
-    throw new Error(
-      `Repository contains changes outside the Implementation Contract: ${unexpected.join(", ")}`,
-    );
+    throw new ContractExtensionApprovalRequired(unexpected);
   if ((!files.length && !allowEmpty) || new Set(files).size !== files.length)
     throw new Error("Commit files must be unique and nonempty");
   for (const path of files) {
@@ -495,6 +589,14 @@ export async function prepareCommit(
     message,
     hashes: await hashes(s.cwd, files),
   };
+}
+export class ContractExtensionApprovalRequired extends Error {
+  constructor(readonly changes: UnexpectedWorkflowChange[]) {
+    super(
+      `Approval required for repository changes outside the Implementation Contract: ${changes.map((change) => `${change.path} (${change.operation})`).join(", ")}`,
+    );
+    this.name = "ContractExtensionApprovalRequired";
+  }
 }
 export async function createCommit(
   s: WorkflowState,

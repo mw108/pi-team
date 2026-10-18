@@ -8,6 +8,7 @@ import { buildCompletionReportInput } from "../workflow/report.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import { testerValidationContext } from "./validation-context.ts";
 import { projectInstructionsForAgent } from "../workflow/project-instructions.ts";
+import { packageManagerContractGuidance } from "../workflow/package-manager.ts";
 import {
   currentVerifiedCommandResults,
   repositoryEvidenceState,
@@ -80,7 +81,11 @@ export async function contextFor(
   }
   if (role === "critic" || role === "reviewer")
     copy("researcher", ...getActiveSolverIds(s.config));
-  if (role === "reviewer") copy("critic");
+  if (role === "reviewer") {
+    copy("critic");
+    context.packageManagerContractGuidance =
+      await packageManagerContractGuidance(s);
+  }
   if (role === "implementor")
     copy(
       "reviewer",
