@@ -148,9 +148,68 @@ export function transition(s: WorkflowState) {
     case "IMPLEMENT": {
       const r = s.results.implementor;
       if (!r) throw new Error("Missing Implementor result");
-      if (r.status === "IMPLEMENTATION_BLOCKED")
-        fix(s, r.suggestedRoute, r.reason);
-      else
+      if (r.status === "IMPLEMENTATION_BLOCKED") {
+        const attemptStart = s.history.findLastIndex(
+          (event) =>
+            event.event === "agent_attempt_started" &&
+            event.meta?.agent === "implementor",
+        );
+        const hostFailure = s.history
+          .slice(Math.max(0, attemptStart))
+          .findLast(
+            (event) =>
+              [
+                "host_contract_authorization_blocked",
+                "contract_path_approval_denied",
+                "file_access_approval_denied",
+              ].includes(event.event) ||
+              (event.event === "command_approval_decided" &&
+                /\bdeny\b/.test(event.detail)),
+          );
+        const technical =
+          hostFailure ||
+          [
+            "CONTRACT_AUTHORIZATION_BLOCKED",
+            "RUNTIME_PERMISSION_BLOCKED",
+            "TOOL_EXECUTION_BLOCKED",
+          ].includes(r.blockerCategory ?? "");
+        const ambiguousRequirementRoute =
+          r.suggestedRoute === "FIX_REQUIREMENTS" &&
+          r.blockerCategory !== "REQUIREMENT_BLOCKED";
+        if (technical || ambiguousRequirementRoute) {
+          record(
+            s,
+            "IMPLEMENTATION_TECHNICAL_BLOCKED",
+            hostFailure?.detail ?? r.reason,
+          );
+          s.pendingApproval = {
+            kind: "technicalRecovery",
+            title: "Implementation blocked",
+            prompt: `Agent: Implementor\n\nReason:\n${r.reason}${hostFailure ? `\n\nHost evidence:\n${hostFailure.detail}` : ""}\n\nChoose a targeted recovery action.`,
+            options: [
+              {
+                value: "retry_implementor",
+                label: "Retry Implementor",
+                description:
+                  "Keep the Contract and partial files, then retry only implementation",
+              },
+              {
+                value: "revise_requirements",
+                label: "Revise requirements",
+                description:
+                  "Provide requirement clarification and restart the design cycle",
+              },
+              {
+                value: "abort",
+                label: "Abort workflow",
+                description: "Stop without reverting repository files",
+              },
+            ],
+          };
+          s.resumePhase = "IMPLEMENT";
+          s.phase = "WAITING_USER";
+        } else fix(s, r.suggestedRoute, r.reason);
+      } else
         s.phase = s.config.qualityGates.codeReview.enabled
           ? "CODE_REVIEW"
           : afterCodeReview(s);

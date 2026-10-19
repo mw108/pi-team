@@ -7,7 +7,7 @@ import {
   type TeamConfig,
 } from "../config/schema.ts";
 import { assertRelative } from "../agents/permissions.ts";
-import { policyPath } from "../agents/path-policy.ts";
+import { normalizedRepositoryPath, policyPath } from "../agents/path-policy.ts";
 import { detectedCommandId } from "../agents/discovery.ts";
 import {
   normalizedRuntimeCommand,
@@ -54,6 +54,7 @@ export const approvalSchema = z.object({
     "orphanedImplementation",
     "securityRisk",
     "credentialFinding",
+    "technicalRecovery",
   ]),
   title: z.string(),
   prompt: z.string(),
@@ -319,6 +320,7 @@ export const stateSchema = z.object({
           source: z
             .enum(["runtime_request", "repository_change_user_approval"])
             .optional(),
+          authorizedFromAbsent: z.boolean().optional(),
         })
         .strict(),
     )
@@ -335,6 +337,7 @@ export const stateSchema = z.object({
           path: exactPath,
           operation: z.enum(["create", "modify", "delete"]),
           reason: z.string().min(1).max(500),
+          authorizedFromAbsent: z.boolean().optional(),
         })
         .strict(),
     )
@@ -436,6 +439,7 @@ export const stateSchema = z.object({
     )
     .default([]),
   implementationStartHashes: z.record(z.string()).optional(),
+  implementationBaselineContractHash: z.string().optional(),
   commitIntent: z
     .object({
       head: z.string().nullable(),
@@ -671,7 +675,7 @@ export function validateState(value: unknown): WorkflowState {
   for (const pending of state.pendingContractPaths)
     if (
       pending.workflowId !== state.id ||
-      policyPath(pending.path) !== pending.path
+      normalizedRepositoryPath(pending.path) !== pending.path
     )
       throw new Error("Pending contract path identity mismatch");
   for (const approval of state.workflowApprovedContractPaths)
@@ -723,7 +727,7 @@ export function validateState(value: unknown): WorkflowState {
     credentialApprovalIdentities.add(identity);
   }
   for (const path of state.completedOneShotContractPaths)
-    if (policyPath(path) !== path)
+    if (normalizedRepositoryPath(path) !== path)
       throw new Error("One-shot contract mutation identity mismatch");
   for (const path of state.approvedDirtyPaths)
     if (!state.baseline.dirtyPaths.includes(path))

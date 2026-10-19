@@ -13,6 +13,7 @@ import {
   policyPath,
   isWithinPath,
   permissionPatternMatches,
+  normalizedRepositoryPath,
 } from "./path-policy.ts";
 import { createHash } from "node:crypto";
 import type { Role, Contract } from "./schemas.ts";
@@ -105,7 +106,85 @@ export type ContractPathApproval = {
   path: string;
   operation: ContractOperation;
   source?: "runtime_request" | "repository_change_user_approval";
+  /** Persisted proof that a create grant began while the path was absent. */
+  authorizedFromAbsent?: boolean;
 };
+export type ContractAuthorizationContext = {
+  implementationStartHashes?: Record<string, string>;
+};
+export type ContractAuthorizationResult = {
+  allowed: boolean;
+  source?: "contract" | "create_lifecycle" | "workflow_approval";
+  reason?: string;
+};
+
+function baselineHash(
+  hashes: Record<string, string> | undefined,
+  path: string,
+): string | undefined {
+  if (!hashes) return undefined;
+  const identity = policyPath(path);
+  const entry = Object.entries(hashes).find(
+    ([candidate]) => policyPath(candidate) === identity,
+  );
+  return entry?.[1];
+}
+
+/** Central operation-aware Contract decision used by tools and repository checks. */
+export function effectiveContractAuthorization(
+  contract: Contract | undefined,
+  approvals: ContractPathApproval[],
+  path: string,
+  operation: ContractOperation,
+  context: ContractAuthorizationContext = {},
+): ContractAuthorizationResult {
+  const identity = policyPath(path);
+  const start = baselineHash(context.implementationStartHashes, path);
+  const originalCreate = contract?.filesToCreate.some(
+    (candidate) => policyPath(candidate) === identity,
+  );
+  const matchingApproval = approvals.find(
+    (approval) =>
+      approval.operation === operation &&
+      policyPath(approval.path) === identity,
+  );
+
+  if (matchingApproval) return { allowed: true, source: "workflow_approval" };
+  if (isContractOperationAllowed(contract, path, operation)) {
+    if (operation !== "create" || start === undefined || start === "DELETED")
+      return { allowed: true, source: "contract" };
+    return {
+      allowed: false,
+      reason:
+        "create authorization cannot overwrite a path present at the implementation baseline",
+    };
+  }
+  if (operation === "modify" && originalCreate) {
+    if (start === "DELETED")
+      return { allowed: true, source: "create_lifecycle" };
+    return {
+      allowed: false,
+      reason:
+        start === undefined
+          ? "create lifecycle cannot be proven without the implementation baseline"
+          : "create authorization cannot modify a path present at the implementation baseline",
+    };
+  }
+  if (
+    operation === "modify" &&
+    approvals.some(
+      (approval) =>
+        approval.operation === "create" &&
+        approval.authorizedFromAbsent === true &&
+        policyPath(approval.path) === identity,
+    )
+  )
+    return { allowed: true, source: "create_lifecycle" };
+  return {
+    allowed: false,
+    reason: "operation is outside the effective contract",
+  };
+}
 export function effectiveContractPaths(
   contract: Contract | undefined,
   approvals: ContractPathApproval[] = [],
@@ -123,16 +202,15 @@ export function isWorkflowContractOperationAllowed(
   approvals: ContractPathApproval[],
   path: string,
   operation: ContractOperation,
+  context: ContractAuthorizationContext = {},
 ): boolean {
-  const identity = policyPath(path);
-  return (
-    isContractOperationAllowed(contract, path, operation) ||
-    approvals.some(
-      (approval) =>
-        approval.operation === operation &&
-        policyPath(approval.path) === identity,
-    )
-  );
+  return effectiveContractAuthorization(
+    contract,
+    approvals,
+    path,
+    operation,
+    context,
+  ).allowed;
 }
 export function workflowScopePaths(s: WorkflowState): string[] {
   return [
@@ -153,7 +231,11 @@ export function effectiveContractIdentity(
   approvals: ContractPathApproval[] = [],
 ): string {
   const extensions = approvals
-    .map(({ path, operation }) => ({ path: policyPath(path), operation }))
+    .map(({ path, operation, authorizedFromAbsent }) => ({
+      path: policyPath(path),
+      operation,
+      ...(authorizedFromAbsent ? { authorizedFromAbsent: true } : {}),
+    }))
     .sort((a, b) =>
       `${a.path}:${a.operation}`.localeCompare(`${b.path}:${b.operation}`),
     );
@@ -198,8 +280,9 @@ export async function assertWithin(cwd: string, path: string) {
 }
 export async function validateContractPathRequest(cwd: string, path: string) {
   assertRelative(path);
-  const key = policyPath(path);
-  if (key !== path || /[?*\[\]]/.test(path))
+  const normalized = normalizedRepositoryPath(path);
+  const key = policyPath(normalized);
+  if (normalized !== path || /[?*\[\]]/.test(path))
     throw new Error(
       "Contract approval requires an exact normalized repository-relative path",
     );
@@ -208,7 +291,21 @@ export async function validateContractPathRequest(cwd: string, path: string) {
     throw new Error(
       "Contract path is outside the approved repository boundary",
     );
-  return key;
+  return normalized;
+}
+
+export class ContractAuthorizationError extends Error {
+  readonly code = "CONTRACT_AUTHORIZATION_BLOCKED";
+  constructor(
+    readonly path: string,
+    readonly operation: ContractOperation,
+    readonly authorizationReason: string,
+  ) {
+    super(
+      `Path not in implementation contract for ${operation}: ${path}. ${authorizationReason}. Call team_request_contract_path with the exact repository-relative path, ${operation} operation, and a concise reason before retrying.`,
+    );
+    this.name = "ContractAuthorizationError";
+  }
 }
 export async function validateContractPaths(cwd: string, contract: Contract) {
   const identities = new Set<string>();
@@ -245,6 +342,7 @@ export async function checkTool(
       path: string,
     ) => Promise<boolean>;
     workflowContractApprovals?: ContractPathApproval[];
+    implementationStartHashes?: Record<string, string>;
     consumeContractOnce?: (
       operation: ContractOperation,
       path: string,
@@ -338,19 +436,21 @@ export async function checkTool(
       )
         throw new Error("Tester may only modify configured test paths");
     }
-    const inContract = isContractOperationAllowed(contract, path, operation);
-    const approved = dirtyPolicy?.workflowContractApprovals?.some(
-      (item) =>
-        item.operation === operation &&
-        policyPath(item.path) === policyPath(path),
+    const authorization = effectiveContractAuthorization(
+      contract,
+      dirtyPolicy?.workflowContractApprovals ?? [],
+      path,
+      operation,
+      { implementationStartHashes: dirtyPolicy?.implementationStartHashes },
     );
     if (
-      !inContract &&
-      !approved &&
+      !authorization.allowed &&
       !dirtyPolicy?.consumeContractOnce?.(operation, path)
     )
-      throw new Error(
-        `Path not in implementation contract: ${path}. Call team_request_contract_path with the path, ${operation} operation, and a concise reason before retrying.`,
+      throw new ContractAuthorizationError(
+        path,
+        operation,
+        authorization.reason ?? "operation is outside the effective contract",
       );
     // Cross-file rename/delete can exceed the contract: use explicit edit operations instead.
     if (["serena_rename_symbol", "serena_safe_delete_symbol"].includes(name))

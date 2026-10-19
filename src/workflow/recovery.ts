@@ -105,6 +105,71 @@ export function pendingFixRequirements(
   return { sourceAgent, sourcePhase, attempt };
 }
 
+/**
+ * Recognize an answered legacy requirement rewind that never completed its new
+ * Orchestrator run. Recovery is explicit (`/team-retry implementor override`)
+ * and preserves the historical full-cycle increment and audit events.
+ */
+export function recoverableAnsweredImplementorRewind(
+  state: WorkflowState,
+): FixRequirementsOrigin | undefined {
+  if (
+    !["ORCHESTRATE", "BLOCKED"].includes(state.phase) ||
+    state.pendingQuestion ||
+    state.pendingApproval ||
+    state.pendingResearchQuestions?.length ||
+    state.pendingRuntimeCommands.length ||
+    state.pendingRuntimeFiles.length ||
+    state.pendingContractPaths.length ||
+    state.pendingContractExtensions.length ||
+    state.inFlight ||
+    state.manualRetry ||
+    state.commit ||
+    !state.implementationStartHashes ||
+    !contractSchema.safeParse(state.results.reviewer).success
+  )
+    return undefined;
+  const routeIndex = state.history.findLastIndex(
+    (event) =>
+      event.event === "FIX_REQUIREMENTS" && event.phase === "IMPLEMENT",
+  );
+  if (routeIndex < 1) return undefined;
+  const completion = state.history[routeIndex - 1];
+  if (
+    completion.event !== "agent_completed" ||
+    completion.detail !== "implementor"
+  )
+    return undefined;
+  const after = state.history.slice(routeIndex + 1);
+  const answerIndex = after.findIndex((event) => event.event === "user_answer");
+  if (answerIndex < 0) return undefined;
+  const later = after.slice(answerIndex + 1);
+  if (
+    later.some(
+      (event) =>
+        event.event === "agent_completed" ||
+        (event.event === "phase_started" && event.phase !== "ORCHESTRATE"),
+    )
+  )
+    return undefined;
+  const result = state.results.implementor;
+  if (
+    result?.status !== "IMPLEMENTATION_BLOCKED" ||
+    result.suggestedRoute !== "FIX_REQUIREMENTS"
+  )
+    return undefined;
+  const attempt = state.history
+    .slice(0, routeIndex)
+    .findLast(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "implementor",
+    )?.meta?.attempt;
+  return attempt
+    ? { sourceAgent: "implementor", sourcePhase: "IMPLEMENT", attempt }
+    : undefined;
+}
+
 const mutating = new Set<Role>([
   "implementor",
   "pentester",

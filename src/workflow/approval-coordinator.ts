@@ -85,6 +85,7 @@ export class RuntimeCommandApprovalCoordinator {
     reason: string,
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
+    authorizedFromAbsent = false,
   ): Promise<"once" | "workflow" | "deny"> {
     const current = () =>
       control.workflowId === s.id &&
@@ -108,6 +109,9 @@ export class RuntimeCommandApprovalCoordinator {
       path,
       operation,
       reason: redactVisibleText(reason),
+      ...(operation === "create" && authorizedFromAbsent
+        ? { authorizedFromAbsent: true }
+        : {}),
     };
     const resumePhase = s.phase;
     s.pendingContractPaths.push(pending);
@@ -158,6 +162,9 @@ export class RuntimeCommandApprovalCoordinator {
           path,
           operation,
           source: "runtime_request",
+          ...(operation === "create" && authorizedFromAbsent
+            ? { authorizedFromAbsent: true }
+            : {}),
         });
       s.pendingContractPaths = s.pendingContractPaths.filter(
         (item) => item.requestId !== pending.requestId,

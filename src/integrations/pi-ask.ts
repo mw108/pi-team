@@ -97,6 +97,7 @@ export function approvalParams(request: ApprovalRequest) {
           "contractExtension",
           "securityRisk",
           "credentialFinding",
+          "technicalRecovery",
         ].includes(request.kind)
           ? "single"
           : "multi",

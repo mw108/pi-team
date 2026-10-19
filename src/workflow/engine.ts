@@ -29,9 +29,10 @@ import {
 } from "../agents/schemas.ts";
 import {
   assertRelative,
+  contractIdentity,
   effectiveContractIdentity,
+  effectiveContractAuthorization,
   contractPaths,
-  isContractOperationAllowed,
   workflowScopePaths,
   validateContractPaths,
   validateContractPathRequest,
@@ -93,7 +94,7 @@ import {
   type CredentialFindingApproval,
   type CredentialFindingIdentity,
 } from "./state.ts";
-import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import { fix, phaseRoles, getPhaseRoles, transition } from "./router.ts";
 import {
   currentSecurityRiskReview,
   isLegacySecurityRiskBlock,
@@ -117,6 +118,7 @@ import {
   classifyManualRetry,
   interruptedMutationRecovery,
   pendingFixRequirements,
+  recoverableAnsweredImplementorRewind,
   classifyQualityGateBlocker,
   clearQualityGateBlocker,
 } from "./recovery.ts";
@@ -685,11 +687,14 @@ export class WorkflowEngine {
     const control = this.activeAttempts.get(role);
     if (control && control.workflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
-    const requirement = pendingFixRequirements(state);
+    const pendingRequirement = pendingFixRequirements(state);
+    const answeredLegacyRequirement =
+      recoverableAnsweredImplementorRewind(state);
+    const requirement = pendingRequirement ?? answeredLegacyRequirement;
     if (mode === "override") {
       if (!requirement)
         throw new Error(
-          "No unanswered FIX_REQUIREMENTS decision with clear provenance is pending. Answer the pending question with /team resume instead.",
+          "No unanswered FIX_REQUIREMENTS decision or recoverable answered Implementor rewind with clear provenance is available.",
         );
       if (role !== requirement.sourceAgent)
         throw new Error(
@@ -716,6 +721,17 @@ export class WorkflowEngine {
         attempt: requirement.attempt,
         sourcePhase: requirement.sourcePhase,
       });
+      if (answeredLegacyRequirement)
+        record(
+          state,
+          "answered_fix_requirements_recovered_locally",
+          "Explicit Implementor override preserved the prior Contract and full-cycle history",
+          {
+            agent: role,
+            attempt: requirement.attempt,
+            sourcePhase: requirement.sourcePhase,
+          },
+        );
       record(
         state,
         "agent_retry_requested_by_user",
@@ -742,9 +758,17 @@ export class WorkflowEngine {
       await this.store.save(state);
       return "prepared";
     }
-    if (!mode && requirement && role === requirement.sourceAgent)
+    if (!mode && pendingRequirement && role === pendingRequirement.sourceAgent)
       throw new Error(
-        `${label} is waiting on a FIX_REQUIREMENTS decision. Use /team-retry ${role} override to keep existing requirements and retry ${requirement.sourcePhase}, or /team resume ${state.id} to answer the requirement question.`,
+        `${label} is waiting on a FIX_REQUIREMENTS decision. Use /team-retry ${role} override to keep existing requirements and retry ${pendingRequirement.sourcePhase}, or /team resume ${state.id} to answer the requirement question.`,
+      );
+    if (
+      !mode &&
+      answeredLegacyRequirement &&
+      role === answeredLegacyRequirement.sourceAgent
+    )
+      throw new Error(
+        `${label} has a recoverable answered FIX_REQUIREMENTS rewind. Use /team-retry ${role} override to keep the existing Contract and retry ${answeredLegacyRequirement.sourcePhase}.`,
       );
     const recovery = interruptedMutationRecovery(state);
     if (mode || (recovery && recovery.agent === role)) {
@@ -846,7 +870,6 @@ export class WorkflowEngine {
       this.invalidateDependents(state, role);
       delete state.reportInput;
       delete state.reportFailure;
-      delete state.implementationStartHashes;
       state.phase = recovery.phase;
       delete state.blocker;
       state.manualRetry = { agent: role, phase: recovery.phase };
@@ -2124,20 +2147,18 @@ export class WorkflowEngine {
                 const contract = s.results.reviewer
                   ? contractSchema.parse(s.results.reviewer)
                   : undefined;
-                const already = isContractOperationAllowed(
+                const already = effectiveContractAuthorization(
                   contract,
+                  authoritative.workflowApprovedContractPaths,
                   path,
                   operation,
-                );
-                if (
-                  already ||
-                  authoritative.workflowApprovedContractPaths.some(
-                    (item) =>
-                      policyPath(item.path) === policyPath(key) &&
-                      item.operation === operation,
-                  )
-                )
-                  return true;
+                  {
+                    implementationStartHashes:
+                      authoritative.implementationStartHashes,
+                  },
+                ).allowed;
+                if (already) return "already_authorized";
+                const requestBaseline = await hashes(this.cwd, [key]);
                 const choice = await this.commandApprovals.approveContractPath(
                   authoritative,
                   role,
@@ -2147,9 +2168,10 @@ export class WorkflowEngine {
                   reason.trim(),
                   requestSignal,
                   (event) => logged?.logger.append(event),
+                  requestBaseline[key] === "DELETED",
                 );
                 if (choice === "once") {
-                  const token = `${operation}:${key}`;
+                  const token = `${operation}:${policyPath(key)}`;
                   contractOnce.set(token, (contractOnce.get(token) ?? 0) + 1);
                 } else if (choice === "workflow")
                   s.workflowApprovedContractPaths = structuredClone(
@@ -2158,14 +2180,30 @@ export class WorkflowEngine {
                 return choice !== "deny";
               },
               consumeOnce: (operation, path) => {
-                const token = `${operation}:${path}`;
+                const token = `${operation}:${policyPath(path)}`;
                 const count = contractOnce.get(token) ?? 0;
                 if (!count || control.intention || control.settled)
                   return false;
                 if (count === 1) contractOnce.delete(token);
                 else contractOnce.set(token, count - 1);
-                consumedContractOnce.add(path);
+                consumedContractOnce.add(policyPath(path));
                 return true;
+              },
+              recordFailure: async (failure) => {
+                if (role !== "implementor") return;
+                record(
+                  authoritative,
+                  "host_contract_authorization_blocked",
+                  `${failure.operation} ${failure.path}: ${failure.reason}`,
+                  { agent: role, attempt: attemptNumber },
+                );
+                await this.store.save(authoritative);
+                logged?.logger.append({
+                  type: "host_contract_authorization_blocked",
+                  agent: role,
+                  attempt: attemptNumber,
+                  ...failure,
+                });
               },
             },
             (operation, path, fileSignal) =>
@@ -2184,13 +2222,11 @@ export class WorkflowEngine {
             async (mutation: ObservedFileMutation) => {
               if (
                 consumedContractOnce.delete(policyPath(mutation.path)) &&
-                !authoritative.completedOneShotContractPaths.includes(
-                  policyPath(mutation.path),
+                !authoritative.completedOneShotContractPaths.some(
+                  (path) => policyPath(path) === mutation.identity,
                 )
               ) {
-                authoritative.completedOneShotContractPaths.push(
-                  policyPath(mutation.path),
-                );
+                authoritative.completedOneShotContractPaths.push(mutation.path);
                 await this.store.save(authoritative);
               }
               if (role !== "implementor") return;
@@ -2690,6 +2726,9 @@ export class WorkflowEngine {
               path: pending.path,
               operation: pending.operation,
               source: "runtime_request",
+              ...(pending.operation === "create" && pending.authorizedFromAbsent
+                ? { authorizedFromAbsent: true }
+                : {}),
             });
           s.pendingContractPaths = s.pendingContractPaths.filter(
             (item) => item.requestId !== pending.requestId,
@@ -3090,6 +3129,9 @@ export class WorkflowEngine {
                 path: pending.path,
                 operation: pending.operation,
                 source: "repository_change_user_approval",
+                ...(pending.operation === "create"
+                  ? { authorizedFromAbsent: true }
+                  : {}),
               });
             record(
               s,
@@ -3467,7 +3509,74 @@ export class WorkflowEngine {
               "approval_submitted",
               JSON.stringify({ kind: request.kind, selected }),
             );
-            if (request.kind === "commands") {
+            if (request.kind === "technicalRecovery") {
+              if (
+                selected.length !== 1 ||
+                !["retry_implementor", "revise_requirements", "abort"].includes(
+                  selected[0],
+                )
+              )
+                throw new Error(
+                  "Technical recovery requires exactly one listed action",
+                );
+              const decision = selected[0];
+              delete s.pendingApproval;
+              delete s.resumePhase;
+              if (decision === "retry_implementor") {
+                if (s.results.implementor)
+                  s.results.previous_implementor = s.results.implementor;
+                delete s.results.implementor;
+                this.invalidateDependents(s, "implementor");
+                delete s.reportInput;
+                delete s.reportFailure;
+                delete s.blocker;
+                s.phase = "IMPLEMENT";
+                s.manualRetry = {
+                  agent: "implementor",
+                  phase: "IMPLEMENT",
+                };
+                this.manualReruns.add("implementor");
+                record(
+                  s,
+                  "technical_recovery_retry_implementor",
+                  "Preserved Contract, upstream results, and working tree",
+                  {
+                    agent: "implementor",
+                    attempt: Math.max(
+                      1,
+                      this.nextAttempt(s, "implementor") - 1,
+                    ),
+                  },
+                );
+              } else if (decision === "revise_requirements") {
+                s.phase = "IMPLEMENT";
+                const blocked = s.results.implementor;
+                fix(
+                  s,
+                  "FIX_REQUIREMENTS",
+                  blocked?.status === "IMPLEMENTATION_BLOCKED"
+                    ? blocked.reason
+                    : "Clarify the blocking requirement.",
+                );
+                record(
+                  s,
+                  "technical_recovery_requirements_revision_selected",
+                  "User explicitly selected requirements revision",
+                );
+              } else {
+                this.abortState(
+                  s,
+                  "User aborted after a technical implementation blocker",
+                );
+                record(
+                  s,
+                  "technical_recovery_aborted",
+                  "Working tree preserved",
+                );
+              }
+              await this.store.save(s);
+              continue;
+            } else if (request.kind === "commands") {
               const commands = s.discoveredCommands
                 .filter((c) => selected.includes(c.command.id))
                 .map((c) => c.command);
@@ -3860,10 +3969,21 @@ export class WorkflowEngine {
         );
         if (s.phase === "IMPLEMENT") {
           const contract = contractSchema.parse(s.results.reviewer);
-          s.implementationStartHashes = await hashes(
-            this.cwd,
-            workflowScopePaths(s),
-          );
+          const identity = contractIdentity(contract);
+          if (
+            s.implementationStartHashes &&
+            !s.implementationBaselineContractHash
+          ) {
+            // Legacy states already carry the authoritative implementation
+            // baseline. Adopt it without resnapshotting partial artifacts.
+            s.implementationBaselineContractHash = identity;
+          } else if (s.implementationBaselineContractHash !== identity) {
+            s.implementationStartHashes = await hashes(
+              this.cwd,
+              workflowScopePaths(s),
+            );
+            s.implementationBaselineContractHash = identity;
+          }
         }
         const manualAtStart = new Set<Role>([
           ...this.manualReruns,

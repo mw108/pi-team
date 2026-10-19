@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { deleteTool } from "../src/agents/files.ts";
 import {
   checkTool,
+  effectiveContractAuthorization,
   isContractOperationAllowed,
   validateContractPathRequest,
   workflowScopePaths,
@@ -13,6 +14,7 @@ import {
 import { approvalParams } from "../src/integrations/pi-ask.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { transition } from "../src/workflow/router.ts";
+import { unexpectedWorkflowChanges } from "../src/workflow/git.ts";
 import {
   config,
   contract,
@@ -136,6 +138,143 @@ test("Reviewer contract grants only the matching create, modify, or delete opera
     /team_request_contract_path/,
   );
   assert.equal(await readFile(join(cwd, path), "utf8"), "original\n");
+});
+
+test("create authorization follows an absent baseline through scaffolding and repeated edits", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  const path = "app/Models/Client.php";
+  const createOnly = {
+    ...contract,
+    filesToModify: [],
+    filesToCreate: [path],
+    filesToDelete: [],
+  };
+  await mkdir(join(cwd, "app/Models"), { recursive: true });
+  const policy = {
+    dirtyPaths: [],
+    approvedDirtyPaths: [],
+    implementationStartHashes: { [path]: "DELETED" },
+    consumeContractOnce: () => {
+      throw new Error("create lifecycle must not request approval");
+    },
+  };
+
+  await checkTool(
+    "implementor",
+    "write",
+    { path },
+    cwd,
+    cfg,
+    createOnly,
+    policy,
+  );
+  await writeFile(join(cwd, path), "<?php // scaffold\n");
+  await checkTool(
+    "implementor",
+    "edit",
+    { path },
+    cwd,
+    cfg,
+    createOnly,
+    policy,
+  );
+  await writeFile(join(cwd, path), "<?php // implementation\n");
+  await checkTool(
+    "implementor",
+    "edit",
+    { path },
+    cwd,
+    cfg,
+    createOnly,
+    policy,
+  );
+  assert.equal(
+    effectiveContractAuthorization(createOnly, [], path, "modify", {
+      implementationStartHashes: policy.implementationStartHashes,
+    }).source,
+    "create_lifecycle",
+  );
+});
+
+test("create authorization cannot overwrite a path present at the implementation baseline", async () => {
+  const cwd = await repository();
+  const path = "app/Models/Client.php";
+  await mkdir(join(cwd, "app/Models"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php // user file\n");
+  const createOnly = {
+    ...contract,
+    filesToModify: [],
+    filesToCreate: [path],
+    filesToDelete: [],
+  };
+  await assert.rejects(
+    () =>
+      checkTool("implementor", "edit", { path }, cwd, config(), createOnly, {
+        dirtyPaths: [],
+        approvedDirtyPaths: [],
+        implementationStartHashes: { [path]: "existing-hash" },
+      }),
+    /present at the implementation baseline/,
+  );
+  assert.equal(await readFile(join(cwd, path), "utf8"), "<?php // user file\n");
+});
+
+test("repository validation keeps scaffold edits classified as an authorized creation", async () => {
+  const cwd = await repository();
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Create Client model", config());
+  const path = "app/Models/Client.php";
+  state.results.reviewer = {
+    ...contract,
+    filesToModify: [],
+    filesToCreate: [path],
+  };
+  state.implementationStartHashes = { [path]: "DELETED" };
+  await mkdir(join(cwd, "app/Models"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php // completed scaffold\n");
+  assert.deepEqual(await unexpectedWorkflowChanges(state), []);
+
+  state.results.reviewer = {
+    ...contract,
+    filesToModify: [],
+    filesToCreate: [path, "math.js"],
+  };
+  state.implementationStartHashes = {
+    [path]: "DELETED",
+    "math.js": "existing-hash",
+  };
+  await writeFile(join(cwd, "math.js"), "export const changed = true;\n");
+  assert.deepEqual(await unexpectedWorkflowChanges(state), [
+    { path: "math.js", operation: "modify" },
+  ]);
+});
+
+test("an exact generated-path create approval carries timestamped scaffolds through edits", async () => {
+  const cwd = await repository();
+  const path = "database/migrations/2026_10_19_204241_create_clients_table.php";
+  await mkdir(join(cwd, "database/migrations"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php // generated\n");
+  const approvals = [
+    {
+      path,
+      operation: "create" as const,
+      source: "repository_change_user_approval" as const,
+      authorizedFromAbsent: true,
+    },
+  ];
+  await checkTool("implementor", "edit", { path }, cwd, config(), contract, {
+    dirtyPaths: [],
+    approvedDirtyPaths: [],
+    workflowContractApprovals: approvals,
+  });
+  assert.equal(
+    effectiveContractAuthorization(contract, approvals, path, "modify").source,
+    "create_lifecycle",
+  );
 });
 
 test("runtime approval bridges a create-only contract to modify without granting delete", async () => {
@@ -400,7 +539,8 @@ test("denial leaves the file untouched and an existing in-contract path needs no
     suggestedRoute: "FIX_DESIGN",
   };
   transition(f.state);
-  assert.equal(f.state.phase, "RESEARCH");
+  assert.equal(f.state.phase, "WAITING_USER");
+  assert.equal(f.state.pendingApproval?.kind, "technicalRecovery");
 });
 
 test("pending contract scope request is WAITING_USER without an agent failure", async () => {
@@ -455,6 +595,14 @@ test("path validation rejects traversal, external paths, symlinks, and protected
   assert.equal(
     await validateContractPathRequest(cwd, "tests/extra.test.mjs"),
     "tests/extra.test.mjs",
+  );
+  assert.equal(
+    await validateContractPathRequest(cwd, "app/Models/Client.php"),
+    "app/Models/Client.php",
+  );
+  await assert.rejects(
+    () => validateContractPathRequest(cwd, "app\\Models\\Client.php"),
+    /exact normalized/,
   );
 });
 

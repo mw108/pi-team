@@ -16,6 +16,7 @@ import { commandSchema } from "../config/schema.ts";
 import {
   allowedTools,
   checkTool,
+  ContractAuthorizationError,
   effectiveContractIdentity,
   type ContractOperation,
   validateContractPaths,
@@ -134,9 +135,16 @@ export type RuntimeContractApprover = {
     path: string,
     reason: string,
     signal?: AbortSignal,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | "already_authorized">;
   consumeOnce: (operation: ContractOperation, path: string) => boolean;
+  recordFailure?: AuthorizationFailureObserver;
 };
+export type AuthorizationFailureObserver = (failure: {
+  kind: "contract_authorization";
+  path: string;
+  operation: ContractOperation;
+  reason: string;
+}) => void | Promise<void>;
 export type { GuardEvent } from "./doom-loop.ts";
 
 export const testerCommandInstructions =
@@ -512,6 +520,7 @@ export class PiRunner implements AgentRunner {
               dirtyPaths: s.baseline.dirtyPaths,
               approvedDirtyPaths: s.approvedDirtyPaths,
               workflowContractApprovals: s.workflowApprovedContractPaths,
+              implementationStartHashes: s.implementationStartHashes,
               consumeContractOnce: contractApproval?.consumeOnce,
               approvedSensitivePaths:
                 s.results.reviewer &&
@@ -533,6 +542,13 @@ export class PiRunner implements AgentRunner {
           )
             authorizedDeletes.set(event.toolCallId, event.input.path);
         } catch (e) {
+          if (e instanceof ContractAuthorizationError)
+            await contractApproval?.recordFailure?.({
+              kind: "contract_authorization",
+              path: e.path,
+              operation: e.operation,
+              reason: e.authorizationReason,
+            });
           return { block: true, reason: String(e) };
         }
       });

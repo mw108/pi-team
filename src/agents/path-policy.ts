@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 
-/** Identity for policy decisions only. Keep the caller's spelling for filesystem IO. */
-export function policyPath(path: string): string {
+/** Normalized repository spelling. Policy identities are case-folded separately. */
+export function normalizedRepositoryPath(path: string): string {
   if (!path || path.includes("\0")) throw new Error("Invalid repository path");
   const slash = path.normalize("NFC").replace(/\\/g, "/");
   if (slash.startsWith("/") || /^[a-zA-Z]:/.test(slash))
@@ -10,7 +10,12 @@ export function policyPath(path: string): string {
     throw new Error("Repository path traversal denied");
   const normalized = posix.normalize(slash);
   if (normalized === ".") throw new Error("Repository root is not a file");
-  return normalized.toLowerCase();
+  return normalized;
+}
+
+/** Identity for policy decisions only. Keep the caller's spelling for filesystem IO. */
+export function policyPath(path: string): string {
+  return normalizedRepositoryPath(path).toLowerCase();
 }
 
 export function isWithinPath(path: string, directory: string): boolean {

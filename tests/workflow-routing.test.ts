@@ -310,6 +310,66 @@ test("FIX_REQUIREMENTS pauses for orchestrator", () => {
   assert.equal(s.resumePhase, "ORCHESTRATE");
   assert.equal(s.pendingQuestion?.question, "Integers only?");
 });
+test("technical Implementor blocker offers a targeted retry without a full-cycle rewind", () => {
+  const s = state();
+  s.phase = "IMPLEMENT";
+  s.results.reviewer = contract;
+  s.results.implementor = {
+    status: "IMPLEMENTATION_BLOCKED",
+    reason: "The host rejected an authorized scaffold edit",
+    evidence: ["modify app/Models/Client.php was denied"],
+    blockerCategory: "CONTRACT_AUTHORIZATION_BLOCKED",
+    suggestedRoute: "FIX_REQUIREMENTS",
+  };
+  const fullCycle = s.fullCycle;
+  transition(s);
+  assert.equal(s.phase, "WAITING_USER");
+  assert.equal(s.pendingApproval?.kind, "technicalRecovery");
+  assert.deepEqual(
+    s.pendingApproval?.options.map((option) => option.value),
+    ["retry_implementor", "revise_requirements", "abort"],
+  );
+  assert.equal(s.fullCycle, fullCycle);
+  assert.ok(s.results.reviewer);
+});
+test("Retry Implementor recovery preserves upstream results and continues through quality gates", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.qualityGates.commit.enabled = false;
+  const runner = new FixtureRunner(async (role, _state, count) => {
+    if (role === "implementor" && count === 1)
+      return {
+        status: "IMPLEMENTATION_BLOCKED",
+        reason: "A required Contract write was rejected by the host",
+        evidence: ["modify app/Models/Client.php denied"],
+        blockerCategory: "CONTRACT_AUTHORIZATION_BLOCKED",
+        suggestedRoute: "FIX_REQUIREMENTS",
+      };
+    return undefined;
+  });
+  const engine = new WorkflowEngine(cwd, runner, {
+    progress: () => {},
+    ask: async () => undefined,
+    approve: async (request) =>
+      request.kind === "technicalRecovery"
+        ? ["retry_implementor"]
+        : request.options.map((option) => option.value),
+  });
+  const s = await engine.start("Fix addition", cfg);
+  await engine.run(s);
+  assert.equal(s.phase, "DONE", s.blocker);
+  assert.equal(s.fullCycle, 1);
+  assert.equal(s.localFixCycle, 0);
+  assert.equal(runner.counts.orchestrator, 1);
+  assert.equal(runner.counts.researcher, 1);
+  assert.equal(runner.counts.reviewer, 1);
+  assert.equal(runner.counts.implementor, 2);
+  assert.ok(
+    s.history.some(
+      (event) => event.event === "technical_recovery_retry_implementor",
+    ),
+  );
+});
 for (const route of ["FIX_LOCAL", "FIX_DESIGN"] as const)
   test(`security ${route} routes correctly`, () => {
     const s = state();

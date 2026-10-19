@@ -185,6 +185,15 @@ export const implementationSchema = z.union([
     status: z.literal("IMPLEMENTATION_BLOCKED"),
     reason: text,
     evidence: strings,
+    blockerCategory: z
+      .enum([
+        "REQUIREMENT_BLOCKED",
+        "CONTRACT_AUTHORIZATION_BLOCKED",
+        "RUNTIME_PERMISSION_BLOCKED",
+        "TOOL_EXECUTION_BLOCKED",
+        "IMPLEMENTATION_FAILED",
+      ])
+      .optional(),
     suggestedRoute: z.enum(["FIX_DESIGN", "FIX_REQUIREMENTS"]),
   }),
 ]);

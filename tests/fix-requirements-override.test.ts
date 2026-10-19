@@ -21,6 +21,7 @@ import {
 import { detectedCommandId } from "../src/agents/discovery.ts";
 import { contextFor } from "../src/agents/context.ts";
 import type { WorkflowState } from "../src/workflow/state.ts";
+import { record } from "../src/workflow/state.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
 
@@ -36,6 +37,7 @@ async function waitingLocalFix() {
         status: "IMPLEMENTATION_BLOCKED",
         reason: "The previously unavailable file is needed",
         evidence: [],
+        blockerCategory: "REQUIREMENT_BLOCKED",
         suggestedRoute: "FIX_REQUIREMENTS",
       };
     return undefined;
@@ -438,5 +440,45 @@ test("answering FIX_REQUIREMENTS still restarts the design cycle", async () => {
       (event) => event.event === "fix_requirements_override_applied",
     ),
     false,
+  );
+});
+
+test("explicit override recovers an answered legacy Implementor rewind before new design results complete", async () => {
+  const { state, engine } = await waitingLocalFix();
+  const originalReviewer = structuredClone(state.results.reviewer);
+  const originalBaseline = structuredClone(state.implementationStartHashes);
+  state.questionCount++;
+  state.answers.push({
+    question: state.pendingQuestion!.question,
+    answer: "Retry implementation",
+  });
+  record(state, "user_answer");
+  delete state.pendingQuestion;
+  delete state.resumePhase;
+  state.fullCycle++;
+  state.phase = "ORCHESTRATE";
+  record(state, "phase_started", "orchestrator");
+  record(state, "agent_attempt_started", "orchestrator run 2 started", {
+    agent: "orchestrator",
+    attempt: 2,
+  });
+  record(state, "agent_attempt_failed", "orchestrator run 2: cancelled", {
+    agent: "orchestrator",
+    attempt: 2,
+  });
+  record(state, "interrupted");
+  await engine.store.save(state);
+
+  const fullCycle = state.fullCycle;
+  await engine.retryAgent(state, "implementor", false, "override");
+  assert.equal(state.phase, "IMPLEMENT");
+  assert.equal(state.fullCycle, fullCycle);
+  assert.deepEqual(state.results.reviewer, originalReviewer);
+  assert.deepEqual(state.implementationStartHashes, originalBaseline);
+  assert.equal(state.manualRetry?.agent, "implementor");
+  assert.ok(
+    state.history.some(
+      (event) => event.event === "answered_fix_requirements_recovered_locally",
+    ),
   );
 });

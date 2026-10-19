@@ -467,6 +467,11 @@ export function renderProgress(
       `Options:\n/team resume ${state.id}\n  Answer the requirement question and restart from ORCHESTRATE.\n/team-retry ${requirement.sourceAgent} override\n  Keep the existing requirements, discard this pending question, and retry ${requirement.sourcePhase}.`,
     );
   }
+  if (state.pendingApproval?.kind === "technicalRecovery")
+    lines.push(
+      "Implementation is blocked by a technical or ambiguous host-side failure.",
+      `Next action: /team resume ${state.id} opens Retry Implementor, Revise requirements, and Abort workflow choices.`,
+    );
   for (const request of state.pendingRuntimeCommands ?? [])
     lines.push(
       `◉ ${getAgentDisplayName(state.config, request.agentId)} · command approval required\n  ↳ ${formatCommandLine(request.command)}`,

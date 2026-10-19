@@ -38,7 +38,7 @@ export function contractPathRequestTool(
     operation: ContractOperation,
     path: string,
     reason: string,
-  ) => Promise<boolean>,
+  ) => Promise<boolean | "already_authorized">,
 ): ToolDefinition {
   return {
     name: "team_request_contract_path",
@@ -65,12 +65,18 @@ export function contractPathRequestTool(
         content: [
           {
             type: "text",
-            text: allowed
-              ? `Authorized ${operation} ${path}. Retry the matching mutation now.`
-              : `Authorization denied for ${operation} ${path}. Continue without this change or report the appropriate blocked outcome.`,
+            text:
+              allowed === "already_authorized"
+                ? `Already authorized by the effective Contract: ${operation} ${path}. Retry the matching mutation now.`
+                : allowed
+                  ? `Authorized ${operation} ${path}. Retry the matching mutation now.`
+                  : `Authorization denied for ${operation} ${path}. Continue without this change or report the appropriate blocked outcome.`,
           },
         ],
-        details: { allowed },
+        details: {
+          allowed: Boolean(allowed),
+          alreadyAuthorized: allowed === "already_authorized",
+        },
       };
     },
   };

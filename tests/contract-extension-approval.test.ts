@@ -47,6 +47,7 @@ test("unexpected create pauses, Include persists exact scope, and resumes withou
       path: "generated.txt",
       operation: "create",
       source: "repository_change_user_approval",
+      authorizedFromAbsent: true,
     },
   ]);
   assert.equal(runner.counts.implementor, 1);

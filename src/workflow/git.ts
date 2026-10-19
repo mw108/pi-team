@@ -301,6 +301,7 @@ export async function unexpectedWorkflowChanges(
           s.workflowApprovedContractPaths,
           path,
           operation,
+          { implementationStartHashes: s.implementationStartHashes },
         )) ||
       s.completedOneShotContractPaths.some(
         (candidate) => policyPath(candidate) === identity,
