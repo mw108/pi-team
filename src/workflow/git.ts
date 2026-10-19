@@ -23,13 +23,13 @@ import {
 } from "../agents/path-policy.ts";
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
-import type { WorkflowState } from "./state.ts";
+import { record, type WorkflowState } from "./state.ts";
 import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
 import { matchingSecurityRiskReview } from "./security-risk-review.ts";
 import {
   CredentialApprovalRequired,
   credentialIdentity,
-  sameCredentialFinding,
+  matchingCredentialApproval,
 } from "./credential-findings.ts";
 import type { CredentialFindingIdentity } from "./state.ts";
 const exec = promisify(execFile);
@@ -568,20 +568,63 @@ export async function prepareCommit(
       `Commit blocked: possible ${mandatory.kind} in ${redactVisibleText(mandatory.path)}${mandatory.line ? `:${mandatory.line}` : ""} (${scan.scanner})`,
     );
   }
+  const broadApprovalApplications = new Map<
+    string,
+    {
+      scope: "workflow_file_finding_type" | "workflow_finding_type";
+      scanner: string;
+      findingType: string;
+      path?: string;
+      count: number;
+    }
+  >();
   for (const finding of scan.findings) {
     const identity = credentialIdentity(scan, finding);
-    if (
-      s.workflowApprovedCredentialFindings.some((approved) =>
-        sameCredentialFinding(approved, identity),
-      ) ||
-      oneShot.some((approved) => sameCredentialFinding(approved, identity))
-    )
+    const approval = matchingCredentialApproval(
+      s.workflowApprovedCredentialFindings,
+      oneShot,
+      identity,
+    );
+    if (approval) {
+      if (
+        approval === "workflow_file_finding_type" ||
+        approval === "workflow_finding_type"
+      ) {
+        const summary = {
+          scope: approval,
+          scanner: identity.scanner,
+          findingType: identity.ruleId,
+          ...(approval === "workflow_file_finding_type"
+            ? { path: identity.path }
+            : {}),
+        };
+        const key = JSON.stringify(summary);
+        const existing = broadApprovalApplications.get(key);
+        broadApprovalApplications.set(key, {
+          ...summary,
+          count: (existing?.count ?? 0) + 1,
+        });
+      }
       continue;
+    }
     throw new CredentialApprovalRequired(
       identity,
       finding.line,
       finding.excerpt,
     );
+  }
+  if (broadApprovalApplications.size) {
+    const detail = JSON.stringify({
+      approvals: [...broadApprovalApplications.values()],
+    });
+    if (
+      !s.history.some(
+        (entry) =>
+          entry.event === "credential_finding_type_approval_applied" &&
+          entry.detail === detail,
+      )
+    )
+      record(s, "credential_finding_type_approval_applied", detail);
   }
   return {
     head: s.baseline.head,

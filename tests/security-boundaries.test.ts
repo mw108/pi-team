@@ -14,7 +14,9 @@ import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { prepareCommit } from "../src/workflow/git.ts";
 import {
   CredentialApprovalRequired,
+  credentialApprovalMatches,
   credentialIdentity,
+  matchingCredentialApproval,
   sameCredentialFinding,
 } from "../src/workflow/credential-findings.ts";
 import { StateStore } from "../src/workflow/persistence.ts";
@@ -141,6 +143,94 @@ test("findings in the same file have separate fingerprints and changed files inv
   assert.equal(
     sameCredentialFinding(a, credentialIdentity(second, second.findings[0])),
     false,
+  );
+});
+
+test("finding-type approval matching enforces scope, path, scanner, and type", () => {
+  const finding = {
+    scanner: "builtin" as const,
+    ruleId: "credential-assignment",
+    path: "src/auth.spec.ts",
+    fileSha256: "a".repeat(64),
+    findingFingerprint: "b".repeat(64),
+  };
+  const fileApproval = {
+    scope: "workflow_file_finding_type" as const,
+    scanner: "builtin" as const,
+    ruleId: "credential-assignment",
+    path: "src/auth.spec.ts",
+    approvedAt: new Date().toISOString(),
+  };
+  const workflowApproval = {
+    scope: "workflow_finding_type" as const,
+    scanner: "builtin" as const,
+    ruleId: "credential-assignment",
+    approvedAt: new Date().toISOString(),
+  };
+  const legacyExactApproval = {
+    ...finding,
+    approvedAt: new Date().toISOString(),
+  };
+  assert.equal(credentialApprovalMatches(legacyExactApproval, finding), true);
+  assert.equal(credentialApprovalMatches(fileApproval, finding), true);
+  assert.equal(
+    credentialApprovalMatches(fileApproval, {
+      ...finding,
+      path: "src/other.spec.ts",
+    }),
+    false,
+  );
+  assert.equal(
+    credentialApprovalMatches(workflowApproval, {
+      ...finding,
+      scanner: "gitleaks",
+    }),
+    false,
+  );
+  assert.equal(
+    credentialApprovalMatches(workflowApproval, {
+      ...finding,
+      ruleId: "different-type",
+    }),
+    false,
+  );
+  assert.equal(
+    matchingCredentialApproval([fileApproval, workflowApproval], [], finding),
+    "workflow_file_finding_type",
+  );
+  assert.equal(
+    matchingCredentialApproval([workflowApproval], [finding], finding),
+    "one_shot_exact_finding",
+  );
+});
+
+test("file finding-type approval remains valid for future findings after file changes", async () => {
+  const cwd = await repository();
+  const engine = new WorkflowEngine(cwd, new FixtureRunner(), {
+    progress: () => {},
+    ask: async () => undefined,
+  });
+  const state = await engine.start("Fix", config());
+  state.results.reviewer = contract;
+  state.results.codeReviewer = output("codeReviewer");
+  state.results.securityReviewer = output("securityReviewer");
+  state.results.tester = output("tester");
+  state.workflowApprovedCredentialFindings.push({
+    scope: "workflow_file_finding_type",
+    scanner: "builtin",
+    ruleId: "credential-assignment",
+    path: "math.js",
+    approvedAt: new Date().toISOString(),
+  });
+  await writeFile(join(cwd, "math.js"), "const PASSWORD='firstSecret987';\n");
+  assert.deepEqual(
+    (await prepareCommit(state, ["math.js"], "fix: math")).files,
+    ["math.js"],
+  );
+  await writeFile(join(cwd, "math.js"), "const TOKEN='futureSecret654';\n");
+  assert.deepEqual(
+    (await prepareCommit(state, ["math.js"], "fix: math again")).files,
+    ["math.js"],
   );
 });
 

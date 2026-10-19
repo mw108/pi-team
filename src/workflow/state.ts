@@ -121,6 +121,33 @@ export const credentialFindingIdentitySchema = z
 export type CredentialFindingIdentity = z.infer<
   typeof credentialFindingIdentitySchema
 >;
+const credentialFindingApprovalBaseSchema = z.object({
+  scanner: credentialFindingIdentitySchema.shape.scanner,
+  ruleId: z.string().min(1),
+  approvedAt: z.string(),
+});
+export const credentialFindingApprovalSchema = z.union([
+  credentialFindingIdentitySchema
+    .extend({
+      scope: z.literal("workflow_exact_finding"),
+      approvedAt: z.string(),
+    })
+    .strict(),
+  // Workflow states written before finding-type approvals had no scope field.
+  credentialFindingIdentitySchema.extend({ approvedAt: z.string() }).strict(),
+  credentialFindingApprovalBaseSchema
+    .extend({
+      scope: z.literal("workflow_file_finding_type"),
+      path: exactPath,
+    })
+    .strict(),
+  credentialFindingApprovalBaseSchema
+    .extend({ scope: z.literal("workflow_finding_type") })
+    .strict(),
+]);
+export type CredentialFindingApproval = z.infer<
+  typeof credentialFindingApprovalSchema
+>;
 export const baselineSchema = z.object({
   head: z.string().nullable(),
   dirtyPaths: z.array(z.string()),
@@ -349,11 +376,7 @@ export const stateSchema = z.object({
   approvedDirtyPaths: z.array(exactPath).default([]),
   approvedSensitivePaths: z.array(z.string()).default([]),
   workflowApprovedCredentialFindings: z
-    .array(
-      credentialFindingIdentitySchema
-        .extend({ approvedAt: z.string() })
-        .strict(),
-    )
+    .array(credentialFindingApprovalSchema)
     .default([]),
   pendingCredentialFinding: credentialFindingIdentitySchema
     .extend({
@@ -669,6 +692,35 @@ export function validateState(value: unknown): WorkflowState {
     if (extensionIdentities.has(identity))
       throw new Error("Duplicate contract path approval");
     extensionIdentities.add(identity);
+  }
+  const credentialApprovalIdentities = new Set<string>();
+  for (const approval of state.workflowApprovedCredentialFindings) {
+    let identity: string;
+    if (!("scope" in approval) || approval.scope === "workflow_exact_finding")
+      identity = JSON.stringify([
+        "workflow_exact_finding",
+        approval.scanner,
+        approval.ruleId,
+        approval.path,
+        approval.fileSha256,
+        approval.findingFingerprint,
+      ]);
+    else if (approval.scope === "workflow_file_finding_type")
+      identity = JSON.stringify([
+        approval.scope,
+        approval.scanner,
+        approval.ruleId,
+        approval.path,
+      ]);
+    else
+      identity = JSON.stringify([
+        approval.scope,
+        approval.scanner,
+        approval.ruleId,
+      ]);
+    if (credentialApprovalIdentities.has(identity))
+      throw new Error("Duplicate credential finding approval");
+    credentialApprovalIdentities.add(identity);
   }
   for (const path of state.completedOneShotContractPaths)
     if (policyPath(path) !== path)

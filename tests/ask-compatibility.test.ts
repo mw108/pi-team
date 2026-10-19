@@ -142,17 +142,35 @@ test("credential approval dialog uses English single-choice labels and retains d
   assert.equal(params.questions[0].type, "single");
   assert.equal(request.title, "Potential credential detected");
   assert.match(request.prompt, /File: src\/auth\.spec\.ts/);
-  assert.match(request.prompt, /Allow this exact finding/);
+  assert.match(request.prompt, /What do you want to do\?/);
   assert.deepEqual(
     request.options.map(({ value, label }) => [value, label]),
     [
       ["allow_once", "Allow once"],
       ["allow_workflow", "Allow for this workflow"],
+      [
+        "allow_file_finding_type",
+        "Allow all findings of type credential-assignment in this file",
+      ],
+      [
+        "allow_workflow_finding_type",
+        "Allow all findings of type credential-assignment for this workflow",
+      ],
       ["deny", "Deny"],
     ],
   );
+  assert.match(
+    request.options[2].description,
+    /src\/auth\.spec\.ts for this workflow/,
+  );
   assert.doesNotMatch(JSON.stringify(params), /\b(?:Ja|Nein|für)\b/i);
-  for (const value of ["allow_once", "allow_workflow", "deny"])
+  for (const value of [
+    "allow_once",
+    "allow_workflow",
+    "allow_file_finding_type",
+    "allow_workflow_finding_type",
+    "deny",
+  ])
     assert.deepEqual(
       approvalValues(request, {
         mode: "submit",
@@ -160,4 +178,14 @@ test("credential approval dialog uses English single-choice labels and retains d
       }),
       [value],
     );
+  assert.throws(
+    () =>
+      approvalValues(request, {
+        mode: "submit",
+        answers: {
+          approval: { values: [], customText: "allow everything" },
+        },
+      }),
+    /freeform input cannot grant permissions/,
+  );
 });

@@ -43,6 +43,7 @@ async function workflow(
     unexpectedPath?: string;
     secretPath?: string;
     secretText?: string;
+    secretPaths?: Record<string, string>;
     credentialChoices?: string[];
     changeRepositoryAfterApproval?: boolean;
     contractExtensionChoices?: string[];
@@ -97,9 +98,10 @@ async function workflow(
           await mkdir(dirname(join(cwd, path)), { recursive: true });
           await writeFile(
             join(cwd, path),
-            path === options.secretPath
-              ? (options.secretText ?? "API_KEY=abc123def456ghi789\n")
-              : `workflow change in ${path}\n`,
+            options.secretPaths?.[path] ??
+              (path === options.secretPath
+                ? (options.secretText ?? "API_KEY=abc123def456ghi789\n")
+                : `workflow change in ${path}\n`),
           );
         }
       return {
@@ -422,6 +424,84 @@ test("workflow approval survives reload and does not authorize another workflow"
   assert.equal(other.state.workflowApprovedCredentialFindings.length, 0);
 });
 
+test("file-scoped finding-type approval covers matching findings only in that file", async () => {
+  const { state, engine, runner } = await workflow(
+    ["src/auth.spec.ts", "src/other.spec.ts"],
+    ["src/auth.spec.ts", "src/other.spec.ts"],
+    {
+      secretPaths: {
+        "src/auth.spec.ts":
+          "const PASSWORD='firstSecret987';\nconst TOKEN='secondSecret654';\n",
+        "src/other.spec.ts": "const PASSWORD='thirdSecret321';\n",
+      },
+      credentialChoices: ["allow_file_finding_type", "deny"],
+    },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(
+    state.history.filter(
+      (entry) => entry.event === "credential_finding_approval_requested",
+    ).length,
+    2,
+  );
+  const approval = state.workflowApprovedCredentialFindings[0];
+  assert.deepEqual(approval, {
+    scope: "workflow_file_finding_type",
+    scanner: "builtin",
+    ruleId: "credential-assignment",
+    path: "src/auth.spec.ts",
+    approvedAt: approval.approvedAt,
+  });
+  const loaded = await engine.store.load(state.id);
+  assert.deepEqual(loaded.workflowApprovedCredentialFindings, [approval]);
+});
+
+test("workflow finding-type approval covers matching findings across authorized files", async () => {
+  const { state, engine, runner } = await workflow(
+    ["src/auth.spec.ts", "src/other.spec.ts"],
+    ["src/auth.spec.ts", "src/other.spec.ts"],
+    {
+      secretPaths: {
+        "src/auth.spec.ts":
+          "const PASSWORD='firstSecret987';\nconst TOKEN='secondSecret654';\n",
+        "src/other.spec.ts": "const PASSWORD='thirdSecret321';\n",
+      },
+      credentialChoices: ["allow_workflow_finding_type"],
+    },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.commitAgent, 1);
+  assert.equal(
+    state.history.filter(
+      (entry) => entry.event === "credential_finding_approval_requested",
+    ).length,
+    1,
+  );
+  assert.ok(
+    state.history.some(
+      (entry) =>
+        entry.event === "credential_finding_type_approval_granted" &&
+        entry.detail.includes("workflow_finding_type"),
+    ),
+  );
+  assert.ok(
+    state.history.some(
+      (entry) =>
+        entry.event === "credential_finding_type_approval_applied" &&
+        entry.detail.includes('\"count\":3'),
+    ),
+  );
+  const loaded = await engine.store.load(state.id);
+  const approval = loaded.workflowApprovedCredentialFindings[0];
+  assert.deepEqual(approval, {
+    scope: "workflow_finding_type",
+    scanner: "builtin",
+    ruleId: "credential-assignment",
+    approvedAt: approval.approvedAt,
+  });
+});
+
 test("denial blocks commit without agent failure or upstream rerun", async () => {
   const { state, runner } = await workflow(
     ["config/app.php"],
@@ -485,6 +565,39 @@ test("pending credential approval resumes after state reload without rerunning g
   assert.equal(loaded.workflowApprovedCredentialFindings.length, 1);
 });
 
+test("pending workflow finding-type approval resumes after reload and covers remaining findings", async () => {
+  const first = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+    secretText:
+      "API_KEY=abc123def456ghi789\nTOKEN=xyz987abc654def321\nSECRET=foo456bar789baz123\n",
+  });
+  assert.equal(first.state.phase, "WAITING_USER");
+  const resumed = new WorkflowEngine(first.cwd, first.runner, {
+    ...ui,
+    approve: async (request) =>
+      request.kind === "credentialFinding"
+        ? ["allow_workflow_finding_type"]
+        : [],
+  });
+  const loaded = await resumed.store.load(first.state.id);
+  await resumed.run(loaded);
+  assert.equal(loaded.phase, "DONE", loaded.blocker);
+  assert.equal(first.runner.counts.implementor, 1);
+  assert.equal(first.runner.counts.commitAgent, 1);
+  assert.equal(
+    loaded.history.filter(
+      (entry) => entry.event === "credential_finding_approval_requested",
+    ).length,
+    1,
+  );
+  assert.equal(
+    "scope" in loaded.workflowApprovedCredentialFindings[0]
+      ? loaded.workflowApprovedCredentialFindings[0].scope
+      : undefined,
+    "workflow_finding_type",
+  );
+});
+
 test("concurrent approval resumes cannot create two commits", async () => {
   const first = await workflow(["config/app.php"], ["config/app.php"], {
     secretPath: "config/app.php",
@@ -538,7 +651,7 @@ test("changed file invalidates pending approval after reconnect", async () => {
 test("credential approval does not bypass independent repository checks", async () => {
   const { state } = await workflow(["config/app.php"], ["config/app.php"], {
     secretPath: "config/app.php",
-    credentialChoices: ["allow_workflow"],
+    credentialChoices: ["allow_workflow_finding_type"],
     changeRepositoryAfterApproval: true,
   });
   assert.equal(state.phase, "WAITING_USER");
@@ -554,6 +667,24 @@ test("older state defaults to no credential approvals", async () => {
   const old = JSON.parse(JSON.stringify(state));
   delete old.workflowApprovedCredentialFindings;
   assert.deepEqual(validateState(old).workflowApprovedCredentialFindings, []);
+});
+
+test("duplicate finding-type approvals are rejected during state recovery", async () => {
+  const { state } = await workflow(["config/app.php"], ["config/app.php"], {
+    secretPath: "config/app.php",
+  });
+  const duplicate = {
+    scope: "workflow_finding_type",
+    scanner: "builtin",
+    ruleId: "credential-assignment",
+    approvedAt: new Date().toISOString(),
+  };
+  const raw = JSON.parse(JSON.stringify(state));
+  raw.workflowApprovedCredentialFindings = [duplicate, duplicate];
+  assert.throws(
+    () => validateState(raw),
+    /Duplicate credential finding approval/,
+  );
 });
 
 test("a legacy file-list mismatch can retry COMMIT without rerunning gates", async () => {

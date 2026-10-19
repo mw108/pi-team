@@ -61,6 +61,7 @@ import {
   CredentialApprovalRequired,
   credentialFindingPrompt,
   credentialIdentity,
+  sameCredentialApproval,
   sameCredentialFinding,
 } from "./credential-findings.ts";
 import {
@@ -89,6 +90,7 @@ import {
   type WorkflowState,
   type Phase,
   type ApprovalRequest,
+  type CredentialFindingApproval,
   type CredentialFindingIdentity,
 } from "./state.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
@@ -355,10 +357,16 @@ export class WorkflowEngine {
       "credential_finding_approval_requested",
       JSON.stringify({
         scanner: error.identity.scanner,
-        ruleId: error.identity.ruleId,
+        findingType: error.identity.ruleId,
         path: error.identity.path,
         line: error.line,
         fingerprint: error.identity.findingFingerprint,
+        availableScopes: [
+          "one_shot_exact_finding",
+          "workflow_exact_finding",
+          "workflow_file_finding_type",
+          "workflow_finding_type",
+        ],
       }),
     );
     await this.requestApproval(
@@ -3173,7 +3181,13 @@ export class WorkflowEngine {
             if (
               !selected ||
               selected.length !== 1 ||
-              !["allow_once", "allow_workflow", "deny"].includes(selected[0])
+              ![
+                "allow_once",
+                "allow_workflow",
+                "allow_file_finding_type",
+                "allow_workflow_finding_type",
+                "deny",
+              ].includes(selected[0])
             ) {
               await this.store.save(s);
               break;
@@ -3213,41 +3227,69 @@ export class WorkflowEngine {
               await this.store.save(s);
               break;
             }
+            const decision = selected[0];
+            const approvalDetail = {
+              scanner: pending.scanner,
+              findingType: pending.ruleId,
+              path: pending.path,
+              line: pending.line,
+              fingerprint: pending.findingFingerprint,
+            };
+            const workflowApproval: CredentialFindingApproval | undefined =
+              decision === "allow_workflow"
+                ? {
+                    scope: "workflow_exact_finding",
+                    scanner: pending.scanner,
+                    ruleId: pending.ruleId,
+                    path: pending.path,
+                    fileSha256: pending.fileSha256,
+                    findingFingerprint: pending.findingFingerprint,
+                    approvedAt: new Date().toISOString(),
+                  }
+                : decision === "allow_file_finding_type"
+                  ? {
+                      scope: "workflow_file_finding_type",
+                      scanner: pending.scanner,
+                      ruleId: pending.ruleId,
+                      path: pending.path,
+                      approvedAt: new Date().toISOString(),
+                    }
+                  : decision === "allow_workflow_finding_type"
+                    ? {
+                        scope: "workflow_finding_type",
+                        scanner: pending.scanner,
+                        ruleId: pending.ruleId,
+                        approvedAt: new Date().toISOString(),
+                      }
+                    : undefined;
             record(
               s,
-              selected[0] === "deny"
+              decision === "deny"
                 ? "credential_finding_denied"
-                : selected[0] === "allow_once"
+                : decision === "allow_once"
                   ? "credential_finding_approved_once"
-                  : "credential_finding_approved_workflow",
+                  : decision === "allow_workflow"
+                    ? "credential_finding_approved_workflow"
+                    : "credential_finding_type_approval_granted",
               JSON.stringify({
-                scanner: pending.scanner,
-                ruleId: pending.ruleId,
-                path: pending.path,
-                line: pending.line,
-                fingerprint: pending.findingFingerprint,
+                ...approvalDetail,
+                ...(workflowApproval && "scope" in workflowApproval
+                  ? { scope: workflowApproval.scope }
+                  : {}),
               }),
             );
             if (
-              selected[0] === "allow_workflow" &&
+              workflowApproval &&
               !s.workflowApprovedCredentialFindings.some((item) =>
-                sameCredentialFinding(item, pending),
+                sameCredentialApproval(item, workflowApproval),
               )
             )
-              s.workflowApprovedCredentialFindings.push({
-                scanner: pending.scanner,
-                ruleId: pending.ruleId,
-                path: pending.path,
-                fileSha256: pending.fileSha256,
-                findingFingerprint: pending.findingFingerprint,
-                approvedAt: new Date().toISOString(),
-              });
-            if (selected[0] === "allow_once")
-              this.credentialOneShot.push(pending);
+              s.workflowApprovedCredentialFindings.push(workflowApproval);
+            if (decision === "allow_once") this.credentialOneShot.push(pending);
             delete s.pendingCredentialFinding;
             delete s.pendingApproval;
             delete s.resumePhase;
-            if (selected[0] === "deny") {
+            if (decision === "deny") {
               block(
                 s,
                 `Credential finding denied for ${pending.path}${pending.line ? `:${pending.line}` : ""}`,
