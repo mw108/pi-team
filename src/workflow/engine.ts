@@ -19,7 +19,10 @@ import {
 } from "../config/loader.ts";
 import type { AgentRunner } from "../agents/runner.ts";
 import { normalizedResponseForLog } from "../agents/normalized-response.ts";
-import type { ObservedFileMutation } from "../agents/mutation-attribution.ts";
+import {
+  MutationStatePersistenceError,
+  type ObservedFileMutation,
+} from "../agents/mutation-attribution.ts";
 import { resolveRequestTimeout } from "../agents/request-timeout.ts";
 import {
   parseResult,
@@ -40,6 +43,7 @@ import {
 import {
   classifyPath,
   policyPath,
+  normalizedRepositoryPath,
   isWithinPath,
   permissionPatternMatches,
 } from "../agents/path-policy.ts";
@@ -88,6 +92,7 @@ import {
   record,
   block,
   newState,
+  validateState,
   type WorkflowState,
   type Phase,
   type ApprovalRequest,
@@ -435,8 +440,10 @@ export class WorkflowEngine {
     meta: NonNullable<WorkflowState["history"][number]["meta"]>,
   ) {
     record(state, event, detail, meta);
-    this.historyWrite = this.historyWrite.then(() => this.store.save(state));
-    await this.historyWrite;
+    const snapshot = structuredClone(state);
+    const pending = this.historyWrite.then(() => this.store.save(snapshot));
+    this.historyWrite = pending.catch(() => {});
+    await pending;
   }
   private emitAgentEvent(event: AgentEvent) {
     try {
@@ -1621,8 +1628,15 @@ export class WorkflowEngine {
           delete authoritative.manualRetry;
           await this.store.save(authoritative);
         }
-        const contractOnce = new Map<string, number>();
-        const consumedContractOnce = new Set<string>();
+        const contractOnce = new Map<string, { count: number; path: string }>();
+        const consumedContractOnce = new Map<
+          string,
+          {
+            operation: "create" | "modify" | "delete";
+            path: string;
+            identity: string;
+          }
+        >();
         const result = parseResult(
           role,
           await this.runner.run(
@@ -2172,21 +2186,30 @@ export class WorkflowEngine {
                 );
                 if (choice === "once") {
                   const token = `${operation}:${policyPath(key)}`;
-                  contractOnce.set(token, (contractOnce.get(token) ?? 0) + 1);
+                  const grant = contractOnce.get(token);
+                  contractOnce.set(token, {
+                    count: (grant?.count ?? 0) + 1,
+                    path: grant?.path ?? key,
+                  });
                 } else if (choice === "workflow")
                   s.workflowApprovedContractPaths = structuredClone(
                     authoritative.workflowApprovedContractPaths,
                   );
                 return choice !== "deny";
               },
-              consumeOnce: (operation, path) => {
+              consumeOnce: (operation, path, toolCallId) => {
                 const token = `${operation}:${policyPath(path)}`;
-                const count = contractOnce.get(token) ?? 0;
-                if (!count || control.intention || control.settled)
+                const grant = contractOnce.get(token);
+                if (!grant?.count || control.intention || control.settled)
                   return false;
-                if (count === 1) contractOnce.delete(token);
-                else contractOnce.set(token, count - 1);
-                consumedContractOnce.add(policyPath(path));
+                if (grant.count === 1) contractOnce.delete(token);
+                else
+                  contractOnce.set(token, { ...grant, count: grant.count - 1 });
+                consumedContractOnce.set(toolCallId, {
+                  operation,
+                  path: grant.path,
+                  identity: policyPath(grant.path),
+                });
                 return true;
               },
               recordFailure: async (failure) => {
@@ -2220,33 +2243,73 @@ export class WorkflowEngine {
                 (event) => logged?.logger.append(event),
               ),
             async (mutation: ObservedFileMutation) => {
+              const consumed = consumedContractOnce.get(mutation.toolCallId);
+              consumedContractOnce.delete(mutation.toolCallId);
               if (
-                consumedContractOnce.delete(policyPath(mutation.path)) &&
-                !authoritative.completedOneShotContractPaths.some(
-                  (path) => policyPath(path) === mutation.identity,
+                consumed &&
+                (consumed.identity !== mutation.identity ||
+                  (consumed.operation === "delete") !==
+                    (mutation.kind === "delete"))
+              )
+                throw new Error(
+                  "One-shot Contract approval completion did not match its authorized mutation",
+                );
+              const completedOneShotContractPaths = [
+                ...authoritative.completedOneShotContractPaths,
+              ];
+              if (
+                consumed &&
+                !completedOneShotContractPaths.some(
+                  (path) => policyPath(path) === consumed.identity,
                 )
-              ) {
-                authoritative.completedOneShotContractPaths.push(mutation.path);
-                await this.store.save(authoritative);
+              )
+                completedOneShotContractPaths.push(
+                  normalizedRepositoryPath(consumed.path),
+                );
+              if (role !== "implementor") {
+                if (!consumed) return;
+                const candidate = validateState({
+                  ...authoritative,
+                  completedOneShotContractPaths,
+                });
+                await this.store.save(candidate);
+                authoritative.completedOneShotContractPaths =
+                  candidate.completedOneShotContractPaths;
+                return;
               }
-              if (role !== "implementor") return;
-              const recordItem = { attempt: attemptNumber, ...mutation };
+              const { toolCallId: _toolCallId, ...observedMutation } = mutation;
+              const recordItem = {
+                attempt: attemptNumber,
+                ...observedMutation,
+              };
+              const observedImplementorMutations = [
+                ...authoritative.observedImplementorMutations,
+              ];
               if (
-                authoritative.observedImplementorMutations.some(
+                !observedImplementorMutations.some(
                   (item) =>
                     item.attempt === recordItem.attempt &&
                     item.identity === recordItem.identity &&
                     item.kind === recordItem.kind,
                 )
               )
+                observedImplementorMutations.push(recordItem);
+              if (
+                !consumed &&
+                observedImplementorMutations.length ===
+                  authoritative.observedImplementorMutations.length
+              )
                 return;
-              authoritative.observedImplementorMutations.push(recordItem);
-              try {
-                await this.store.save(authoritative);
-              } catch (error) {
-                authoritative.observedImplementorMutations.pop();
-                throw error;
-              }
+              const candidate = validateState({
+                ...authoritative,
+                completedOneShotContractPaths,
+                observedImplementorMutations,
+              });
+              await this.store.save(candidate);
+              authoritative.completedOneShotContractPaths =
+                candidate.completedOneShotContractPaths;
+              authoritative.observedImplementorMutations =
+                candidate.observedImplementorMutations;
               logged?.logger.append({
                 type: "implementor_file_mutation_recorded",
                 attempt: attemptNumber,
@@ -2493,7 +2556,7 @@ export class WorkflowEngine {
           },
         );
         if (signal?.aborted) throw e;
-        failures++;
+        if (!(e instanceof MutationStatePersistenceError)) failures++;
         const transient = e instanceof AgentTimeoutError;
         if (
           s.agentFailures + failures >= s.config.workflow.maxAgentFailures ||
@@ -4036,6 +4099,7 @@ export class WorkflowEngine {
         if (this.continuingPhase === s.phase) this.continuingPhase = undefined;
         // Failure accounting belongs to the authoritative parent, not the isolated snapshots.
         let error: string | undefined;
+        let mutationPersistenceFailed = false;
         let aborted: Role | undefined;
         let pending: Question | undefined;
         let solverFailures = 0;
@@ -4047,6 +4111,8 @@ export class WorkflowEngine {
               continue;
             }
             if (item.reason instanceof AgentSupersededForRetryError) continue;
+            if (item.reason?.code === "MUTATION_STATE_PERSISTENCE_FAILED")
+              mutationPersistenceFailed = true;
             const failures = item.reason?.failures ?? 1;
             s.agentFailures += failures;
             if (s.phase === "SOLVE") solverFailures += failures;
@@ -4190,7 +4256,20 @@ export class WorkflowEngine {
           // A prepared manual retry has now executed and failed. Its intent
           // must not block the user's next explicit retry.
           delete s.manualRetry;
-          block(s, `Agent execution failed: ${error}`);
+          if (mutationPersistenceFailed) {
+            record(
+              s,
+              "workflow_state_persistence_failed",
+              "A successful file mutation could not publish its validated workflow state",
+            );
+            await this.markInterruptedImplementor(s, "process_interrupted");
+          }
+          block(
+            s,
+            mutationPersistenceFailed
+              ? "Technical workflow state persistence failure after a file mutation; inspect the working tree and use /team-retry implementor keep to reconcile without repeating destructive commands."
+              : `Agent execution failed: ${error}`,
+          );
           await this.store.save(s);
           break;
         }

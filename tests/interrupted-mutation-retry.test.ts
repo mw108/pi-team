@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { dirtyPaths, git } from "../src/workflow/git.ts";
 import { getWorkflowRecoveryPlan } from "../src/workflow/recovery.ts";
+import { MutationStatePersistenceError } from "../src/agents/mutation-attribution.ts";
 import teamExtension from "../src/index.ts";
 import {
   contract,
@@ -21,6 +22,40 @@ const ui = {
     return undefined;
   },
 };
+
+test("mutation persistence failure blocks safely and offers a keep retry", async () => {
+  const cwd = await repository();
+  const runner = new FixtureRunner(async (role) => {
+    if (role !== "implementor") return undefined;
+    await writeFile(join(cwd, "math.js"), "export const add = () => 3;\n");
+    throw new MutationStatePersistenceError(
+      new Error("candidate state rejected"),
+    );
+  });
+  const engine = new WorkflowEngine(cwd, runner, ui);
+  const state = await engine.start("Fix addition", config());
+  state.phase = "IMPLEMENT";
+  state.results.reviewer = contract;
+  await engine.run(state);
+  assert.equal(state.phase, "BLOCKED");
+  assert.equal(state.agentFailures, 0);
+  assert.equal(
+    state.interruptedMutationRecovery?.reason,
+    "process_interrupted",
+  );
+  assert.match(state.blocker ?? "", /persistence failure/);
+  assert.deepEqual(
+    (await getWorkflowRecoveryPlan(state, cwd)).actions.map(
+      (action) => action.command,
+    ),
+    [
+      "/team-retry implementor keep",
+      "/team-retry implementor discard",
+      "/team-abort",
+    ],
+  );
+});
+
 async function interrupted(
   options: { baselineDirty?: boolean; commandOutput?: boolean } = {},
 ) {
@@ -43,8 +78,18 @@ async function interrupted(
     if (role !== "implementor") return undefined;
     await writeFile(join(cwd, "math.js"), "export const add = (a,b) => a+b;\n");
     await writeFile(join(cwd, "new.js"), "export const newValue = 1;\n");
-    await observe?.({ path: "math.js", identity: "math.js", kind: "edit" });
-    await observe?.({ path: "new.js", identity: "new.js", kind: "write" });
+    await observe?.({
+      toolCallId: "edit-math",
+      path: "math.js",
+      identity: "math.js",
+      kind: "edit",
+    });
+    await observe?.({
+      toolCallId: "write-new",
+      path: "new.js",
+      identity: "new.js",
+      kind: "write",
+    });
     if (options.commandOutput)
       await writeFile(join(cwd, "generated.txt"), "command output\n");
     entered();

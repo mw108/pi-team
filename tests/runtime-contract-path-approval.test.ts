@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { deleteTool } from "../src/agents/files.ts";
+import { policyPath } from "../src/agents/path-policy.ts";
 import {
   checkTool,
   effectiveContractAuthorization,
@@ -15,6 +16,8 @@ import { approvalParams } from "../src/integrations/pi-ask.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import { transition } from "../src/workflow/router.ts";
 import { unexpectedWorkflowChanges } from "../src/workflow/git.ts";
+import { normalizedRuntimeCommand } from "../src/agents/runtime-commands.ts";
+import { validateState } from "../src/workflow/state.ts";
 import {
   config,
   contract,
@@ -779,26 +782,31 @@ test("HAPAK register template scope gap asks before the success-button edit", as
   assert.ok(!hapakContract.filesToModify.includes(path));
 });
 
-test("engine keeps a one-shot scope grant inside the current Implementor attempt", async () => {
+test("one-shot deletion remains valid after an earlier consumed migration approval", async () => {
   const cwd = await repository();
-  await writeFile(join(cwd, "extra.js"), "old\n");
+  const migration =
+    "database/migrations/2026_10_19_204241_create_clients_table.php";
+  const path = "tests/Feature/ClientModelTest.php";
+  await mkdir(join(cwd, "tests/Feature"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php // unintended scaffold\n");
   class RequestingRunner extends FixtureRunner {
     override async run(role: any, state: any, ...extras: any[]) {
       if (role !== "implementor") return super.run(role, state, ...extras);
       const approval = extras.at(-3);
       const mutationObserver = extras.at(-1);
+      const toolCallId = "delete-client-feature-test";
       assert.equal(
         await approval.request(
-          "modify",
-          "extra.js",
-          "Existing test needs the new behavior",
+          "delete",
+          path,
+          "Artisan generated a Feature test instead of the required Unit test",
         ),
         true,
       );
       await checkTool(
         "implementor",
-        "edit",
-        { path: "extra.js" },
+        "team_delete",
+        { path },
         cwd,
         state.config,
         contract,
@@ -806,34 +814,156 @@ test("engine keeps a one-shot scope grant inside the current Implementor attempt
           dirtyPaths: [],
           approvedDirtyPaths: [],
           workflowContractApprovals: state.workflowApprovedContractPaths,
-          consumeContractOnce: approval.consumeOnce,
+          consumeContractOnce: (operation, requested) =>
+            approval.consumeOnce(operation, requested, toolCallId),
         },
       );
-      await writeFile(join(cwd, "extra.js"), "new\n");
+      const tool = deleteTool(
+        cwd,
+        (id, requested) => id === toolCallId && requested === path,
+      );
+      await tool.execute(
+        toolCallId,
+        { path } as any,
+        undefined,
+        undefined,
+        {} as any,
+      );
       await mutationObserver({
-        path: "extra.js",
-        identity: "extra.js",
-        kind: "edit",
+        toolCallId,
+        path,
+        identity: policyPath(path),
+        kind: "delete",
       });
       return output("implementor");
     }
   }
   const requests: any[] = [];
+  const choices = [["allow_once"], ["allow_once"]];
   const engine = new WorkflowEngine(cwd, new RequestingRunner(), {
     progress: () => {},
     ask: async () => undefined,
     approve: async (request) => {
       requests.push(request);
-      return ["allow_once"];
+      return choices.shift();
     },
   });
-  const state = await engine.start("Edit extra file", config());
+  const state = await engine.start("Delete unintended scaffold", config());
+  state.results.reviewer = contract;
+  state.completedOneShotContractPaths = [migration];
+  await engine.invoke("implementor", state);
+  await assert.rejects(() => readFile(join(cwd, path), "utf8"), /ENOENT/);
+  assert.deepEqual(state.workflowApprovedContractPaths, []);
+  assert.deepEqual(state.completedOneShotContractPaths, [migration, path]);
+  validateState(state);
+  const loaded = await engine.store.load(state.id);
+  assert.deepEqual(loaded.completedOneShotContractPaths, [migration, path]);
+
+  const control = {
+    workflowId: loaded.id,
+    attempt: 2,
+    controller: new AbortController(),
+  };
+  (engine as any).activeAttempts.set("implementor", control);
+  const { command, request } = normalizedRuntimeCommand(
+    {
+      executable: process.execPath,
+      args: ["--version"],
+      purpose: "Verify the runtime after deletion",
+      category: "development",
+    },
+    "implementor",
+  );
+  assert.equal(
+    await (engine as any).runtimeCommandApproval(
+      loaded,
+      loaded,
+      "implementor",
+      control,
+      command,
+      request,
+      control.controller.signal,
+      () => {},
+    ),
+    "allow",
+  );
+  validateState(await engine.store.load(state.id));
+  assert.equal(requests.length, 2);
+  assert.ok(workflowScopePaths(state).includes(path));
+  assert.equal(state.agentFailures, 0);
+});
+
+test("an unsuccessful deletion consumes its exact one-shot without recording completion", async () => {
+  const cwd = await repository();
+  const path = "tests/Feature/ClientModelTest.php";
+  await mkdir(join(cwd, "tests/Feature"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php // unintended scaffold\n");
+  class FailingDeleteRunner extends FixtureRunner {
+    override async run(role: any, state: any, ...extras: any[]) {
+      if (role !== "implementor") return super.run(role, state, ...extras);
+      const approval = extras.at(-3);
+      const toolCallId = "failed-delete";
+      assert.equal(
+        await approval.request("delete", path, "Remove unintended scaffold"),
+        true,
+      );
+      const consume = (operation: any, requested: string) =>
+        approval.consumeOnce(operation, requested, toolCallId);
+      await checkTool(
+        "implementor",
+        "team_delete",
+        { path },
+        cwd,
+        state.config,
+        contract,
+        {
+          dirtyPaths: [],
+          approvedDirtyPaths: [],
+          consumeContractOnce: consume,
+        },
+      );
+      await unlink(join(cwd, path));
+      const tool = deleteTool(cwd, () => true);
+      await assert.rejects(
+        () =>
+          tool.execute(
+            toolCallId,
+            { path } as any,
+            undefined,
+            undefined,
+            {} as any,
+          ),
+        /ENOENT/,
+      );
+      await assert.rejects(
+        () =>
+          checkTool(
+            "implementor",
+            "team_delete",
+            { path },
+            cwd,
+            state.config,
+            contract,
+            {
+              dirtyPaths: [],
+              approvedDirtyPaths: [],
+              consumeContractOnce: (operation, requested) =>
+                approval.consumeOnce(operation, requested, "retry-delete"),
+            },
+          ),
+        /team_request_contract_path/,
+      );
+      return output("implementor");
+    }
+  }
+  const engine = new WorkflowEngine(cwd, new FailingDeleteRunner(), {
+    progress: () => {},
+    ask: async () => undefined,
+    approve: async () => ["allow_once"],
+  });
+  const state = await engine.start("Delete unintended scaffold", config());
   state.results.reviewer = contract;
   await engine.invoke("implementor", state);
-  assert.equal(requests.length, 1);
-  assert.equal(await readFile(join(cwd, "extra.js"), "utf8"), "new\n");
-  assert.deepEqual(state.workflowApprovedContractPaths, []);
-  assert.deepEqual(state.completedOneShotContractPaths, ["extra.js"]);
-  assert.ok(workflowScopePaths(state).includes("extra.js"));
-  assert.equal(state.agentFailures, 0);
+  assert.deepEqual(state.completedOneShotContractPaths, []);
+  validateState(await engine.store.load(state.id));
 });

@@ -3,6 +3,7 @@ import { policyPath } from "./path-policy.ts";
 
 export type FileMutationKind = "edit" | "write" | "delete";
 export type ObservedFileMutation = {
+  toolCallId: string;
   path: string;
   identity: string;
   kind: FileMutationKind;
@@ -10,6 +11,18 @@ export type ObservedFileMutation = {
 export type MutationObserver = (
   mutation: ObservedFileMutation,
 ) => Promise<void>;
+
+export class MutationStatePersistenceError extends Error {
+  readonly code = "MUTATION_STATE_PERSISTENCE_FAILED";
+  readonly failures = 0;
+  constructor(cause: unknown) {
+    super(
+      "Workflow state persistence failed after a file mutation; the mutation requires recovery before execution can continue",
+      { cause },
+    );
+    this.name = "MutationStatePersistenceError";
+  }
+}
 
 const mutationKinds: Record<string, FileMutationKind> = {
   edit: "edit",
@@ -23,6 +36,7 @@ export class FileMutationTracker {
   constructor(
     private readonly cwd: string,
     private readonly observer: MutationObserver,
+    private readonly observerError?: (error: unknown) => void,
   ) {}
   start(toolCallId: string, toolName: string, args: unknown) {
     const kind = mutationKinds[toolName];
@@ -39,11 +53,21 @@ export class FileMutationTracker {
       assertRelative(mutation.path);
       const path = await assertWithin(this.cwd, mutation.path);
       if (policyPath(path) !== policyPath(mutation.path)) return;
-      observed = { path, identity: policyPath(path), kind: mutation.kind };
+      observed = {
+        toolCallId,
+        path,
+        identity: policyPath(path),
+        kind: mutation.kind,
+      };
     } catch {
       // A successful tool with an unresolvable path cannot establish ownership.
       return;
     }
-    await this.observer(observed);
+    try {
+      await this.observer(observed);
+    } catch (error) {
+      if (!this.observerError) throw error;
+      this.observerError(error);
+    }
   }
 }

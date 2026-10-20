@@ -69,13 +69,15 @@ export class StateStore {
     return join(this.dir, `${id}.json`);
   }
   async save(state: WorkflowState) {
-    const pending = this.saveQueue.then(() => this.write(state));
+    const candidate = structuredClone(state);
+    sanitizeWorkflowStateText(candidate);
+    const validated = validateState(candidate);
+    sanitizeWorkflowStateText(state);
+    const pending = this.saveQueue.then(() => this.write(validated));
     this.saveQueue = pending.catch(() => {});
     await pending;
   }
   private async write(state: WorkflowState) {
-    sanitizeWorkflowStateText(state);
-    validateState(state);
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const path = this.path(state.id),
       temp = `${path}.${process.pid}.${randomUUID()}.tmp`;

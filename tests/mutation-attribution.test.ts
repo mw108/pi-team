@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   FileMutationTracker,
@@ -47,8 +47,53 @@ test("only successful file tool completions record normalized mutations", async 
   await observed(cwd, observer, "generated.json", "team_command");
   await observed(cwd, observer, "../escape", "write");
   assert.deepEqual(mutations, [
-    { path: "math.js", identity: "math.js", kind: "edit" },
+    {
+      toolCallId: "call",
+      path: "math.js",
+      identity: "math.js",
+      kind: "edit",
+    },
   ]);
+});
+
+test("a successful deletion reports a canonical path and contains observer failures", async () => {
+  const cwd = await repository();
+  const path = "tests/Feature/ClientModelTest.php";
+  await mkdir(join(cwd, "tests/Feature"), { recursive: true });
+  await writeFile(join(cwd, path), "<?php\n");
+  let observedMutation: unknown;
+  const tracker = new FileMutationTracker(cwd, async (mutation) => {
+    observedMutation = mutation;
+  });
+  tracker.start("delete-call", "team_delete", { path });
+  await unlink(join(cwd, path));
+  await tracker.end("delete-call", false);
+  assert.deepEqual(observedMutation, {
+    toolCallId: "delete-call",
+    path,
+    identity: "tests/feature/clientmodeltest.php",
+    kind: "delete",
+  });
+  validateState({
+    ...newState(cwd, "task", config(), await baseline(cwd)),
+    completedOneShotContractPaths: [path],
+  });
+
+  let observerFailure: unknown;
+  const failing = new FileMutationTracker(
+    cwd,
+    async () => {
+      throw new Error("state write failed");
+    },
+    (error) => {
+      observerFailure = error;
+    },
+  );
+  await writeFile(join(cwd, path), "<?php\n");
+  failing.start("failed-persistence", "team_delete", { path });
+  await unlink(join(cwd, path));
+  await failing.end("failed-persistence", false);
+  assert.match(String(observerFailure), /state write failed/);
 });
 
 test("declared changes and successful commands do not establish discard ownership", async () => {

@@ -98,6 +98,7 @@ import {
 } from "./active-sessions.ts";
 import {
   FileMutationTracker,
+  MutationStatePersistenceError,
   type MutationObserver,
 } from "./mutation-attribution.ts";
 import { parseTextualToolCall } from "./textual-tool-call.ts";
@@ -136,7 +137,11 @@ export type RuntimeContractApprover = {
     reason: string,
     signal?: AbortSignal,
   ) => Promise<boolean | "already_authorized">;
-  consumeOnce: (operation: ContractOperation, path: string) => boolean;
+  consumeOnce: (
+    operation: ContractOperation,
+    path: string,
+    toolCallId: string,
+  ) => boolean;
   recordFailure?: AuthorizationFailureObserver;
 };
 export type AuthorizationFailureObserver = (failure: {
@@ -335,6 +340,7 @@ export class PiRunner implements AgentRunner {
       providerRequest: number,
     ) => void,
     contractApproval?: RuntimeContractApprover,
+    mutationFailure?: { error?: unknown },
     preflightLifecycle?: { start(): void; end(): void },
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
@@ -452,7 +458,9 @@ export class PiRunner implements AgentRunner {
       (role === "implementor" ||
         (role === "tester" && config.tester.mayModifyTests)) &&
       mutationObserver
-        ? new FileMutationTracker(s.cwd, mutationObserver)
+        ? new FileMutationTracker(s.cwd, mutationObserver, (error) => {
+            if (mutationFailure) mutationFailure.error ??= error;
+          })
         : undefined;
     const authorizedDeletes = new Map<string, string>();
     const guard = (pi: ExtensionAPI) => {
@@ -486,6 +494,12 @@ export class PiRunner implements AgentRunner {
         return { message: recovered.message };
       });
       pi.on("tool_call", async (event) => {
+        if (mutationFailure?.error)
+          return {
+            block: true,
+            reason:
+              "Workflow state persistence failed after a file mutation; further tools are disabled pending recovery",
+          };
         const { tool, input } = toolInvocation(event.toolName, event.input);
         const guarded = await guardState?.guard.call(
           tool,
@@ -521,7 +535,14 @@ export class PiRunner implements AgentRunner {
               approvedDirtyPaths: s.approvedDirtyPaths,
               workflowContractApprovals: s.workflowApprovedContractPaths,
               implementationStartHashes: s.implementationStartHashes,
-              consumeContractOnce: contractApproval?.consumeOnce,
+              consumeContractOnce: contractApproval
+                ? (operation, path) =>
+                    contractApproval.consumeOnce(
+                      operation,
+                      path,
+                      event.toolCallId,
+                    )
+                : undefined,
               approvedSensitivePaths:
                 s.results.reviewer &&
                 s.sensitiveApprovalContractHash ===
@@ -732,6 +753,7 @@ export class PiRunner implements AgentRunner {
     mutationObserver?: MutationObserver,
   ) {
     const evidence: CommandEvidence[] = [];
+    const mutationFailure: { error?: unknown } = {};
     let commandDenied = false;
     const captureResult: CommandResultObserver = async (command, result) => {
       if (commandResult) return commandResult(command, result);
@@ -834,6 +856,7 @@ export class PiRunner implements AgentRunner {
       },
       normalizedResponse,
       contractApproval,
+      mutationFailure,
       {
         start: () => pauseAgentTimeout(),
         end: () => resumeAgentTimeout(),
@@ -998,6 +1021,8 @@ export class PiRunner implements AgentRunner {
       await session.prompt(JSON.stringify(sanitizeContextForProvider(input)), {
         expandPromptTemplates: false,
       });
+      if (mutationFailure.error)
+        throw new MutationStatePersistenceError(mutationFailure.error);
       if (timedOut && timeoutMs !== undefined)
         throw new AgentTimeoutError(role, timeoutMs, attempt);
       if (signal?.aborted) throw new Error("Workflow interrupted");

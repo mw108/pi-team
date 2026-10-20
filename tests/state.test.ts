@@ -197,6 +197,30 @@ test("corrupt state fails closed and is not overwritten", async () => {
   await assert.rejects(() => store.load(s.id), /original state preserved/);
   assert.equal(await readFile(store.path(s.id), "utf8"), "{broken");
 });
+test("an invalid queued candidate preserves valid state and does not poison later writes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-state-"));
+  const state = newState(cwd, "valid", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  const store = new StateStore(cwd);
+  await store.save(state);
+  const before = await readFile(store.path(state.id), "utf8");
+  const invalid = {
+    ...state,
+    completedOneShotContractPaths: ["tests\\Feature\\ClientModelTest.php"],
+  } as any;
+  await assert.rejects(() => store.save(invalid), /exact normalized/);
+  assert.equal(await readFile(store.path(state.id), "utf8"), before);
+  assert.deepEqual(state.completedOneShotContractPaths, []);
+
+  state.task = "valid follow-up";
+  await store.save(state);
+  assert.equal((await store.load(state.id)).task, "valid follow-up");
+});
 test("repository lock prevents a second live workflow", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-lock-"));
   const store = new StateStore(cwd);

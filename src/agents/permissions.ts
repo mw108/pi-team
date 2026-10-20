@@ -261,7 +261,7 @@ export async function assertWithin(cwd: string, path: string) {
       const r = relative(root, resolve(actual, ...missing));
       if (r.startsWith("..") || isAbsolute(r))
         throw new Error("Symlink escapes repository");
-      return r;
+      return normalizedRepositoryPath(r);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       try {
