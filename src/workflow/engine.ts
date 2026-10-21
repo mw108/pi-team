@@ -165,6 +165,7 @@ import {
   serializeErrorDiagnostics,
 } from "../agents/error-diagnostics.ts";
 import type { ProviderRequestEvent } from "../agents/network-retry.ts";
+import type { AgentHumanInputWait } from "../agents/agent-timeout.ts";
 import {
   buildCompletionReportInput,
   finalizeReport,
@@ -421,6 +422,7 @@ export class WorkflowEngine {
     request: RuntimeCommandRequest,
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
+    waitForHumanInput?: AgentHumanInputWait,
   ) {
     return this.commandApprovals.approve(
       s,
@@ -431,6 +433,7 @@ export class WorkflowEngine {
       request,
       signal,
       log,
+      waitForHumanInput,
     );
   }
   private async persistAttempt(
@@ -2017,7 +2020,7 @@ export class WorkflowEngine {
                   update,
                 });
             },
-            (command, request, commandSignal) =>
+            (command, request, commandSignal, waitForHumanInput) =>
               this.runtimeCommandApproval(
                 authoritative,
                 s,
@@ -2027,6 +2030,7 @@ export class WorkflowEngine {
                 request,
                 commandSignal,
                 (event) => logged?.logger.append(event),
+                waitForHumanInput,
               ),
             (recovery) =>
               logged?.logger.append({
@@ -2139,7 +2143,13 @@ export class WorkflowEngine {
               this.emitAgentEvent({ type: "schemaRepair", role, event });
             },
             {
-              request: async (operation, path, reason, requestSignal) => {
+              request: async (
+                operation,
+                path,
+                reason,
+                requestSignal,
+                waitForHumanInput,
+              ) => {
                 if (!reason.trim() || reason.length > 500)
                   throw new Error(
                     "Contract path request requires a concise reason (1–500 characters)",
@@ -2183,6 +2193,7 @@ export class WorkflowEngine {
                   requestSignal,
                   (event) => logged?.logger.append(event),
                   requestBaseline[key] === "DELETED",
+                  waitForHumanInput,
                 );
                 if (choice === "once") {
                   const token = `${operation}:${policyPath(key)}`;
@@ -2229,7 +2240,7 @@ export class WorkflowEngine {
                 });
               },
             },
-            (operation, path, fileSignal) =>
+            (operation, path, fileSignal, waitForHumanInput) =>
               this.commandApprovals.approveFile(
                 authoritative,
                 role,
@@ -2241,6 +2252,7 @@ export class WorkflowEngine {
                   ? contractSchema.parse(s.results.reviewer).goal
                   : "Agent requested access to a sensitive repository file",
                 (event) => logged?.logger.append(event),
+                waitForHumanInput,
               ),
             async (mutation: ObservedFileMutation) => {
               const consumed = consumedContractOnce.get(mutation.toolCallId);

@@ -26,10 +26,12 @@ import {
   sandboxSetupFailure,
   type SandboxDetails,
 } from "./sandbox.ts";
+import type { AgentHumanInputWait } from "./agent-timeout.ts";
 export type RuntimeCommandApprover = (
   command: Command,
   request: RuntimeCommandRequest,
   signal?: AbortSignal,
+  waitForHumanInput?: AgentHumanInputWait,
 ) => Promise<"allow" | "deny" | "pending">;
 export type CommandResultObserver = (
   command: Command,

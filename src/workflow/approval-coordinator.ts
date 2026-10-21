@@ -19,6 +19,7 @@ import { getAgentDisplayName } from "../ui/agent-name.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import type { WorkflowState, ApprovalRequest } from "./state.ts";
 import { policyPath } from "../agents/path-policy.ts";
+import type { AgentHumanInputWait } from "../agents/agent-timeout.ts";
 
 export type AttemptControl = {
   workflowId: string;
@@ -46,6 +47,25 @@ export interface CommandApprovalDependencies {
 export class RuntimeCommandApprovalCoordinator {
   constructor(private readonly deps: CommandApprovalDependencies) {}
   private commandApprovalQueue = Promise.resolve();
+  private async requestDecision(
+    request: ApprovalRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<string[] | undefined> {
+    if (signal?.aborted) return undefined;
+    let abort: (() => void) | undefined;
+    const aborted = new Promise<undefined>((resolve) => {
+      abort = () => resolve(undefined);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      return await Promise.race([
+        this.deps.approve?.(request) ?? Promise.resolve(undefined),
+        aborted,
+      ]);
+    } finally {
+      if (abort) signal?.removeEventListener("abort", abort);
+    }
+  }
   contractPathPrompt(
     s: WorkflowState,
     role: Role,
@@ -86,6 +106,7 @@ export class RuntimeCommandApprovalCoordinator {
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
     authorizedFromAbsent = false,
+    waitForHumanInput?: AgentHumanInputWait,
   ): Promise<"once" | "workflow" | "deny"> {
     const current = () =>
       control.workflowId === s.id &&
@@ -134,19 +155,10 @@ export class RuntimeCommandApprovalCoordinator {
     const decide = async (): Promise<"once" | "workflow" | "deny"> => {
       if (!current()) return "deny";
       if (granted()) return "workflow";
-      const aborted = new Promise<undefined>((resolve) => {
-        if (signal?.aborted) resolve(undefined);
-        else
-          signal?.addEventListener("abort", () => resolve(undefined), {
-            once: true,
-          });
-      });
-      const selected = await Promise.race([
-        this.deps.approve?.(
-          this.contractPathPrompt(s, role, operation, path, reason),
-        ) ?? Promise.resolve(undefined),
-        aborted,
-      ]);
+      const selected = await this.requestDecision(
+        this.contractPathPrompt(s, role, operation, path, reason),
+        signal,
+      );
       if (
         !current() ||
         !s.pendingContractPaths.some(
@@ -204,7 +216,9 @@ export class RuntimeCommandApprovalCoordinator {
       () => {},
     );
     try {
-      return await turn;
+      return await (waitForHumanInput
+        ? waitForHumanInput("contract_path_approval", () => turn)
+        : turn);
     } finally {
       if (!current()) {
         s.pendingContractPaths = s.pendingContractPaths.filter(
@@ -257,6 +271,7 @@ export class RuntimeCommandApprovalCoordinator {
     signal: AbortSignal | undefined,
     reason: string,
     log: (event: { type: string; [key: string]: unknown }) => void,
+    waitForHumanInput?: AgentHumanInputWait,
   ): Promise<boolean> {
     const current = () =>
       control.workflowId === s.id &&
@@ -313,17 +328,7 @@ export class RuntimeCommandApprovalCoordinator {
         path,
         reason,
       );
-      const aborted = new Promise<undefined>((resolve) => {
-        if (signal?.aborted) resolve(undefined);
-        else
-          signal?.addEventListener("abort", () => resolve(undefined), {
-            once: true,
-          });
-      });
-      const selected = await Promise.race([
-        this.deps.approve?.(request) ?? Promise.resolve(undefined),
-        aborted,
-      ]);
+      const selected = await this.requestDecision(request, signal);
       if (
         !current() ||
         !s.pendingRuntimeFiles.some(
@@ -373,7 +378,9 @@ export class RuntimeCommandApprovalCoordinator {
       () => {},
     );
     try {
-      return await turn;
+      return await (waitForHumanInput
+        ? waitForHumanInput("runtime_file_approval", () => turn)
+        : turn);
     } finally {
       if (!current()) {
         s.pendingRuntimeFiles = s.pendingRuntimeFiles.filter(
@@ -468,6 +475,7 @@ export class RuntimeCommandApprovalCoordinator {
     request: RuntimeCommandRequest,
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
+    waitForHumanInput?: AgentHumanInputWait,
   ): Promise<"allow" | "deny" | "pending"> {
     const current = () =>
       control.workflowId === s.id &&
@@ -549,17 +557,7 @@ export class RuntimeCommandApprovalCoordinator {
         command,
         request.purpose,
       );
-      const aborted = new Promise<undefined>((resolve) => {
-        if (signal?.aborted) resolve(undefined);
-        else
-          signal?.addEventListener("abort", () => resolve(undefined), {
-            once: true,
-          });
-      });
-      const selected = await Promise.race([
-        this.deps.approve?.(approval) ?? Promise.resolve(undefined),
-        aborted,
-      ]);
+      const selected = await this.requestDecision(approval, signal);
       if (
         !current() ||
         !s.pendingRuntimeCommands.some(
@@ -640,7 +638,9 @@ export class RuntimeCommandApprovalCoordinator {
       () => {},
     );
     try {
-      return await turn;
+      return await (waitForHumanInput
+        ? waitForHumanInput("runtime_command_approval", () => turn)
+        : turn);
     } finally {
       if (!current()) {
         s.pendingRuntimeCommands = s.pendingRuntimeCommands.filter(

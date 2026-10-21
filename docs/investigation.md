@@ -1,5 +1,45 @@
 # Investigation and implementation choices
 
+## Agent execution timeout and human-input waits (2026-10-20)
+
+Before this change, `PiRunner.run()` owned one agent execution timer. It stored
+the configured role timeout (falling back to `workflow.agentTimeoutMs`), the
+remaining milliseconds, and the wall-clock start of the current active slice.
+`timeoutMs: 0` resolved to `undefined` and installed no timer. Model preflight
+called runner-local `pauseAgentTimeout()` / `resumeAgentTimeout()`, but runtime
+command, sensitive-file, and contract-path approvals awaited the approval
+coordinator without touching that timer. A sufficiently late answer could
+therefore return to an attempt whose wall-clock timer had already aborted it.
+The accounting also used `Date.now()`, so clock corrections could distort the
+remaining budget, and the single running/paused state could not represent
+overlapping pause owners safely.
+
+The live-agent human waits are the approval coordinator's runtime command,
+sensitive-file, and contract-path decision queues. Their policy checks,
+request construction, state persistence, command execution, and ordinary tool
+work remain active execution. Requirement questions, security-risk review,
+credential review, and persisted contract-extension review enter
+`WAITING_USER` only after the producing agent has returned; there is no live
+agent timer to pause in those flows. On process restart, Pi Team terminates the
+old in-flight attempt and recovers persisted pending approvals through its
+existing recovery rules rather than resuming an in-memory agent session, so no
+timeout budget is persisted or resurrected.
+
+`AgentTimeoutBudget` now remains the runner's sole execution-time authority.
+It uses the monotonic performance clock, preserves the exact remaining active
+budget, and issues idempotent pause tokens so model preflight and human waits
+cannot resume each other prematurely. The runner supplies one scoped
+`waitForHumanInput` operation to all three approval callbacks. The coordinator
+uses it only after approval is known to be required and while the serialized
+decision turn is pending, with `try/finally` release. Abort continues to race
+the UI decision, removes its listener, stops the budget, and invalidates late
+answers through the existing workflow/attempt/request identity checks.
+Independent model-request, preflight cold-start, command, HTTP, retry,
+doom-loop, tool-call, authorization, and quality-gate limits are unchanged.
+Structured `agent_timeout_paused` and `agent_timeout_resumed` attempt-log events
+report the reason, active time, waiting time, and remaining budget without
+including request contents.
+
 ## Pi 0.99 provider streaming and live progress (2026-10-01)
 
 Inspected the installed `@earendil-works/pi-ai@0.99.0` declarations in

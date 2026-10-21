@@ -103,6 +103,11 @@ import {
 } from "./mutation-attribution.ts";
 import { parseTextualToolCall } from "./textual-tool-call.ts";
 import type { LocalJsonRepairEvent } from "./local-json-repair.ts";
+import {
+  AgentTimeoutBudget,
+  type AgentHumanInputWait,
+  type AgentTimeoutEvent,
+} from "./agent-timeout.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -129,6 +134,7 @@ export type RuntimeFileApprover = (
   operation: "read" | "write",
   path: string,
   signal?: AbortSignal,
+  waitForHumanInput?: AgentHumanInputWait,
 ) => Promise<boolean>;
 export type RuntimeContractApprover = {
   request: (
@@ -136,6 +142,7 @@ export type RuntimeContractApprover = {
     path: string,
     reason: string,
     signal?: AbortSignal,
+    waitForHumanInput?: AgentHumanInputWait,
   ) => Promise<boolean | "already_authorized">;
   consumeOnce: (
     operation: ContractOperation,
@@ -291,7 +298,9 @@ export interface AgentRunner {
     guardEvent?: (event: GuardEvent) => void,
     providerEvent?: (
       event:
-        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
+        | (ProviderRequestEvent & Record<string, unknown>)
+        | ModelPreflightEvent
+        | AgentTimeoutEvent,
     ) => void,
     providerProgress?: (
       update: ProviderProgressUpdate | ModelPreflightUpdate,
@@ -325,7 +334,9 @@ export class PiRunner implements AgentRunner {
     },
     providerEvent?: (
       event:
-        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
+        | (ProviderRequestEvent & Record<string, unknown>)
+        | ModelPreflightEvent
+        | AgentTimeoutEvent,
     ) => void,
     providerProgress?: (
       update: ProviderProgressUpdate | ModelPreflightUpdate,
@@ -735,7 +746,9 @@ export class PiRunner implements AgentRunner {
     guardEvent?: (event: GuardEvent) => void,
     providerEvent?: (
       event:
-        (ProviderRequestEvent & Record<string, unknown>) | ModelPreflightEvent,
+        | (ProviderRequestEvent & Record<string, unknown>)
+        | ModelPreflightEvent
+        | AgentTimeoutEvent,
     ) => void,
     providerProgress?: (
       update: ProviderProgressUpdate | ModelPreflightUpdate,
@@ -771,8 +784,7 @@ export class PiRunner implements AgentRunner {
     let timedOut = false;
     let agentTimeoutElapsed = (): number | null => null;
     let agentTimeoutRemaining = (): number | null => null;
-    let pauseAgentTimeout = () => {};
-    let resumeAgentTimeout = () => {};
+    let pauseAgentTimeout = (_reason: "model_preflight") => () => {};
     const doomConfig = resolveDoomLoop(effectiveConfig(state), role);
     const entry: ActiveAgentSession = {
       workflowId: state.id,
@@ -799,6 +811,42 @@ export class PiRunner implements AgentRunner {
     entry.resetDoomLoop = () => guard.resetHistory();
     const agentTimeoutMs = getAgentTimeoutMs(state.config, role);
     const retryPolicy = resolveNetworkRetry(effectiveConfig(state), role);
+    const preflightPauses: (() => void)[] = [];
+    let waitForHumanInput: AgentHumanInputWait = async (_reason, operation) =>
+      operation();
+    const pausableRuntimeApproval = runtimeApproval
+      ? (
+          command: Parameters<RuntimeCommandApprover>[0],
+          request: Parameters<RuntimeCommandApprover>[1],
+          approvalSignal?: AbortSignal,
+        ) =>
+          runtimeApproval(command, request, approvalSignal, waitForHumanInput)
+      : undefined;
+    const pausableFileApproval = fileApproval
+      ? (
+          operation: "read" | "write",
+          path: string,
+          approvalSignal?: AbortSignal,
+        ) => fileApproval(operation, path, approvalSignal, waitForHumanInput)
+      : undefined;
+    const pausableContractApproval = contractApproval
+      ? {
+          ...contractApproval,
+          request: (
+            operation: ContractOperation,
+            path: string,
+            reason: string,
+            approvalSignal?: AbortSignal,
+          ) =>
+            contractApproval.request(
+              operation,
+              path,
+              reason,
+              approvalSignal,
+              waitForHumanInput,
+            ),
+        }
+      : undefined;
     const session = await this.createSession(
       role,
       state,
@@ -847,19 +895,19 @@ export class PiRunner implements AgentRunner {
         });
       },
       providerProgress,
-      runtimeApproval,
-      fileApproval,
+      pausableRuntimeApproval,
+      pausableFileApproval,
       mutationObserver,
       captureResult,
       (status) => {
         if (status === "denied") commandDenied = true;
       },
       normalizedResponse,
-      contractApproval,
+      pausableContractApproval,
       mutationFailure,
       {
-        start: () => pauseAgentTimeout(),
-        end: () => resumeAgentTimeout(),
+        start: () => preflightPauses.push(pauseAgentTimeout("model_preflight")),
+        end: () => preflightPauses.pop()?.(),
       },
     );
     entry.session = session;
@@ -873,13 +921,11 @@ export class PiRunner implements AgentRunner {
     const executionAbort = new AbortController();
     executionSignal = executionAbort.signal;
     timeoutStartedAt = Date.now();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let remainingMs = timeoutMs;
-    let activeStartedAt: number | undefined;
     let abortTask: Promise<void> | undefined;
+    let timeoutBudget: AgentTimeoutBudget;
     const abort = () => {
       if (abortTask) return;
-      if (timer) clearTimeout(timer);
+      timeoutBudget.stop();
       executionAbort.abort();
       guard.resetHistory();
       try {
@@ -889,51 +935,19 @@ export class PiRunner implements AgentRunner {
       }
       abortTask = session.abort().catch(() => {});
     };
-    const scheduleTimeout = () => {
-      if (
-        timeoutMs === undefined ||
-        remainingMs === undefined ||
-        executionAbort.signal.aborted
-      )
-        return;
-      activeStartedAt = Date.now();
-      timer = setTimeout(() => {
+    timeoutBudget = new AgentTimeoutBudget(timeoutMs, {
+      onTimeout: () => {
         timedOut = true;
         abort();
-      }, remainingMs);
-    };
-    pauseAgentTimeout = () => {
-      if (timeoutMs === undefined || activeStartedAt === undefined) return;
-      remainingMs = Math.max(0, remainingMs! - (Date.now() - activeStartedAt));
-      activeStartedAt = undefined;
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-    };
-    resumeAgentTimeout = () => {
-      if (timeoutMs === undefined || activeStartedAt !== undefined) return;
-      if ((remainingMs ?? 0) <= 0) {
-        timedOut = true;
-        abort();
-        return;
-      }
-      scheduleTimeout();
-    };
-    agentTimeoutElapsed = () =>
-      timeoutMs === undefined
-        ? null
-        : Math.max(
-            0,
-            timeoutMs -
-              (remainingMs ?? 0) +
-              (activeStartedAt === undefined
-                ? 0
-                : Date.now() - activeStartedAt),
-          );
-    agentTimeoutRemaining = () =>
-      timeoutMs === undefined
-        ? null
-        : Math.max(0, timeoutMs - (agentTimeoutElapsed() ?? 0));
-    scheduleTimeout();
+      },
+      onEvent: (event) => providerEvent?.(event),
+    });
+    pauseAgentTimeout = (reason) => timeoutBudget.pause(reason);
+    waitForHumanInput = (reason, operation) =>
+      timeoutBudget.withPaused(reason, operation);
+    agentTimeoutElapsed = () => timeoutBudget.elapsed();
+    agentTimeoutRemaining = () => timeoutBudget.remaining();
+    timeoutBudget.start();
     signal?.addEventListener("abort", abort, { once: true });
     try {
       if (signal?.aborted) throw new Error("Workflow interrupted");
@@ -1341,7 +1355,7 @@ export class PiRunner implements AgentRunner {
       } catch {
         // Diagnostics must not replace an agent result or error.
       }
-      if (timer) clearTimeout(timer);
+      timeoutBudget.stop();
       signal?.removeEventListener("abort", abort);
       registry?.remove(entry);
       await abortTask;
