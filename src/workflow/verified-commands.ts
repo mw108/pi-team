@@ -28,6 +28,43 @@ export const validatorIdentitySchema = z.object({
 });
 export type ValidatorIdentity = z.infer<typeof validatorIdentitySchema>;
 
+export const effectiveValidationIdentitySchema = z
+  .object({
+    validationType: z.enum(["TEST", "STATIC"]),
+    tool: z.enum([...staticValidatorTools, "PHPUNIT", "COMPOSITE"]),
+    source: z.enum(["direct", "interpreter", "package_script"]),
+    scriptName: z.string().optional(),
+    underlyingTools: z
+      .array(z.enum([...staticValidatorTools, "PHPUNIT"]))
+      .optional(),
+  })
+  .superRefine((identity, ctx) => {
+    if (
+      (identity.validationType === "STATIC" && identity.tool === "PHPUNIT") ||
+      (identity.validationType === "TEST" &&
+        identity.tool !== "PHPUNIT" &&
+        identity.tool !== "COMPOSITE")
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "Detected tool contradicts its effective validation type",
+      });
+    if (
+      identity.underlyingTools?.some((tool) =>
+        identity.validationType === "STATIC"
+          ? tool === "PHPUNIT"
+          : tool !== "PHPUNIT",
+      )
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "Composite tools contradict the effective validation type",
+      });
+  });
+export type EffectiveValidationIdentity = z.infer<
+  typeof effectiveValidationIdentitySchema
+>;
+
 export const verifiedCommandResultSchema = z.object({
   executionId: z.string().uuid(),
   command: z.object({
@@ -38,6 +75,7 @@ export const verifiedCommandResultSchema = z.object({
   }),
   commandIdentity: z.string(),
   validatorIdentity: validatorIdentitySchema.optional(),
+  effectiveValidationIdentity: effectiveValidationIdentitySchema.optional(),
   agent: z.enum(roles),
   attempt: z.number().int().positive(),
   exitCode: z.number().int(),
@@ -139,6 +177,49 @@ export function directStaticValidatorIdentity(
   }
 }
 
+export function directTestRunnerIdentity(
+  command: Pick<Command, "executable" | "args">,
+): EffectiveValidationIdentity | undefined {
+  const executable = executableName(command.executable);
+  const args = command.args.map(interpreterTarget);
+  if (executable === "phpunit")
+    return { validationType: "TEST", tool: "PHPUNIT", source: "direct" };
+  if (executable === "php") {
+    const target = args[0] ?? "";
+    if (/(?:^|\/)vendor\/bin\/phpunit$/.test(target))
+      return {
+        validationType: "TEST",
+        tool: "PHPUNIT",
+        source: "interpreter",
+      };
+    if (/(?:^|\/)artisan$/.test(target) && args[1] === "test")
+      return {
+        validationType: "TEST",
+        tool: "PHPUNIT",
+        source: "interpreter",
+      };
+  }
+  if (executable === "artisan" && args[0] === "test")
+    return { validationType: "TEST", tool: "PHPUNIT", source: "direct" };
+}
+
+function directEffectiveValidationIdentity(
+  command: Pick<Command, "executable" | "args">,
+): EffectiveValidationIdentity | undefined {
+  const validator = directStaticValidatorIdentity(command);
+  if (
+    validator &&
+    validator.tool !== "UNKNOWN" &&
+    validator.tool !== "COMPOSITE"
+  )
+    return {
+      validationType: "STATIC",
+      tool: validator.tool,
+      source: validator.source as "direct" | "interpreter",
+    };
+  return directTestRunnerIdentity(command);
+}
+
 function packageScriptRequest(command: Pick<Command, "executable" | "args">) {
   const executable = executableName(command.executable);
   if (["npm", "pnpm", "yarn", "bun"].includes(executable)) {
@@ -162,6 +243,15 @@ function scriptCommandIdentity(value: string): ValidatorIdentity | undefined {
   const parts = text.split(/\s+/);
   const [executable, ...args] = parts;
   return directStaticValidatorIdentity({ executable, args });
+}
+
+function scriptEffectiveValidationIdentity(
+  value: string,
+): EffectiveValidationIdentity | undefined {
+  const text = value.trim().replace(/^@php\s+/, "php ");
+  if (!text || /[`$<>\r\n'"\\]/.test(text)) return;
+  const [executable, ...args] = text.split(/\s+/);
+  return directEffectiveValidationIdentity({ executable, args });
 }
 
 function packageScriptIdentity(
@@ -203,12 +293,74 @@ function packageScriptIdentity(
   return { tool: identities[0].tool, source: "package_script", scriptName };
 }
 
+function packageScriptEffectiveValidationIdentity(
+  definition: unknown,
+  scriptName: string,
+): EffectiveValidationIdentity | undefined {
+  const commands =
+    typeof definition === "string"
+      ? definition.split(/(?:&&|\|\||[;|])/).map((part) => part.trim())
+      : Array.isArray(definition) &&
+          definition.every((item) => typeof item === "string")
+        ? definition
+        : [];
+  if (!commands.length) return;
+  const identities = commands.map(scriptEffectiveValidationIdentity);
+  if (identities.some((identity) => !identity)) return;
+  const recognized = identities as EffectiveValidationIdentity[];
+  const validationTypes = [
+    ...new Set(recognized.map((identity) => identity.validationType)),
+  ];
+  if (validationTypes.length !== 1) return;
+  if (recognized.length === 1)
+    return {
+      validationType: recognized[0].validationType,
+      tool: recognized[0].tool,
+      source: "package_script",
+      scriptName,
+    };
+  return {
+    validationType: validationTypes[0],
+    tool: "COMPOSITE",
+    source: "package_script",
+    scriptName,
+    underlyingTools: [
+      ...new Set(
+        recognized.flatMap((identity) =>
+          identity.tool === "COMPOSITE"
+            ? (identity.underlyingTools ?? [])
+            : [identity.tool],
+        ),
+      ),
+    ],
+  };
+}
+
+export async function resolveEffectiveValidationIdentity(
+  command: Pick<Command, "executable" | "args" | "purpose">,
+  cwd: string,
+): Promise<EffectiveValidationIdentity | undefined> {
+  const direct = directEffectiveValidationIdentity(command);
+  if (direct) return direct;
+  const request = packageScriptRequest(command);
+  if (!request) return;
+  try {
+    const source = await readFile(join(cwd, request.file));
+    if (source.byteLength > 262144) return;
+    const document = JSON.parse(source.toString("utf8"));
+    return packageScriptEffectiveValidationIdentity(
+      document?.scripts?.[request.name],
+      request.name,
+    );
+  } catch {
+    return;
+  }
+}
+
 export async function resolveStaticValidatorIdentity(
   command: Pick<Command, "executable" | "args" | "purpose">,
   cwd: string,
 ): Promise<ValidatorIdentity> {
-  if (command.purpose !== "static")
-    return { tool: "UNKNOWN", source: "unknown" };
   const direct = directStaticValidatorIdentity(command);
   if (direct) return direct;
   const request = packageScriptRequest(command);
@@ -250,10 +402,29 @@ export async function recordVerifiedCommandResult(
   )
     return;
   const repoState = await repositoryEvidenceState(state);
-  const validatorIdentity = await resolveStaticValidatorIdentity(
+  const effectiveValidationIdentity = await resolveEffectiveValidationIdentity(
     command,
     state.cwd,
   );
+  const validatorIdentity: ValidatorIdentity | undefined =
+    effectiveValidationIdentity?.validationType === "STATIC"
+      ? {
+          tool: effectiveValidationIdentity.tool as
+            StaticValidatorTool | "COMPOSITE",
+          source: effectiveValidationIdentity.source,
+          ...(effectiveValidationIdentity.scriptName
+            ? { scriptName: effectiveValidationIdentity.scriptName }
+            : {}),
+          ...(effectiveValidationIdentity.underlyingTools
+            ? {
+                underlyingTools:
+                  effectiveValidationIdentity.underlyingTools.filter(
+                    (tool): tool is StaticValidatorTool => tool !== "PHPUNIT",
+                  ),
+              }
+            : {}),
+        }
+      : undefined;
   return {
     executionId: randomUUID(),
     command: {
@@ -263,7 +434,8 @@ export async function recordVerifiedCommandResult(
       purpose: command.purpose,
     },
     commandIdentity: commandKey(command),
-    ...(command.purpose === "static" ? { validatorIdentity } : {}),
+    ...(validatorIdentity ? { validatorIdentity } : {}),
+    ...(effectiveValidationIdentity ? { effectiveValidationIdentity } : {}),
     agent,
     attempt,
     exitCode: evidence.exitCode,
@@ -328,6 +500,12 @@ export type ClassifiedCommandOutcome = {
   category: CommandOutcomeCategory;
   validationType: CommandValidationType;
   validatorIdentity: ValidatorIdentity;
+  purposeMismatch?: {
+    declaredPurpose: "test" | "static";
+    effectiveValidationType: CommandValidationType;
+    detectedTool: EffectiveValidationIdentity["tool"];
+    source: EffectiveValidationIdentity["source"];
+  };
   reason: string;
   recoverable: boolean;
 };
@@ -342,16 +520,70 @@ function withoutAnsi(value: string): string {
 export function classifyVerifiedCommand(
   result: VerifiedCommandResult,
 ): ClassifiedCommandOutcome {
-  const validationType: CommandValidationType =
+  const storedValidator = result.validatorIdentity;
+  const directValidator = directStaticValidatorIdentity(result.command);
+  const effectiveValidationIdentity: EffectiveValidationIdentity | undefined =
+    result.effectiveValidationIdentity ??
+    (storedValidator &&
+    storedValidator.tool !== "UNKNOWN" &&
+    storedValidator.source !== "unknown"
+      ? {
+          validationType: "STATIC",
+          tool: storedValidator.tool,
+          source: storedValidator.source,
+          ...(storedValidator.scriptName
+            ? { scriptName: storedValidator.scriptName }
+            : {}),
+          ...(storedValidator.underlyingTools
+            ? { underlyingTools: storedValidator.underlyingTools }
+            : {}),
+        }
+      : directValidator
+        ? {
+            validationType: "STATIC",
+            tool: directValidator.tool as StaticValidatorTool,
+            source: directValidator.source as "direct" | "interpreter",
+          }
+        : directTestRunnerIdentity(result.command));
+  const declaredValidationType: CommandValidationType =
     result.command.purpose === "static" ? "STATIC" : "TEST";
+  const validationType =
+    effectiveValidationIdentity?.validationType ?? declaredValidationType;
   const validatorIdentity: ValidatorIdentity =
-    result.command.purpose === "static"
-      ? (result.validatorIdentity ??
-        directStaticValidatorIdentity(result.command) ?? {
-          tool: "UNKNOWN",
-          source: "unknown",
-        })
+    validationType === "STATIC"
+      ? (storedValidator ??
+        directValidator ??
+        (effectiveValidationIdentity
+          ? {
+              tool: effectiveValidationIdentity.tool as
+                StaticValidatorTool | "COMPOSITE",
+              source: effectiveValidationIdentity.source,
+              ...(effectiveValidationIdentity.scriptName
+                ? { scriptName: effectiveValidationIdentity.scriptName }
+                : {}),
+              ...(effectiveValidationIdentity.underlyingTools
+                ? {
+                    underlyingTools:
+                      effectiveValidationIdentity.underlyingTools.filter(
+                        (tool): tool is StaticValidatorTool =>
+                          tool !== "PHPUNIT",
+                      ),
+                  }
+                : {}),
+            }
+          : { tool: "UNKNOWN", source: "unknown" }))
       : { tool: "UNKNOWN", source: "unknown" };
+  const purposeMismatch =
+    ["test", "static"].includes(result.command.purpose) &&
+    Boolean(effectiveValidationIdentity) &&
+    effectiveValidationIdentity?.validationType !== declaredValidationType
+      ? {
+          declaredPurpose: result.command.purpose as "test" | "static",
+          effectiveValidationType: validationType,
+          detectedTool: effectiveValidationIdentity!.tool,
+          source: effectiveValidationIdentity!.source,
+        }
+      : undefined;
   const outcome = (
     category: CommandOutcomeCategory,
     reason: string,
@@ -360,6 +592,7 @@ export function classifyVerifiedCommand(
     category,
     validationType,
     validatorIdentity,
+    ...(purposeMismatch ? { purposeMismatch } : {}),
     reason,
     recoverable,
   });
@@ -389,7 +622,7 @@ export function classifyVerifiedCommand(
       false,
     );
   if (
-    result.command.purpose === "test" &&
+    validationType === "TEST" &&
     /(?:\b\d+\s+(?:tests?|test files?)\s+failed\b|\btests?:\s*\d+\s+failed\b|AssertionError:)/i.test(
       output,
     )
@@ -400,7 +633,7 @@ export function classifyVerifiedCommand(
       true,
     );
   if (
-    result.command.purpose === "test" &&
+    validationType === "TEST" &&
     result.command.args.includes("--test") &&
     /(?:^|\n)\s*(?:#|ℹ)\s*fail\s+[1-9]\d*\b/i.test(output)
   )
@@ -409,7 +642,7 @@ export function classifyVerifiedCommand(
       "Node test runner reported failing tests",
       true,
     );
-  if (result.command.purpose === "static") {
+  if (validationType === "STATIC") {
     const tool = validatorIdentity.tool;
     if (
       tool === "LARAVEL_PINT" &&
@@ -480,7 +713,7 @@ export function classifyVerifiedCommand(
   }
   return outcome(
     "INDETERMINATE",
-    result.command.purpose === "static" &&
+    validationType === "STATIC" &&
       ["UNKNOWN", "COMPOSITE"].includes(validatorIdentity.tool)
       ? `Static validator identity is ${validatorIdentity.tool.toLowerCase()}; nonzero exit cannot be attributed from output alone`
       : "Nonzero exit without a recognized validation outcome",
@@ -498,6 +731,7 @@ export function validationFailureFingerprint(
     .filter(({ outcome }) => outcome.recoverable)
     .map(({ item, outcome }) => ({
       commandIdentity: item.commandIdentity,
+      validationType: outcome.validationType,
       validatorIdentity: outcome.validatorIdentity,
       category: outcome.category,
       output: withoutAnsi(item.output).replace(/\r\n/g, "\n").trim(),

@@ -18,15 +18,18 @@ import {
   classifyVerifiedCommand,
   currentVerifiedCommandResults,
   directStaticValidatorIdentity,
+  directTestRunnerIdentity,
   isVerifiedCommandResultCurrent,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  resolveEffectiveValidationIdentity,
   resolveStaticValidatorIdentity,
   supersedingInvocation,
   validationFailureFingerprint,
   type ValidatorIdentity,
   type VerifiedCommandResult,
 } from "../src/workflow/verified-commands.ts";
+import { recordCommandPurposeMismatch } from "../src/workflow/command-purpose-mismatch.ts";
 import { config, contract, repository } from "./helpers.ts";
 
 const sandbox = {
@@ -98,6 +101,111 @@ test("Laravel Pint check results are classified as static formatting outcomes", 
       reason: "Command completed successfully",
       recoverable: false,
     },
+  );
+});
+
+test("verified tool identity overrides contradictory declared purpose", () => {
+  const pint = classifyVerifiedCommand(
+    classifiedResult(
+      "php",
+      [
+        "vendor/bin/pint",
+        "--test",
+        "bootstrap/app.php",
+        "routes/api.php",
+        "app/Http/Requests/API/V1/LoginRequest.php",
+        "app/Models/Client.php",
+      ],
+      "test",
+      1,
+      "FAIL — 4 files, 3 style issues\n\napp\\Http\\Requests\\API\\V1\\LoginRequest.php\n    single_blank_line_at_eof\n\nbootstrap\\app.php\n    ordered_imports\n\nroutes\\api.php\n    ordered_imports",
+    ),
+  );
+  assert.equal(pint.validationType, "STATIC");
+  assert.equal(pint.validatorIdentity.tool, "LARAVEL_PINT");
+  assert.equal(pint.category, "STATIC_FORMAT_FAILURE");
+  assert.equal(pint.recoverable, true);
+  assert.deepEqual(pint.purposeMismatch, {
+    declaredPurpose: "test",
+    effectiveValidationType: "STATIC",
+    detectedTool: "LARAVEL_PINT",
+    source: "interpreter",
+  });
+
+  for (const command of [
+    classifiedResult(
+      "php",
+      ["artisan", "test", "--no-coverage"],
+      "static",
+      0,
+      "Tests: 61 passed (334 assertions)",
+    ),
+    classifiedResult(
+      "php",
+      ["vendor\\bin\\phpunit"],
+      "static",
+      0,
+      "OK (61 tests, 334 assertions)",
+    ),
+  ]) {
+    const phpunit = classifyVerifiedCommand(command);
+    assert.equal(phpunit.validationType, "TEST");
+    assert.equal(phpunit.category, "PASS");
+    assert.deepEqual(phpunit.purposeMismatch, {
+      declaredPurpose: "static",
+      effectiveValidationType: "TEST",
+      detectedTool: "PHPUNIT",
+      source: "interpreter",
+    });
+  }
+});
+
+test("purpose mismatch diagnostic is structured, deduplicated, and failure-neutral", async () => {
+  const cwd = await repository();
+  const state = newState(
+    cwd,
+    "purpose mismatch",
+    config(),
+    await baseline(cwd),
+  );
+  const result = classifiedResult(
+    "php",
+    ["vendor/bin/pint", "--test"],
+    "test",
+    1,
+    "FAIL — 4 files, 3 style issues",
+  );
+  const outcome = classifyVerifiedCommand(result);
+  const restoredLegacy = validateState({
+    ...state,
+    verifiedCommandResults: [result],
+  });
+  assert.equal(
+    classifyVerifiedCommand(restoredLegacy.verifiedCommandResults[0]).category,
+    "STATIC_FORMAT_FAILURE",
+  );
+  const failures = state.agentFailures;
+  assert.equal(recordCommandPurposeMismatch(state, result, outcome), true);
+  assert.equal(recordCommandPurposeMismatch(state, result, outcome), false);
+  assert.equal(state.agentFailures, failures);
+  const events = state.history.filter(
+    (entry) => entry.event === "command_purpose_mismatch",
+  );
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].meta, {
+    agent: "tester",
+    attempt: 1,
+    commandId: "classified",
+    executionId: result.executionId,
+    declaredPurpose: "test",
+    effectiveValidationType: "STATIC",
+    detectedTool: "LARAVEL_PINT",
+    validatorSource: "interpreter",
+    resolution: "verified_command_identity",
+  });
+  assert.equal(
+    state.history.some((entry) => entry.event === "agent_attempt_failed"),
+    false,
   );
 });
 
@@ -221,6 +329,13 @@ test("static validator identity comes from argv, including trusted interpreter t
     }),
     undefined,
   );
+  assert.deepEqual(
+    directTestRunnerIdentity({
+      executable: "php",
+      args: ["artisan", "test"],
+    }),
+    { validationType: "TEST", tool: "PHPUNIT", source: "interpreter" },
+  );
 });
 
 test("diagnostic-looking output cannot establish or override validator identity", () => {
@@ -271,6 +386,7 @@ test("package-manager validator identity uses project script definitions and pre
       scripts: {
         analyse: "@php vendor/bin/phpstan analyse",
         "format-check": "@php vendor/bin/pint --test",
+        test: "@php artisan test",
       },
     }),
   );
@@ -316,12 +432,96 @@ test("package-manager validator identity uses project script definitions and pre
       underlyingTools: ["TYPESCRIPT", "ESLINT"],
     },
   );
+  assert.deepEqual(
+    await resolveEffectiveValidationIdentity(
+      { executable: "composer", args: ["run", "test"], purpose: "static" },
+      cwd,
+    ),
+    {
+      validationType: "TEST",
+      tool: "PHPUNIT",
+      source: "package_script",
+      scriptName: "test",
+    },
+  );
+  assert.deepEqual(
+    await resolveEffectiveValidationIdentity(
+      { executable: "npm", args: ["run", "lint"], purpose: "test" },
+      cwd,
+    ),
+    {
+      validationType: "STATIC",
+      tool: "ESLINT",
+      source: "package_script",
+      scriptName: "lint",
+    },
+  );
 
   const state = newState(
     cwd,
     "wrapper classification",
     config(),
     await baseline(cwd),
+  );
+  const wrappedPhpunit = await recordVerifiedCommandResult(
+    state,
+    {
+      id: "wrapped-phpunit",
+      executable: "composer",
+      args: ["run", "test"],
+      purpose: "static",
+      timeoutMs: 1000,
+    },
+    {
+      id: "wrapped-phpunit",
+      exitCode: 0,
+      output: "Tests: 61 passed (334 assertions)",
+      sandbox,
+    },
+    "tester",
+    1,
+  );
+  assert.ok(wrappedPhpunit);
+  assert.equal(
+    wrappedPhpunit.effectiveValidationIdentity?.validationType,
+    "TEST",
+  );
+  assert.equal(classifyVerifiedCommand(wrappedPhpunit).validationType, "TEST");
+  assert.equal(
+    classifyVerifiedCommand(wrappedPhpunit).purposeMismatch?.detectedTool,
+    "PHPUNIT",
+  );
+  const restored = validateState({
+    ...state,
+    verifiedCommandResults: [wrappedPhpunit],
+  });
+  assert.equal(
+    classifyVerifiedCommand(restored.verifiedCommandResults[0]).validationType,
+    "TEST",
+  );
+
+  const wrappedEslint = await recordVerifiedCommandResult(
+    state,
+    {
+      id: "wrapped-eslint",
+      executable: "npm",
+      args: ["run", "lint"],
+      purpose: "test",
+      timeoutMs: 1000,
+    },
+    {
+      id: "wrapped-eslint",
+      exitCode: 1,
+      output: "✖ 5 problems (3 errors, 2 warnings)",
+      sandbox,
+    },
+    "tester",
+    1,
+  );
+  assert.ok(wrappedEslint);
+  assert.equal(
+    classifyVerifiedCommand(wrappedEslint).category,
+    "STATIC_ANALYSIS_FAILURE",
   );
   for (const [id, executable, args, output, expectedTool, expectedOutcome] of [
     [
@@ -1147,7 +1347,7 @@ test("unresolved invocation blocks while a genuine failure routes only with evid
   }
 });
 
-test("PHPUnit pass plus Pint findings preserves both outcomes and routes FIX_LOCAL", async () => {
+test("PHPUnit pass plus purpose-mismatched Pint findings routes FIX_LOCAL", async () => {
   const cwd = await repository();
   const cfg = config();
   cfg.commands = [];
@@ -1168,18 +1368,26 @@ test("PHPUnit pass plus Pint findings preserves both outcomes and routes FIX_LOC
   const pint = normalizedRuntimeCommand(
     {
       executable: "php",
-      args: ["vendor/bin/pint", "--test"],
+      args: [
+        "vendor/bin/pint",
+        "--test",
+        "bootstrap/app.php",
+        "routes/api.php",
+        "app/Http/Requests/API/V1/LoginRequest.php",
+        "app/Models/Client.php",
+      ],
       purpose: "Check formatting",
-      category: "static",
+      category: "test",
     },
     "tester",
   ).command;
+  assert.equal(pint.id, "detected-2da0f219accf");
   for (const [command, exitCode, output] of [
     [phpunit, 0, "Tests: 61 passed (334 assertions)"],
     [
       pint,
       1,
-      "FAIL — 66 files, 24 style issues\napp/Models/User.php ordered_traits ordered_imports single_blank_line_at_eof",
+      "FAIL — 4 files, 3 style issues\n\napp\\Http\\Requests\\API\\V1\\LoginRequest.php\n    single_blank_line_at_eof\n\nbootstrap\\app.php\n    ordered_imports\n\nroutes\\api.php\n    ordered_imports",
     ],
   ] as const) {
     const verified = await recordVerifiedCommandResult(
@@ -1226,6 +1434,15 @@ test("PHPUnit pass plus Pint findings preserves both outcomes and routes FIX_LOC
   assert.match(result.reason, /Functional tests: PASS/);
   assert.match(result.reason, /Static validation: FAIL/);
   assert.match(result.failureFingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(pint.purpose, "test");
+  assert.equal(
+    state.history.filter(
+      (entry) =>
+        entry.event === "command_purpose_mismatch" &&
+        entry.meta?.commandId === pint.id,
+    ).length,
+    1,
+  );
 
   state.results.tester = result;
   transition(state);

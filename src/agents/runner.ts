@@ -65,6 +65,7 @@ import {
   supersedingInvocation,
   validationFailureFingerprint,
 } from "../workflow/verified-commands.ts";
+import { recordCommandPurposeMismatch } from "../workflow/command-purpose-mismatch.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
 import { ExecutableResolutionError } from "./executable-resolution.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
@@ -1239,6 +1240,7 @@ export class PiRunner implements AgentRunner {
         const supersededIdentities = new Set<string>();
         for (const item of selected) {
           const outcome = classifyVerifiedCommand(item);
+          recordCommandPurposeMismatch(state, item, outcome);
           if (outcome.category === "INVOCATION_ERROR") {
             const superseded = await supersedingInvocation(
               item,

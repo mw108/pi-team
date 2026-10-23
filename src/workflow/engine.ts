@@ -111,6 +111,7 @@ import {
   classifyVerifiedCommand,
   recordVerifiedCommandResult,
 } from "./verified-commands.ts";
+import { recordCommandPurposeMismatch } from "./command-purpose-mismatch.ts";
 import {
   getActiveSolverIds,
   getRequiredSuccessfulSolverCount,
@@ -2050,8 +2051,9 @@ export class WorkflowEngine {
               if (!verified) return;
               authoritative.verifiedCommandResults.push(verified);
               if (s !== authoritative) s.verifiedCommandResults.push(verified);
+              const outcome = classifyVerifiedCommand(verified);
+              recordCommandPurposeMismatch(authoritative, verified, outcome);
               if (verified.exitCode !== 0) {
-                const outcome = classifyVerifiedCommand(verified);
                 record(
                   authoritative,
                   "test_command_classified",

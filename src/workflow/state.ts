@@ -260,6 +260,25 @@ export const stateSchema = z.object({
               "INDETERMINATE",
             ])
             .optional(),
+          declaredPurpose: z.enum(["test", "static"]).optional(),
+          effectiveValidationType: z.enum(["TEST", "STATIC"]).optional(),
+          detectedTool: z
+            .enum([
+              "LARAVEL_PINT",
+              "PHP_CS_FIXER",
+              "PHPSTAN",
+              "PSALM",
+              "ESLINT",
+              "PRETTIER",
+              "TYPESCRIPT",
+              "PHPUNIT",
+              "COMPOSITE",
+            ])
+            .optional(),
+          validatorSource: z
+            .enum(["direct", "interpreter", "package_script"])
+            .optional(),
+          resolution: z.literal("verified_command_identity").optional(),
           supersededBy: z.string().uuid().optional(),
           repositoryVerified: z.boolean().optional(),
           failedAreas: z.array(z.string()).optional(),
