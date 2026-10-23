@@ -295,6 +295,46 @@ export const persistedTestSchema = z.object({
   ),
   failedAreas: strings,
   classification: z.enum(["FIX_LOCAL", "FIX_DESIGN"]).optional(),
+  validationOutcomes: z
+    .array(
+      z.object({
+        id: text,
+        validationType: z.enum(["TEST", "STATIC"]),
+        validator: z.enum([
+          "LARAVEL_PINT",
+          "PHP_CS_FIXER",
+          "PHPSTAN",
+          "PSALM",
+          "ESLINT",
+          "PRETTIER",
+          "TYPESCRIPT",
+          "UNKNOWN",
+          "COMPOSITE",
+        ]),
+        validatorSource: z.enum([
+          "direct",
+          "interpreter",
+          "package_script",
+          "unknown",
+        ]),
+        outcome: z.enum([
+          "PASS",
+          "TEST_FAILURE",
+          "STATIC_FORMAT_FAILURE",
+          "STATIC_ANALYSIS_FAILURE",
+          "INVOCATION_ERROR",
+          "INFRASTRUCTURE_ERROR",
+          "INDETERMINATE",
+        ]),
+        reason: text,
+        recoverable: z.boolean(),
+      }),
+    )
+    .optional(),
+  failureFingerprint: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
 });
 export const testSchema = persistedTestSchema.superRefine((result, ctx) => {
   if (

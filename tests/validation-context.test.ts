@@ -100,6 +100,24 @@ test("Reviewer exact command wins deduplication and unsafe hints are ignored", a
     assert.equal(parseValidationHint(unsafe), undefined);
 });
 
+test("Pint check-only hints remain static validation candidates", async () => {
+  const cwd = await repository();
+  const state = newState(cwd, "check", config(), await baseline(cwd));
+  state.config.commands = [];
+  state.results.reviewer = {
+    ...contract,
+    acceptanceCriteria: ["php vendor/bin/pint --test app/Models/User.php"],
+  };
+  const candidate =
+    testerValidationContext(state).candidateValidationCommands[0];
+  assert.deepEqual(candidate, {
+    executable: "php",
+    args: ["vendor/bin/pint", "--test", "app/Models/User.php"],
+    purpose: "Run acceptance static validation",
+    source: "reviewer.acceptanceCriteria",
+  });
+});
+
 test("current successful host evidence is a Tester suggestion, not approved gate evidence", async () => {
   const cwd = await repository();
   const cfg = config();

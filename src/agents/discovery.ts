@@ -201,6 +201,39 @@ export async function discoverCommands(
           },
         );
     }
+  const pintProxy = await read("vendor/bin/pint");
+  if (pintProxy) {
+    if (process.platform === "win32")
+      add(
+        "php",
+        ["vendor/bin/pint", "--test"],
+        "vendor/bin/pint",
+        "format-check",
+        "high",
+        {
+          platform: "win32",
+          launcher: "interpreter",
+          requiresShell: false,
+          interpreter: "php",
+          equivalentOf: "vendor/bin/pint --test",
+          reason:
+            "Composer's extensionless Pint proxy is a PHP script on Windows",
+        },
+      );
+    else
+      add(
+        "vendor/bin/pint",
+        ["--test"],
+        "vendor/bin/pint",
+        "format-check",
+        "high",
+        {
+          platform: "posix",
+          launcher: "native",
+          requiresShell: false,
+        },
+      );
+  }
   const artisan = await read("artisan");
   const composerRequires = {
     ...(composerDocument?.require ?? {}),

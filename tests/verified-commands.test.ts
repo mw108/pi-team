@@ -17,10 +17,15 @@ import { transition } from "../src/workflow/router.ts";
 import {
   classifyVerifiedCommand,
   currentVerifiedCommandResults,
+  directStaticValidatorIdentity,
   isVerifiedCommandResultCurrent,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  resolveStaticValidatorIdentity,
   supersedingInvocation,
+  validationFailureFingerprint,
+  type ValidatorIdentity,
+  type VerifiedCommandResult,
 } from "../src/workflow/verified-commands.ts";
 import { config, contract, repository } from "./helpers.ts";
 
@@ -30,6 +35,351 @@ const sandbox = {
   temporaryHome: true,
   filesystemIsolation: false,
 };
+
+function classifiedResult(
+  executable: string,
+  args: string[],
+  purpose: "test" | "static",
+  exitCode: number,
+  output: string,
+  validatorIdentity?: ValidatorIdentity,
+): VerifiedCommandResult {
+  return {
+    executionId: "00000000-0000-4000-8000-000000000001",
+    command: { id: "classified", executable, args, purpose },
+    commandIdentity: commandKey({ executable, args }),
+    ...(validatorIdentity ? { validatorIdentity } : {}),
+    agent: "tester",
+    attempt: 1,
+    exitCode,
+    output,
+    completedAt: "2026-10-23T00:00:00.000Z",
+    repoState: { head: "head", gateHashes: {} },
+  };
+}
+
+test("Laravel Pint check results are classified as static formatting outcomes", () => {
+  for (const [executable, args] of [
+    ["vendor/bin/pint", ["--test"]],
+    ["php", ["vendor/bin/pint", "--test", "app/Models/User.php"]],
+    ["php", ["vendor\\bin\\pint", "--test"]],
+  ] as const) {
+    const failed = classifyVerifiedCommand(
+      classifiedResult(
+        executable,
+        [...args],
+        "static",
+        1,
+        "\u001b[31mFAIL\u001b[39m — 66 files, 24 style issues\napp\\Models\\User.php ordered_traits ordered_imports single_blank_line_at_eof",
+      ),
+    );
+    assert.equal(failed.category, "STATIC_FORMAT_FAILURE");
+    assert.equal(failed.validationType, "STATIC");
+    assert.equal(failed.validatorIdentity.tool, "LARAVEL_PINT");
+    assert.equal(failed.recoverable, true);
+  }
+  assert.deepEqual(
+    classifyVerifiedCommand(
+      classifiedResult(
+        "php",
+        ["vendor/bin/pint", "--test"],
+        "static",
+        0,
+        "PASS — 4 files",
+      ),
+    ),
+    {
+      category: "PASS",
+      validationType: "STATIC",
+      validatorIdentity: {
+        tool: "LARAVEL_PINT",
+        source: "interpreter",
+      },
+      reason: "Command completed successfully",
+      recoverable: false,
+    },
+  );
+});
+
+test("Pint startup failures and incomplete reports remain indeterminate", () => {
+  for (const output of [
+    "PHP Fatal error: bootstrap crashed",
+    "app/Models/User.php ordered_imports\n[output truncated]",
+  ])
+    assert.equal(
+      classifyVerifiedCommand(
+        classifiedResult(
+          "php",
+          ["vendor/bin/pint", "--test"],
+          "static",
+          1,
+          output,
+        ),
+      ).category,
+      "INDETERMINATE",
+    );
+  assert.equal(
+    classifyVerifiedCommand(
+      classifiedResult(
+        "php",
+        ["vendor/bin/pint", "--bad-option"],
+        "static",
+        1,
+        "The option --bad-option does not exist",
+      ),
+    ).category,
+    "INVOCATION_ERROR",
+  );
+});
+
+test("recognized static analyzers are failures, while unknown nonzero static output is indeterminate", () => {
+  for (const [executable, args, output, expected] of [
+    [
+      "npx",
+      ["prettier", "--check", "."],
+      "[warn] Code style issues found in 2 files.",
+      "STATIC_FORMAT_FAILURE",
+    ],
+    [
+      "vendor/bin/php-cs-fixer",
+      ["fix", "--dry-run"],
+      "Found 2 of 20 files that can be fixed in 0.1 seconds",
+      "STATIC_FORMAT_FAILURE",
+    ],
+    [
+      "npx",
+      ["eslint", "."],
+      "✖ 5 problems (3 errors, 2 warnings)",
+      "STATIC_ANALYSIS_FAILURE",
+    ],
+    [
+      "npx",
+      ["tsc", "--noEmit"],
+      "src/a.ts(1,1): error TS2322: bad",
+      "STATIC_ANALYSIS_FAILURE",
+    ],
+    [
+      "vendor/bin/phpstan",
+      ["analyse"],
+      "PHPStan\n[ERROR] Found 3 errors",
+      "STATIC_ANALYSIS_FAILURE",
+    ],
+    [
+      "vendor/bin/psalm",
+      [],
+      "Psalm\nERRORS! 2 errors found",
+      "STATIC_ANALYSIS_FAILURE",
+    ],
+  ] as const)
+    assert.equal(
+      classifyVerifiedCommand(
+        classifiedResult(executable, [...args], "static", 1, output),
+      ).category,
+      expected,
+    );
+  assert.equal(
+    classifyVerifiedCommand(
+      classifiedResult("custom-lint", [], "static", 2, "validation stopped"),
+    ).category,
+    "INDETERMINATE",
+  );
+});
+
+test("static validator identity comes from argv, including trusted interpreter targets", () => {
+  for (const [executable, args, tool, source] of [
+    ["vendor/bin/pint", ["--test"], "LARAVEL_PINT", "direct"],
+    [
+      "php",
+      ["vendor/bin/php-cs-fixer", "fix", "--dry-run"],
+      "PHP_CS_FIXER",
+      "interpreter",
+    ],
+    ["php", ["vendor\\bin\\phpstan", "analyse"], "PHPSTAN", "interpreter"],
+    ["php", ["vendor/bin/psalm"], "PSALM", "interpreter"],
+    ["npx.cmd", ["eslint", "src"], "ESLINT", "interpreter"],
+    ["npx", ["prettier", "--check", "."], "PRETTIER", "interpreter"],
+    ["tsc.cmd", ["--noEmit"], "TYPESCRIPT", "direct"],
+    [
+      "node.exe",
+      ["node_modules\\typescript\\bin\\tsc", "--noEmit"],
+      "TYPESCRIPT",
+      "interpreter",
+    ],
+  ] as const) {
+    assert.deepEqual(
+      directStaticValidatorIdentity({ executable, args: [...args] }),
+      {
+        tool,
+        source,
+      },
+    );
+  }
+  assert.equal(
+    directStaticValidatorIdentity({
+      executable: "php",
+      args: ["tools/pint", "--test"],
+    }),
+    undefined,
+  );
+});
+
+test("diagnostic-looking output cannot establish or override validator identity", () => {
+  for (const [executable, args, output] of [
+    ["echo", ["error TS2339"], "error TS2339: fixture"],
+    ["php", ["artisan", "route:list"], "error TS2339: fixture"],
+    ["node", ["print-log.js"], "PHPStan\n[ERROR] Found 3 errors"],
+    ["node", ["print-log.js"], "FAIL — 2 files, 2 style issues"],
+    ["node", ["print-log.js"], "✖ 5 problems (3 errors, 2 warnings)"],
+  ] as const) {
+    const outcome = classifyVerifiedCommand(
+      classifiedResult(executable, [...args], "static", 1, output),
+    );
+    assert.equal(outcome.validatorIdentity.tool, "UNKNOWN");
+    assert.equal(outcome.category, "INDETERMINATE");
+  }
+  const conflicting = classifyVerifiedCommand(
+    classifiedResult(
+      "npx",
+      ["eslint", "src"],
+      "static",
+      1,
+      "FAIL — 2 files, 2 style issues",
+    ),
+  );
+  assert.equal(conflicting.validatorIdentity.tool, "ESLINT");
+  assert.equal(conflicting.category, "INDETERMINATE");
+});
+
+test("package-manager validator identity uses project script definitions and preserves ambiguity", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "package.json"),
+    JSON.stringify({
+      type: "module",
+      scripts: {
+        lint: "eslint src",
+        typecheck: "tsc --noEmit",
+        "format-check": "prettier --check .",
+        logs: "node print-log.js",
+        composite: "tsc --noEmit && eslint src",
+      },
+    }),
+  );
+  await writeFile(
+    join(cwd, "composer.json"),
+    JSON.stringify({
+      scripts: {
+        analyse: "@php vendor/bin/phpstan analyse",
+        "format-check": "@php vendor/bin/pint --test",
+      },
+    }),
+  );
+  for (const [executable, args, tool] of [
+    ["npm", ["run", "lint"], "ESLINT"],
+    ["npm", ["run", "typecheck"], "TYPESCRIPT"],
+    ["npm", ["run", "format-check"], "PRETTIER"],
+    ["composer", ["run", "analyse"], "PHPSTAN"],
+    ["composer", ["run", "format-check"], "LARAVEL_PINT"],
+  ] as const) {
+    assert.deepEqual(
+      await resolveStaticValidatorIdentity(
+        { executable, args: [...args], purpose: "static" },
+        cwd,
+      ),
+      {
+        tool,
+        source: "package_script",
+        scriptName: args[1],
+      },
+    );
+  }
+  assert.deepEqual(
+    await resolveStaticValidatorIdentity(
+      { executable: "npm", args: ["run", "logs"], purpose: "static" },
+      cwd,
+    ),
+    { tool: "UNKNOWN", source: "package_script", scriptName: "logs" },
+  );
+  assert.deepEqual(
+    await resolveStaticValidatorIdentity(
+      {
+        executable: "npm",
+        args: ["run", "composite"],
+        purpose: "static",
+      },
+      cwd,
+    ),
+    {
+      tool: "COMPOSITE",
+      source: "package_script",
+      scriptName: "composite",
+      underlyingTools: ["TYPESCRIPT", "ESLINT"],
+    },
+  );
+
+  const state = newState(
+    cwd,
+    "wrapper classification",
+    config(),
+    await baseline(cwd),
+  );
+  for (const [id, executable, args, output, expectedTool, expectedOutcome] of [
+    [
+      "wrapped-typecheck",
+      "npm",
+      ["run", "typecheck"],
+      "src/a.ts(1,1): error TS2339: fixture",
+      "TYPESCRIPT",
+      "STATIC_ANALYSIS_FAILURE",
+    ],
+    [
+      "wrapped-pint",
+      "composer",
+      ["run", "format-check"],
+      "FAIL — 2 files, 2 style issues",
+      "LARAVEL_PINT",
+      "STATIC_FORMAT_FAILURE",
+    ],
+  ] as const) {
+    const verified = await recordVerifiedCommandResult(
+      state,
+      { id, executable, args: [...args], purpose: "static", timeoutMs: 1000 },
+      { id, exitCode: 1, output, sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(verified);
+    assert.equal(verified.validatorIdentity?.tool, expectedTool);
+    assert.equal(classifyVerifiedCommand(verified).category, expectedOutcome);
+  }
+});
+
+test("failure fingerprints include authoritative validator identity", () => {
+  const typescript = classifiedResult(
+    "npm",
+    ["run", "check"],
+    "static",
+    1,
+    "error TS2339: fixture",
+    { tool: "TYPESCRIPT", source: "package_script", scriptName: "check" },
+  );
+  const unknown = {
+    ...typescript,
+    validatorIdentity: {
+      tool: "UNKNOWN" as const,
+      source: "package_script" as const,
+      scriptName: "check",
+    },
+  };
+  const classified = classifyVerifiedCommand(typescript);
+  assert.equal(classified.category, "STATIC_ANALYSIS_FAILURE");
+  assert.notEqual(
+    validationFailureFingerprint([{ item: typescript, outcome: classified }]),
+    validationFailureFingerprint([
+      { item: unknown, outcome: classifyVerifiedCommand(unknown) },
+    ]),
+  );
+});
 
 test("verified results persist, redact output, select latest and expire on relevant edits", async () => {
   const cwd = await repository();
@@ -795,6 +1145,101 @@ test("unresolved invocation blocks while a genuine failure routes only with evid
     assert.equal(state.phase, expected);
     assert.equal(state.localFixCycle, category === "TEST_FAILURE" ? 1 : 0);
   }
+});
+
+test("PHPUnit pass plus Pint findings preserves both outcomes and routes FIX_LOCAL", async () => {
+  const cwd = await repository();
+  const cfg = config();
+  cfg.commands = [];
+  cfg.qualityGates.commit.enabled = false;
+  const state = newState(cwd, "routing", cfg, await baseline(cwd));
+  const initialFullCycle = state.fullCycle;
+  state.results.reviewer = contract;
+  state.phase = "TEST";
+  const phpunit = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: ["artisan", "test", "--no-coverage"],
+      purpose: "Run Laravel tests",
+      category: "test",
+    },
+    "tester",
+  ).command;
+  const pint = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: ["vendor/bin/pint", "--test"],
+      purpose: "Check formatting",
+      category: "static",
+    },
+    "tester",
+  ).command;
+  for (const [command, exitCode, output] of [
+    [phpunit, 0, "Tests: 61 passed (334 assertions)"],
+    [
+      pint,
+      1,
+      "FAIL — 66 files, 24 style issues\napp/Models/User.php ordered_traits ordered_imports single_blank_line_at_eof",
+    ],
+  ] as const) {
+    const verified = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id: command.id, exitCode, output, sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(verified);
+    state.verifiedCommandResults.push(verified);
+  }
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async () => {},
+      getLastAssistantText: () =>
+        JSON.stringify({
+          status: "BLOCKED",
+          reason: "Nonzero command",
+          commands: [],
+          failedAreas: [],
+        }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const result = (await runner.run("tester", state)) as any;
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.classification, "FIX_LOCAL");
+  assert.deepEqual(result.failedAreas, [pint.id]);
+  assert.deepEqual(
+    result.validationOutcomes.map((outcome: any) => [
+      outcome.validationType,
+      outcome.validator,
+      outcome.outcome,
+    ]),
+    [
+      ["TEST", "UNKNOWN", "PASS"],
+      ["STATIC", "LARAVEL_PINT", "STATIC_FORMAT_FAILURE"],
+    ],
+  );
+  assert.match(result.reason, /Functional tests: PASS/);
+  assert.match(result.reason, /Static validation: FAIL/);
+  assert.match(result.failureFingerprint, /^[a-f0-9]{64}$/);
+
+  state.results.tester = result;
+  transition(state);
+  assert.equal(state.phase, "IMPLEMENT");
+  assert.equal(state.localFixCycle, 1);
+  assert.equal(state.fullCycle, initialFullCycle);
+  assert.equal(state.results.previous_tester?.status, "FAIL");
+
+  state.phase = "TEST";
+  state.results.tester = structuredClone(result);
+  transition(state);
+  assert.equal(state.phase, "BLOCKED");
+  assert.match(state.blocker ?? "", /same findings after a local fix attempt/);
+  assert.equal(state.localFixCycle, 1);
 });
 
 test("only a current full-suite run can supersede an Angular include invocation", async () => {

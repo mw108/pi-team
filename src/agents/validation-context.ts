@@ -19,6 +19,23 @@ export interface CandidateValidationCommand {
   equivalentOf?: string;
 }
 
+function validationHintPurpose(command: {
+  executable: string;
+  args: string[];
+}): "test" | "static" {
+  const script = command.args[0] === "run" ? (command.args[1] ?? "") : "";
+  return (command.executable === "php" &&
+    command.args[0] === "vendor/bin/pint" &&
+    command.args.includes("--test")) ||
+    (command.executable === "vendor/bin/pint" &&
+      command.args.includes("--test")) ||
+    /^(?:check|lint|typecheck|type-check|build|format:check)(?:[:_-].+)?$/.test(
+      script,
+    )
+    ? "static"
+    : "test";
+}
+
 /** Only plain, whitespace-delimited argv is accepted from free-text hints. */
 export function parseValidationHint(value: string) {
   const text = value.trim();
@@ -26,11 +43,15 @@ export function parseValidationHint(value: string) {
   const tokens = text.split(/\s+/);
   if (tokens.length > 64 || tokens.some((token) => !token)) return;
   const [executable, ...args] = tokens;
+  const staticValidation =
+    validationHintPurpose({ executable, args }) === "static";
   const knownValidation =
     (executable === "php" &&
       ((args[0] === "artisan" && args[1] === "test") ||
-        args[0] === "vendor/bin/phpunit")) ||
+        args[0] === "vendor/bin/phpunit" ||
+        (args[0] === "vendor/bin/pint" && args.includes("--test")))) ||
     executable === "vendor/bin/phpunit" ||
+    (executable === "vendor/bin/pint" && args.includes("--test")) ||
     (["npm", "pnpm", "yarn", "bun", "composer"].includes(executable) &&
       (args[0] === "test" ||
         (args[0] === "run" &&
@@ -50,7 +71,7 @@ export function parseValidationHint(value: string) {
     id: detectedCommandId({ executable, args }),
     executable,
     args,
-    purpose: "test",
+    purpose: staticValidation ? "static" : "test",
     timeoutMs: 120000,
   });
   return parsed.success ? { executable, args } : undefined;
@@ -80,12 +101,25 @@ export function testerValidationContext(
     | undefined;
   for (const test of reviewer?.requiredTests ?? []) {
     const command = parseValidationHint(test.description);
-    if (command) add(command, `Run required test`, "reviewer.requiredTests");
+    if (command)
+      add(
+        command,
+        validationHintPurpose(command) === "static"
+          ? "Run required static validation"
+          : "Run required test",
+        "reviewer.requiredTests",
+      );
   }
   for (const criterion of reviewer?.acceptanceCriteria ?? []) {
     const command = parseValidationHint(criterion);
     if (command)
-      add(command, "Check acceptance criterion", "reviewer.acceptanceCriteria");
+      add(
+        command,
+        validationHintPurpose(command) === "static"
+          ? "Run acceptance static validation"
+          : "Check acceptance criterion",
+        "reviewer.acceptanceCriteria",
+      );
   }
   const configured = effectiveConfig(state, "tester").commands.filter(
     (command) => allowedCommandCategories("tester").includes(command.purpose),
@@ -101,9 +135,18 @@ export function testerValidationContext(
     if (command) add(command, "Verify Implementor check", "implementor.checks");
   }
   for (const discovered of state.discoveredCommands) {
-    if (discovered.category !== "test") continue;
+    if (
+      !allowedCommandCategories("tester").includes(discovered.command.purpose)
+    )
+      continue;
     const before = candidates.length;
-    add(discovered.command, "Run discovered test", discovered.source);
+    add(
+      discovered.command,
+      discovered.command.purpose === "test"
+        ? "Run discovered test"
+        : "Run discovered static validation",
+      discovered.source,
+    );
     if (candidates.length !== before)
       Object.assign(candidates.at(-1)!, {
         intent: discovered.category,

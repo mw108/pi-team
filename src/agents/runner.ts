@@ -63,6 +63,7 @@ import {
   recordVerifiedCommandResult,
   repositoryEvidenceState,
   supersedingInvocation,
+  validationFailureFingerprint,
 } from "../workflow/verified-commands.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
 import { ExecutableResolutionError } from "./executable-resolution.ts";
@@ -669,13 +670,17 @@ export class PiRunner implements AgentRunner {
                             reason: `Configured ${command.purpose} validation`,
                           })),
                         ...s.discoveredCommands
-                          .filter((candidate) => candidate.category === "test")
+                          .filter((candidate) =>
+                            allowedCommandCategories("tester").includes(
+                              candidate.command.purpose,
+                            ),
+                          )
                           .map((candidate) => ({
                             command: candidate.command,
                             source: candidate.source,
                             reason:
                               candidate.execution?.reason ??
-                              "Discovered project test command",
+                              `Discovered project ${candidate.command.purpose} command`,
                           })),
                         ...current
                           .filter(
@@ -1267,13 +1272,22 @@ export class PiRunner implements AgentRunner {
           exitCode: item.exitCode,
           output: item.output,
         }));
-        if (commandDenied || result.status === "BLOCKED") {
+        result.validationOutcomes = authoritative.map(({ outcome, id }) => ({
+          id,
+          validationType: outcome.validationType,
+          validator: outcome.validatorIdentity.tool,
+          validatorSource: outcome.validatorIdentity.source,
+          outcome: outcome.category,
+          reason: outcome.reason,
+          recoverable: outcome.recoverable,
+        }));
+        if (commandDenied) {
           result.status = "BLOCKED";
-          result.reason = commandDenied
-            ? "Required test execution was denied by the user."
-            : (result.reason ?? "Required validation could not run.");
+          result.reason =
+            "Required validation execution was denied by the user.";
           result.commands = compactValidationEvidence(allEvidence);
           result.failedAreas = [];
+          delete result.failureFingerprint;
           return result;
         }
         const missing = required.filter(
@@ -1303,6 +1317,7 @@ export class PiRunner implements AgentRunner {
           result.commands = compactValidationEvidence(allEvidence);
           result.failedAreas = [];
           delete result.classification;
+          delete result.failureFingerprint;
           record(state, "tester_gate_blocked", result.reason, {
             agent: "tester",
             attempt,
@@ -1321,13 +1336,39 @@ export class PiRunner implements AgentRunner {
           : "FAIL";
         if (result.status === "FAIL") {
           result.failedAreas = authoritative
-            .filter(({ outcome }) => outcome.category === "TEST_FAILURE")
+            .filter(({ outcome }) => outcome.recoverable)
             .map(({ id }) => id);
-          result.classification ??= "FIX_LOCAL";
-          result.reason = `Host-verified validation failed: ${result.failedAreas.join(", ")}.`;
+          const recoverable = authoritative.filter(
+            ({ outcome }) => outcome.recoverable,
+          );
+          result.failureFingerprint = validationFailureFingerprint(recoverable);
+          const staticFailures = authoritative.filter(({ outcome }) =>
+            ["STATIC_FORMAT_FAILURE", "STATIC_ANALYSIS_FAILURE"].includes(
+              outcome.category,
+            ),
+          );
+          if (staticFailures.length) result.classification = "FIX_LOCAL";
+          else result.classification ??= "FIX_LOCAL";
+          const passedTests = authoritative.filter(
+            ({ outcome }) =>
+              outcome.validationType === "TEST" && outcome.category === "PASS",
+          );
+          const failedTests = authoritative.filter(
+            ({ outcome }) => outcome.category === "TEST_FAILURE",
+          );
+          result.reason = [
+            "Host-verified validation failed.",
+            `Functional tests: ${failedTests.length ? `FAIL (${failedTests.map(({ id }) => id).join(", ")})` : passedTests.length ? `PASS (${passedTests.map(({ id }) => id).join(", ")})` : "not run"}.`,
+            staticFailures.length
+              ? `Static validation: FAIL (${staticFailures.map(({ id, outcome }) => `${id}: ${outcome.reason}`).join("; ")}). Local fix required.`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
         } else {
           result.failedAreas = [];
           delete result.classification;
+          delete result.failureFingerprint;
           result.reason = "Host-verified validation commands passed.";
         }
         if (proposedStatus !== result.status)

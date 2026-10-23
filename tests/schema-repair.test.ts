@@ -311,7 +311,9 @@ test("Tester follow-up final output uses the same repair loop", async () => {
     JSON.stringify(blocked),
   ]);
   const result = await fake.runner.run("tester", state);
-  assert.equal(result.status, "BLOCKED");
+  assert.equal(result.status, "FAIL");
+  assert.equal(result.classification, "FIX_LOCAL");
+  assert.deepEqual(result.failedAreas, ["test"]);
   assert.equal(fake.prompts, 3);
   assert.equal(fake.created, 1);
   assert.match(fake.instructions[2], /SCHEMA_VALIDATION_ERROR/);

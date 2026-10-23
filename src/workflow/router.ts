@@ -334,9 +334,30 @@ export function transition(s: WorkflowState) {
         r.failedAreas.every((id) =>
           r.commands.some((c) => c.id === id && c.exitCode !== 0),
         )
-      )
-        fix(s, r.classification);
-      else
+      ) {
+        const previous = s.results.previous_tester;
+        const unchangedRecoverableFailure =
+          r.classification === "FIX_LOCAL" &&
+          r.validationOutcomes?.some((outcome) =>
+            ["STATIC_FORMAT_FAILURE", "STATIC_ANALYSIS_FAILURE"].includes(
+              outcome.outcome,
+            ),
+          ) &&
+          r.failureFingerprint !== undefined &&
+          previous?.status === "FAIL" &&
+          previous.failureFingerprint === r.failureFingerprint;
+        if (unchangedRecoverableFailure) {
+          record(
+            s,
+            "tester_static_failure_unchanged",
+            "Static validation reported the same findings on the same repository state after local remediation",
+          );
+          block(
+            s,
+            "Testing blocked: static validation reported the same findings after a local fix attempt, and the repository state did not change. Inspect the prior Implementor result, any denied path approvals, and the validator diagnostics before retrying.",
+          );
+        } else fix(s, r.classification);
+      } else
         block(
           s,
           "Testing blocked: Tester result lacks consistent, verified remediation evidence",

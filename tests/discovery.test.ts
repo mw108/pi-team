@@ -45,6 +45,7 @@ test("Composer scripts and PHPUnit discovery", async () => {
   await writeFile(join(cwd, "phpunit.xml"), "<phpunit/>");
   await mkdir(join(cwd, "vendor/bin"), { recursive: true });
   await writeFile(join(cwd, "vendor/bin/phpunit"), "<?php echo 'ok';");
+  await writeFile(join(cwd, "vendor/bin/pint"), "<?php echo 'ok';");
   const commands = await discoverCommands(cwd);
   assert.ok(
     commands.some(
@@ -65,6 +66,18 @@ test("Composer scripts and PHPUnit discovery", async () => {
     assert.equal(phpunit.execution?.interpreter, "php");
     assert.equal(phpunit.execution?.equivalentOf, "vendor/bin/phpunit");
   }
+  const pint = commands.find(
+    (candidate) => candidate.category === "format-check",
+  );
+  assert.ok(pint);
+  assert.equal(pint.command.purpose, "static");
+  assert.ok(pint.command.args.includes("--test"));
+  assert.equal(pint.execution?.requiresShell, false);
+  if (process.platform === "win32") {
+    assert.equal(pint.command.executable, "php");
+    assert.equal(pint.command.args[0], "vendor/bin/pint");
+    assert.equal(pint.execution?.interpreter, "php");
+  } else assert.equal(pint.command.executable, "vendor/bin/pint");
 });
 
 test("Laravel evidence adds a portable Artisan test candidate without replacing Composer scripts", async () => {

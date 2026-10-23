@@ -253,6 +253,8 @@ export const stateSchema = z.object({
             .enum([
               "PASS",
               "TEST_FAILURE",
+              "STATIC_FORMAT_FAILURE",
+              "STATIC_ANALYSIS_FAILURE",
               "INVOCATION_ERROR",
               "INFRASTRUCTURE_ERROR",
               "INDETERMINATE",
