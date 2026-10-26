@@ -480,7 +480,7 @@ test("recovery reissues one model request in the same session and disables provi
   );
 });
 
-test("Pi 0.87.1 OpenAI-compatible stream reconnects after an SDK transport failure", async () => {
+test("Pi 1.4 OpenAI-compatible stream reconnects after an SDK transport failure", async () => {
   const localModel = {
     ...model,
     name: "Fixture",

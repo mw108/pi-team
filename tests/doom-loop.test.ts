@@ -1310,7 +1310,7 @@ test("engine preserves typed doom-loop failure and counts only the failed attemp
   );
 });
 
-test("Pi 0.87.1 AgentSession.steer queues a user-role message", async () => {
+test("Pi 1.4 AgentSession.steer queues a user-role message", async () => {
   const received: unknown[] = [];
   const fake: any = {
     _steeringMessages: [],

@@ -4,9 +4,9 @@ A Pi-native development team with isolated role sessions, configurable parallel 
 
 ## Installed environment
 
-Local development uses the Pi **1.1.0** declarations, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **5.2.0**, `pi-web-access` **0.38.0**, and the existing Serena **1.7.0**. Node 24+ is required. Exact resolved versions are in `package-lock.json`.
+Local development uses the Pi **1.4.0** declarations, `@eko24ive/pi-ask` **1.2.0**, `@bacnh85/pi-serena` **0.9.18**, `pi-mcp-adapter` **5.2.0**, and `pi-web-access` **0.38.0**. The optional Serena CLI was not present during the 1.4 audit. Node 24+ is required. Exact resolved versions are in `package-lock.json`. The [Pi 1.4 compatibility audit](docs/pi-1.4-compatibility.md) records the verified API and runtime coverage.
 
-The user-facing `pi` executable is installed under `~/.local/bin`. This project and its four integration packages are registered as local Pi packages. Keep this checkout and its `node_modules` directory available.
+On the audited Windows host, the user-facing `pi` executable is the managed launcher at `C:\Users\mario\.pi\agent\bin\pi.ps1`; it selects the release recorded in `install/current-version`. `pi list` shows this checkout as the active local package, alongside the user packages `pi-ask-user`, `pi-exa`, and `pi-mcp-adapter`. Keep this checkout and its `node_modules` directory available.
 
 See [investigation](docs/investigation.md), [executed validation](docs/validation.md), [progress fixture evidence](docs/progress-validation.json), [project-local fixture evidence](docs/project-local-validation.json), [integration validation](docs/integration-validation.json) and [live workflow validation](docs/live-validation.json) for checks actually performed. The prior live workflow completed after a guarded resume; its original failure budget was preserved.
 
@@ -240,7 +240,7 @@ Pi Team uses npm and its committed npm lockfile. Use Node 24 or newer and the np
 Pi does not install or modify dependencies for a local-path package. Install the locked dependencies first, then register the absolute checkout path:
 
 ```bash
-npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@1.1.0
+npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@1.4.0
 export PATH="$HOME/.local/bin:$PATH"
 cd /path/to/pi-team
 npm ci
@@ -272,7 +272,7 @@ pi install git:github.com/<owner>/pi-team@<tag-or-commit>
 
 The npm package is currently marked `private`, so the local-path workflow is the supported installation method for this checkout. A Git installation must include the lockfile and should be pinned to a reviewed ref.
 
-Pi host-provided packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) are declared as `peerDependencies` with `"*"`, following Pi's package contract, so managed installations use the host's copies. Matching 1.1.0 versions in `devDependencies` support local typechecking and tests without bundling an independent host runtime into a managed Pi installation.
+Pi host-provided packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) are declared as `peerDependencies` with `"*"`, following Pi's package contract, so managed installations use the host's copies. Matching 1.4.0 versions in `devDependencies` support local typechecking and tests without bundling an independent host runtime into a managed Pi installation.
 
 The integrations also support their documented standalone npm installation form:
 
@@ -285,7 +285,7 @@ pi install npm:pi-web-access@0.38.0
 
 Choose one registration per package; registering both local and npm copies creates duplicate resources. Run `/reload` or restart Pi after registration changes. `pi list` shows active package sources. Pi now uses the `@earendil-works` package scope.
 
-`pi-mcp-adapter` 5.2.0 accepts Pi AI 0.99.x and 1.x, including the current 1.1 line. Pi Team calls its documented `createMcpAdapter({ config })` factory and gives it one isolated Context7 server definition. The package publishes a TypeScript root entry point, so Pi Team resolves that declared entry explicitly through the active TypeScript loader; a regression test verifies the factory, `mcp` tool, command registration, and shutdown hook.
+`pi-mcp-adapter` 5.2.0 accepts Pi AI 0.99.x and 1.x, including the verified 1.4 line. Pi Team calls its documented `createMcpAdapter({ config })` factory and gives it one isolated Context7 server definition. The package publishes a TypeScript root entry point, so Pi Team resolves that declared entry explicitly through the active TypeScript loader; a regression test verifies the factory, `mcp` tool, command registration, and shutdown hook.
 
 If npm reports `ERESOLVE` mentioning `pi-mcp-adapter@3.0.0` and Pi AI 0.99 or 1.x, the checkout or lockfile is stale. Version 3.0.0 accepted only Pi AI 0.84–0.87 even though that peer was optional. Restore the committed `package.json` and `package-lock.json`, then run `npm ci`; do not use `--force` or `--legacy-peer-deps`.
 
@@ -363,7 +363,7 @@ The default solver prompts favor architecture, minimal change and alternative ap
 
 Each agent can set `temperature: 0.2` alongside `thinking: off`. Temperature is optional and must be a finite number from 0 to 2. When omitted, Pi and the provider use their model default; existing project configurations do not need an edit. Lower values favor consistency, while higher values allow more varied samples. The template uses 0.2 for the architecture Solver, 0.5 for the pragmatic Solver, and 0.8 for the alternative Solver. Their distinct prompts remain the main source of different approaches; temperature does not guarantee better reasoning.
 
-Pi 0.99.0 has no temperature argument on `createAgentSession()` or `session.prompt()`. Pi Team passes the configured value through that agent session's `ModelRuntime.streamSimple()` generation options on each request. Pi's OpenAI-compatible adapter sends it as the `temperature` request field. An explicit agent value overrides a model's `samplingParams.temperature`; an omitted value leaves the provider/model default untouched. Workflow state saves the resolved agent configuration, and the existing team YAML hash catches temperature edits during resume. `/team doctor` reports invalid values and statically known unsupported combinations.
+Pi 1.4.0 has no temperature argument on `createAgentSession()` or `session.prompt()`. Pi Team passes the configured value through that agent session's `ModelRuntime.streamSimple()` generation options on each request. Pi's OpenAI-compatible adapter sends it as the `temperature` request field. An explicit agent value overrides a model's `samplingParams.temperature`; an omitted value leaves the provider/model default untouched. Workflow state saves the resolved agent configuration, and the existing team YAML hash catches temperature edits during resume. `/team doctor` reports invalid values and statically known unsupported combinations.
 
 Provider support varies. Pi Team rejects explicit temperature for Pi APIs whose installed adapter does not forward it, Anthropic extended thinking or models marked as not supporting temperature, and OpenAI/Codex reasoning models. For other supported adapters, a model or server may still reject a particular value; that provider error is reported rather than treated as a successful application. Check the chosen model before using the template examples with a different provider.
 
@@ -664,7 +664,7 @@ State is authoritative structured JSON under `.pi/team/state/<workflow-id>.json`
 
 Defaults are three full design cycles, five local repairs, two pentest runs, two agent failures, five submitted questions, 80 tool calls per invocation and a five-minute fallback agent timeout. The template suggests longer budgets for local models. An omitted `agents.<role>.timeoutMs` inherits `workflow.agentTimeoutMs`; a positive value sets that agent's wall-clock timeout in milliseconds (1,000–3,600,000 ms); exactly `0` disables the wall-clock timeout. `workflow.agentTimeoutMs: 0` disables the default wall-clock timeout for agents with no override. The budget covers the agent's commands and model exchange after session setup, but pauses while model preflight uses its separate cold-start budget. `/team doctor` displays disabled timeouts as `unlimited`. The resolved config snapshot retains the configured `0`, while attempt logs record `timeoutMs: null` and `timeoutMode: unlimited`.
 
-`workflow.requestTimeoutMs` sets the provider/SDK request timeout in milliseconds (default 300000). `agents.<role>.requestTimeoutMs` overrides it for one agent. Both accept non-negative integers; `0` uses Pi 0.99's disabled-timeout mapping. This is not an absolute generation deadline. In the installed OpenAI-compatible adapter, the value is passed to OpenAI SDK 7.19.0; that SDK clears its fetch timer after response headers arrive. Pi's separate HTTP idle timeout covers gaps while waiting for headers or body chunks. A continuously active token stream can therefore outlive both values. Other provider adapters may apply `requestTimeoutMs` differently, so Pi Team preserves this established provider-specific behavior.
+`workflow.requestTimeoutMs` sets the provider/SDK request timeout in milliseconds (default 300000). `agents.<role>.requestTimeoutMs` overrides it for one agent. Both accept non-negative integers; `0` uses Pi 1.4's disabled-timeout mapping. This is not an absolute generation deadline. In the installed OpenAI-compatible adapter, the value is passed to the provider SDK; its request timeout can end after response headers arrive. Pi's separate HTTP idle timeout covers gaps while waiting for headers or body chunks. A continuously active token stream can therefore outlive both values. Other provider adapters may apply `requestTimeoutMs` differently, so Pi Team preserves this established provider-specific behavior.
 
 `workflow.providerRequestDeadlineMs` is Pi Team's provider-independent, absolute wall-clock deadline for one inference request, from `provider_request_start` through complete stream iteration and cleanup. It defaults to 1200000 (20 minutes). `workflow.reasoningStallTimeoutMs` bounds a continuous reasoning-only segment that has not begun a tool call or final answer; it defaults to 600000 (10 minutes). `agents.<role>.providerRequestDeadlineMs` and `agents.<role>.reasoningStallTimeoutMs` override either value naturally. These fields accept integer milliseconds from 0 through 86400000; exactly `0` disables only that safeguard. Existing project configuration files are not rewritten and omitted fields receive the defaults when a fresh execution snapshot is resolved.
 
@@ -732,7 +732,7 @@ With `logging.agentLogs.level: summary` (the default), each attempt has an appen
 
 Agent final output is untrusted. Pi Team strictly parses JSON, applies the bounded two-stage local syntax repair described above, validates every candidate with the role schema, and then uses the configured output-only model corrections if needed. Literal tool-call markup after tools are disabled is classified as a finalization failure; persistent malformed output becomes a controlled agent failure with a role-specific `/team-retry` action. A bounded, redacted preview is kept in attempt diagnostics without exposing a raw `JSON.parse()` exception as the workflow blocker.
 
-Provider request diagnostics in each attempt file number individual model invocations from 1, including those made after a network reconnect. Start and end events record the request duration; failure events add time to first stream event, time since last stream activity, effective timeout values, current retry number, abort state, tool count, and Doom-Loop finalization state. An agent timeout measures the session's active execution budget; a provider request duration measures one model invocation. The installed Pi 0.99.0 settings manager supplies `httpIdleTimeoutMs` (300,000 ms by default). The request event records the effective `requestTimeoutMs`, `providerRequestDeadlineMs`, and `reasoningStallTimeoutMs`. `provider_request_deadline_exceeded`, `reasoning_stall_detected`, `reasoning_stall_recovery_started`, `reasoning_stall_recovery_succeeded`, and `reasoning_stall_recovery_failed` retain bounded timing/counter metadata without recording hidden reasoning content. The wrapper does not expose Undici headers or body timeout settings, so the log does not invent them.
+Provider request diagnostics in each attempt file number individual model invocations from 1, including those made after a network reconnect. Start and end events record the request duration; failure events add time to first stream event, time since last stream activity, effective timeout values, current retry number, abort state, tool count, and Doom-Loop finalization state. An agent timeout measures the session's active execution budget; a provider request duration measures one model invocation. The installed Pi 1.4.0 settings manager supplies `httpIdleTimeoutMs` (300,000 ms by default). The request event records the effective `requestTimeoutMs`, `providerRequestDeadlineMs`, and `reasoningStallTimeoutMs`. `provider_request_deadline_exceeded`, `reasoning_stall_detected`, `reasoning_stall_recovery_started`, `reasoning_stall_recovery_succeeded`, and `reasoning_stall_recovery_failed` retain bounded timing/counter metadata without recording hidden reasoning content. The wrapper does not expose Undici headers or body timeout settings, so the log does not invent them.
 
 For example, `/team-log researcher --attempt 1` may show:
 
@@ -838,7 +838,7 @@ If Serena fails, check `serena --version`, `SERENA_PYTHON`, project languages an
 
 ## Update and uninstall
 
-Review current package documentation, source and compatibility before changing versions. Update the dependency pins intentionally, run `npm install --ignore-scripts`, then `npm run check`, `npm run smoke` and the live fixture. Local Pi registrations point to this checkout and use the updated copies after `/reload` or restart. Keep the previous lockfile to reproduce older versions. Update the global CLI explicitly with `npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@<reviewed-version>`.
+Review current package documentation, source and compatibility before changing versions. Update the dependency pins intentionally, run `npm install --ignore-scripts`, then `npm run check`, `npm run smoke` and the live fixture. Local Pi registrations point to this checkout and use the updated copies after `/reload` or restart. Keep the previous lockfile to reproduce older versions. Managed installations should use `pi update`; npm installations can update explicitly with `npm install -g --prefix "$HOME/.local" @earendil-works/pi-coding-agent@<reviewed-version>`.
 
 To unregister this installation:
 

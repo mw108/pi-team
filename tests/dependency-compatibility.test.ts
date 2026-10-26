@@ -44,6 +44,23 @@ test("package metadata keeps runtime, host peer, and lockfile contracts aligned"
     assert.equal(typeof manifest.devDependencies[name], "string");
   }
 
+  for (const name of [
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+  ]) {
+    assert.equal(
+      manifest.devDependencies[name],
+      "1.4.0",
+      `${name} must exercise the installed Pi 1.4.0 API in development`,
+    );
+    assert.equal(lock.packages[`node_modules/${name}`].version, "1.4.0");
+  }
+  assert.equal(
+    lock.packages["node_modules/@earendil-works/pi-agent-core"].version,
+    "1.4.0",
+  );
+
   assert.deepEqual(root.dependencies, manifest.dependencies);
   assert.deepEqual(root.devDependencies, manifest.devDependencies);
   assert.deepEqual(root.peerDependencies, manifest.peerDependencies);
