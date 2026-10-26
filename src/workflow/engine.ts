@@ -60,7 +60,11 @@ import {
   type RuntimeCommandRequest,
 } from "../agents/runtime-commands.ts";
 import { getAgentDisplayName } from "../ui/agent-name.ts";
-import { StateStore } from "./persistence.ts";
+import {
+  StatePersistenceError,
+  StateStore,
+  statePersistenceError,
+} from "./persistence.ts";
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import {
   CredentialApprovalRequired,
@@ -204,7 +208,14 @@ export class WorkflowEngine {
   private ownedState?: WorkflowState;
   private continuingPhase?: Phase;
   private historyWrite = Promise.resolve();
+  private persistenceFailure?: StatePersistenceError;
   private credentialOneShot: CredentialFindingIdentity[] = [];
+  private stopForPersistenceFailure(failure: StatePersistenceError) {
+    this.persistenceFailure ??= failure;
+    for (const attempt of this.activeAttempts.values())
+      attempt.controller.abort();
+    return this.persistenceFailure;
+  }
   private contractExtensionPrompt(
     change: UnexpectedWorkflowChange,
   ): ApprovalRequest {
@@ -446,11 +457,19 @@ export class WorkflowEngine {
     detail: string,
     meta: NonNullable<WorkflowState["history"][number]["meta"]>,
   ) {
-    record(state, event, detail, meta);
-    const snapshot = structuredClone(state);
-    const pending = this.historyWrite.then(() => this.store.save(snapshot));
-    this.historyWrite = pending.catch(() => {});
-    await pending;
+    if (this.persistenceFailure) throw this.persistenceFailure;
+    try {
+      record(state, event, detail, meta);
+      const snapshot = structuredClone(state);
+      const pending = this.historyWrite.then(() => this.store.save(snapshot));
+      this.historyWrite = pending.catch(() => {});
+      await pending;
+    } catch (error) {
+      const failure =
+        statePersistenceError(error) ??
+        new StatePersistenceError(state.id, error);
+      throw this.stopForPersistenceFailure(failure);
+    }
   }
   private emitAgentEvent(event: AgentEvent) {
     try {
@@ -1473,6 +1492,7 @@ export class WorkflowEngine {
     authoritative = s,
     manualStart = false,
   ) {
+    if (this.persistenceFailure) throw this.persistenceFailure;
     let failures = 0;
     let automaticRetries = 0;
     let trigger:
@@ -1593,7 +1613,32 @@ export class WorkflowEngine {
         }
       >();
       const modelToolRequests = new Map<string, number>();
-      const networkHistoryWrites: Promise<void>[] = [];
+      const networkHistoryWrites: Promise<StatePersistenceError | undefined>[] =
+        [];
+      let persistenceDiagnosticWritten = false;
+      const trackHistoryWrite = (write: Promise<void>) =>
+        write.then(
+          () => undefined,
+          (error) => {
+            const failure =
+              statePersistenceError(error) ??
+              new StatePersistenceError(authoritative.id, error);
+            logged?.logger.append({
+              type: "workflow_state_persistence_failed",
+              agent: role,
+              attempt: attemptNumber,
+              message: failure.message,
+              recovery:
+                "The last durable state is unchanged; restart Pi-Team and resume this workflow from persisted state.",
+            });
+            persistenceDiagnosticWritten = true;
+            return failure;
+          },
+        );
+      const backgroundPersistenceFailure = async () =>
+        (await Promise.all(networkHistoryWrites)).find(
+          (failure): failure is StatePersistenceError => failure !== undefined,
+        );
       let providerRequests = 0;
       let failedRequest:
         (ProviderRequestEvent & Record<string, unknown>) | undefined;
@@ -1875,16 +1920,18 @@ export class WorkflowEngine {
                 event.type === "network_retries_exhausted"
               )
                 networkHistoryWrites.push(
-                  this.persistAttempt(
-                    authoritative,
-                    event.type,
-                    `${role} ${event.type.replaceAll("_", " ")} ${event.retry}`,
-                    {
-                      agent: role,
-                      attempt: attemptNumber,
-                      networkRetry: event.retry,
-                      reason: event.category,
-                    },
+                  trackHistoryWrite(
+                    this.persistAttempt(
+                      authoritative,
+                      event.type,
+                      `${role} ${event.type.replaceAll("_", " ")} ${event.retry}`,
+                      {
+                        agent: role,
+                        attempt: attemptNumber,
+                        networkRetry: event.retry,
+                        reason: event.category,
+                      },
+                    ),
                   ),
                 );
             },
@@ -1918,10 +1965,12 @@ export class WorkflowEngine {
                           ? `${role} tool loop persisted; finalizing without tools`
                           : `${role} tool budget exhausted; finalizing without tools`;
               networkHistoryWrites.push(
-                this.persistAttempt(authoritative, event.type, label, {
-                  agent: role,
-                  attempt: attemptNumber,
-                }),
+                trackHistoryWrite(
+                  this.persistAttempt(authoritative, event.type, label, {
+                    agent: role,
+                    attempt: attemptNumber,
+                  }),
+                ),
               );
               this.emitAgentEvent({ type: "guard", role, event });
             },
@@ -1989,18 +2038,20 @@ export class WorkflowEngine {
                 ].includes(event.type)
               )
                 networkHistoryWrites.push(
-                  this.persistAttempt(
-                    authoritative,
-                    event.type,
-                    `${role} ${event.type.replaceAll("_", " ")} (provider request ${event.providerRequest})`,
-                    {
-                      agent: role,
-                      attempt: attemptNumber,
-                      reason: event.cancellationReason,
-                      durationMs:
-                        event.reasoningOnlyDurationMs ??
-                        event.requestDurationMs,
-                    },
+                  trackHistoryWrite(
+                    this.persistAttempt(
+                      authoritative,
+                      event.type,
+                      `${role} ${event.type.replaceAll("_", " ")} (provider request ${event.providerRequest})`,
+                      {
+                        agent: role,
+                        attempt: attemptNumber,
+                        reason: event.cancellationReason,
+                        durationMs:
+                          event.reasoningOnlyDurationMs ??
+                          event.requestDurationMs,
+                      },
+                    ),
                   ),
                 );
               if (event.type === "provider_request_end" && event.success)
@@ -2160,13 +2211,15 @@ export class WorkflowEngine {
                 ...metadata,
               });
               networkHistoryWrites.push(
-                this.persistAttempt(
-                  authoritative,
-                  event.type,
-                  modelRepair
-                    ? `${role} schema repair ${event.repairAttempt}${event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.maxSchemaRepairAttempts}`} ${event.type.slice("schema_repair_".length)}`
-                    : `${role} ${event.type.replaceAll("_", " ")}${event.method ? ` (${event.method})` : ""}`,
-                  metadata,
+                trackHistoryWrite(
+                  this.persistAttempt(
+                    authoritative,
+                    event.type,
+                    modelRepair
+                      ? `${role} schema repair ${event.repairAttempt}${event.maxSchemaRepairAttempts === 0 ? " (unlimited)" : `/${event.maxSchemaRepairAttempts}`} ${event.type.slice("schema_repair_".length)}`
+                      : `${role} ${event.type.replaceAll("_", " ")}${event.method ? ` (${event.method})` : ""}`,
+                    metadata,
+                  ),
                 ),
               );
               this.emitAgentEvent({ type: "schemaRepair", role, event });
@@ -2363,7 +2416,8 @@ export class WorkflowEngine {
         if (control.intention)
           throw new Error("Agent operation superseded by user");
         control.settled = true;
-        await Promise.all(networkHistoryWrites);
+        const backgroundFailure = await backgroundPersistenceFailure();
+        if (backgroundFailure) throw backgroundFailure;
         if (control.intention)
           throw new Error("Agent operation superseded by user");
         logged?.logger.append({
@@ -2393,7 +2447,23 @@ export class WorkflowEngine {
           failures,
         };
       } catch (e) {
-        await Promise.all(networkHistoryWrites);
+        const backgroundFailure = await backgroundPersistenceFailure();
+        const persistenceFailure =
+          backgroundFailure ?? statePersistenceError(e);
+        if (persistenceFailure) {
+          this.stopForPersistenceFailure(persistenceFailure);
+          if (!persistenceDiagnosticWritten)
+            logged?.logger.append({
+              type: "workflow_state_persistence_failed",
+              agent: role,
+              attempt: attemptNumber,
+              message: persistenceFailure.message,
+              recovery:
+                "The last durable state is unchanged; restart Pi-Team and resume this workflow from persisted state.",
+            });
+          await logged?.logger.flush();
+          throw persistenceFailure;
+        }
         if (control.intention === "superseded") {
           logged?.logger.append({
             type: "agent_superseded_by_upstream_retry",
@@ -4141,6 +4211,13 @@ export class WorkflowEngine {
             };
           }),
         );
+        const phasePersistenceFailure = results.find(
+          (item) =>
+            item.status === "rejected" &&
+            statePersistenceError(item.reason) !== undefined,
+        );
+        if (phasePersistenceFailure?.status === "rejected")
+          throw statePersistenceError(phasePersistenceFailure.reason)!;
         if (s.pendingContractPaths.length) {
           s.phase = "WAITING_USER";
           await this.store.save(s);
@@ -4251,6 +4328,8 @@ export class WorkflowEngine {
               record(s, "agent_completed", role);
             } else pending = replay.result;
           } catch (retryError) {
+            const persistenceFailure = statePersistenceError(retryError);
+            if (persistenceFailure) throw persistenceFailure;
             if (retryError instanceof AgentAbortedByUserError) aborted = role;
             else {
               s.agentFailures += (retryError as any)?.failures ?? 1;
@@ -4612,6 +4691,10 @@ export class WorkflowEngine {
       this.ui.progress(s);
       return s;
     } catch (e) {
+      const persistenceFailure =
+        statePersistenceError(e) ?? this.persistenceFailure;
+      if (persistenceFailure)
+        throw this.stopForPersistenceFailure(persistenceFailure);
       block(s, getErrorMessage(e));
       await this.store.save(s);
       this.ui.progress(s);

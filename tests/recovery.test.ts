@@ -15,7 +15,74 @@ import { git, head } from "../src/workflow/git.ts";
 import { record, type WorkflowState } from "../src/workflow/state.ts";
 import { AgentTimeoutError } from "../src/agents/errors.ts";
 import { renderProgress } from "../src/ui/progress.ts";
+import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 const ui = { progress: () => {}, ask: async () => undefined };
+
+test("an interrupted Critic fixture preserves completed upstream work and reruns only Critique", async () => {
+  const cwd = await repository();
+  const initial = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const state = await initial.start("Interrupted Critic", config());
+  state.requirements = [...output("orchestrator").requirements];
+  state.results.orchestrator = output("orchestrator");
+  state.results.researcher = output("researcher");
+  state.results.solver1 = output("solver1");
+  state.results.solver2 = output("solver2");
+  state.results.solver3 = output("solver3");
+  state.phase = "CRITIQUE";
+  state.inFlight = { phase: "CRITIQUE", roles: ["critic"] };
+  state.history = [];
+  for (let index = 0; index < 31; index++)
+    record(state, `fixture_event_${index}`, `durable history ${index}`);
+  const upstream = structuredClone(state.results);
+  const interruptedLog = await initial.logs.create(state.id, "critic");
+  interruptedLog.logger.append({
+    type: "agent_start",
+    agent: "critic",
+    attempt: 1,
+  });
+  interruptedLog.logger.append({
+    type: "assistant_output",
+    text: "partial critic output is not a durable result",
+  });
+  await interruptedLog.logger.flush();
+  await initial.store.save(state);
+
+  const runner = new FixtureRunner();
+  const restarted = new WorkflowEngine(cwd, runner, ui);
+  const loaded = await restarted.store.load(state.id);
+  await restarted.run(loaded);
+
+  assert.equal(loaded.phase, "DONE", loaded.blocker);
+  assert.deepEqual(loaded.results.orchestrator, upstream.orchestrator);
+  assert.deepEqual(loaded.results.researcher, upstream.researcher);
+  assert.deepEqual(loaded.results.solver1, upstream.solver1);
+  assert.deepEqual(loaded.results.solver2, upstream.solver2);
+  assert.deepEqual(loaded.results.solver3, upstream.solver3);
+  assert.equal(runner.counts.orchestrator, undefined);
+  assert.equal(runner.counts.researcher, undefined);
+  assert.equal(runner.counts.solver1, undefined);
+  assert.equal(runner.counts.solver2, undefined);
+  assert.equal(runner.counts.solver3, undefined);
+  assert.equal(runner.counts.critic, 1);
+  assert.ok(loaded.results.critic);
+  assert.equal(
+    loaded.history.filter((event) => event.event === "recovered").length,
+    1,
+  );
+  assert.equal(
+    loaded.history.filter(
+      (event) =>
+        event.event === "agent_attempt_completed" &&
+        event.meta?.agent === "critic",
+    ).length,
+    1,
+  );
+  assert.deepEqual(
+    await new AgentLogStore(cwd).attempts(state.id, "critic"),
+    [1, 2],
+  );
+});
+
 test("complete team pipeline executes real tests and creates intended commit", async () => {
   const cwd = await repository();
   const runner = new FixtureRunner(),

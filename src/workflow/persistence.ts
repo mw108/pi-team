@@ -21,6 +21,30 @@ import { getErrorMessage } from "../agents/error-message.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const exec = promisify(execFile);
+export class StatePersistenceError extends Error {
+  readonly code = "WORKFLOW_STATE_PERSISTENCE_FAILED";
+  constructor(
+    readonly workflowId: string,
+    cause: unknown,
+  ) {
+    super(
+      `Workflow ${workflowId} state was not saved; the last durable state was preserved. Workflow execution stopped before further agents could start. Inspect the diagnostic log, then resume the workflow from its persisted state. Cause: ${getErrorMessage(cause)}`,
+      { cause },
+    );
+    this.name = "StatePersistenceError";
+  }
+}
+
+export function statePersistenceError(error: unknown) {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && !seen.has(current)) {
+    if (current instanceof StatePersistenceError) return current;
+    seen.add(current);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return undefined;
+}
 const ownProcessStart = new Date(
   Date.now() - process.uptime() * 1000,
 ).toISOString();
@@ -69,26 +93,37 @@ export class StateStore {
     return join(this.dir, `${id}.json`);
   }
   async save(state: WorkflowState) {
-    const candidate = structuredClone(state);
-    sanitizeWorkflowStateText(candidate);
-    const validated = validateState(candidate);
-    sanitizeWorkflowStateText(state);
-    const pending = this.saveQueue.then(() => this.write(validated));
-    this.saveQueue = pending.catch(() => {});
-    await pending;
+    try {
+      const candidate = structuredClone(state);
+      sanitizeWorkflowStateText(candidate);
+      const validated = validateState(candidate);
+      sanitizeWorkflowStateText(state);
+      const pending = this.saveQueue.then(() => this.write(validated));
+      this.saveQueue = pending.catch(() => {});
+      await pending;
+    } catch (error) {
+      if (error instanceof StatePersistenceError) throw error;
+      throw new StatePersistenceError(state.id, error);
+    }
   }
   private async write(state: WorkflowState) {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const path = this.path(state.id),
       temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    const file = await open(temp, "w", 0o600);
+    let replaced = false;
     try {
-      await file.writeFile(JSON.stringify(state, null, 2));
-      await file.sync();
+      const file = await open(temp, "w", 0o600);
+      try {
+        await file.writeFile(JSON.stringify(state, null, 2));
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await rename(temp, path);
+      replaced = true;
     } finally {
-      await file.close();
+      if (!replaced) await unlink(temp).catch(() => {});
     }
-    await rename(temp, path);
   }
   async load(id: string) {
     try {

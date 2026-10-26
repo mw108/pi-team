@@ -216,7 +216,7 @@ export const stateSchema = z.object({
           reason: z.string().optional(),
           timeoutMs: z.number().int().nullable().optional(),
           timeoutMode: z.enum(["limited", "unlimited"]).optional(),
-          durationMs: z.number().int().optional(),
+          durationMs: z.number().int().nonnegative().optional(),
           networkRetry: z.number().int().nonnegative().optional(),
           finalError: z
             .object({
@@ -817,14 +817,58 @@ export function record(
   meta?: WorkflowState["history"][number]["meta"],
   instruction?: WorkflowState["history"][number]["instruction"],
 ) {
+  const persistedMeta = meta
+    ? {
+        ...meta,
+        ...(meta.timeoutMs === undefined || meta.timeoutMs === null
+          ? {}
+          : {
+              timeoutMs: toPersistedDurationMs(
+                meta.timeoutMs,
+                "history.meta.timeoutMs",
+              ),
+            }),
+        ...(meta.durationMs === undefined
+          ? {}
+          : {
+              durationMs: toPersistedDurationMs(
+                meta.durationMs,
+                "history.meta.durationMs",
+              ),
+            }),
+        ...(meta.finalError?.requestDurationMs === undefined
+          ? {}
+          : {
+              finalError: {
+                ...meta.finalError,
+                requestDurationMs: toPersistedDurationMs(
+                  meta.finalError.requestDurationMs,
+                  "history.meta.finalError.requestDurationMs",
+                ),
+              },
+            }),
+      }
+    : undefined;
   state.history.push({
     at: new Date().toISOString(),
     phase: state.phase,
     event,
     detail: redactVisibleText(detail).slice(0, 4000),
-    ...(meta ? { meta: redactStructured(meta) } : {}),
+    ...(persistedMeta ? { meta: redactStructured(persistedMeta) } : {}),
     ...(instruction ? { instruction } : {}),
   });
+}
+
+/** Convert a high-resolution runtime duration to the persisted millisecond contract. */
+export function toPersistedDurationMs(value: unknown, field = "durationMs") {
+  if (typeof value !== "number")
+    throw new TypeError(`${field} must be a number`);
+  if (!Number.isFinite(value)) throw new TypeError(`${field} must be finite`);
+  if (value < 0) throw new RangeError(`${field} must not be negative`);
+  const rounded = Math.round(value);
+  if (!Number.isSafeInteger(rounded))
+    throw new RangeError(`${field} exceeds the safe integer range`);
+  return rounded;
 }
 export function block(
   state: WorkflowState,

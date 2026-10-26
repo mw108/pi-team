@@ -87,6 +87,23 @@ test("three-hour approval wait preserves the exact active execution budget", () 
   );
 });
 
+test("timeout accounting retains fractional monotonic precision", () => {
+  const { value, clock, timeouts } = budget(1_000);
+  clock.now = 1_000.125;
+  value.stop();
+  const precise = new AgentTimeoutBudget(1_000, {
+    now: () => clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    onTimeout: () => {},
+  });
+  precise.start();
+  clock.now = 1_154.5678;
+  assert.ok(Math.abs(precise.elapsed()! - 154.4428) < 1e-9);
+  assert.ok(Math.abs(precise.remaining()! - 845.5572) < 1e-9);
+  assert.equal(timeouts(), 0);
+});
+
 test("sequential approvals accumulate active time without resetting the budget", () => {
   const { value, clock, timeouts } = budget(60 * 60_000);
   for (const [active, waiting, reason] of [
