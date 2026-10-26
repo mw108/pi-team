@@ -148,11 +148,14 @@ import {
   AgentDoomLoopError,
   AgentOutputError,
   AgentTimeoutError,
+  ProviderRequestDeadlineError,
+  ReasoningStallError,
   classifyFailure,
   explainFailure,
   getAgentTimeoutMs,
   safeFailureLabel,
 } from "../agents/errors.ts";
+import { resolveProviderRequestLimits } from "../agents/provider-request-limits.ts";
 import { ActiveSessionRegistry } from "../agents/active-sessions.ts";
 import {
   AgentLogStore,
@@ -1976,6 +1979,30 @@ export class WorkflowEngine {
               if (event.type === "provider_request_failure")
                 failedRequest = record;
               logged?.logger.append(record);
+              if (
+                [
+                  "provider_request_deadline_exceeded",
+                  "reasoning_stall_detected",
+                  "reasoning_stall_recovery_started",
+                  "reasoning_stall_recovery_succeeded",
+                  "reasoning_stall_recovery_failed",
+                ].includes(event.type)
+              )
+                networkHistoryWrites.push(
+                  this.persistAttempt(
+                    authoritative,
+                    event.type,
+                    `${role} ${event.type.replaceAll("_", " ")} (provider request ${event.providerRequest})`,
+                    {
+                      agent: role,
+                      attempt: attemptNumber,
+                      reason: event.cancellationReason,
+                      durationMs:
+                        event.reasoningOnlyDurationMs ??
+                        event.requestDurationMs,
+                    },
+                  ),
+                );
               if (event.type === "provider_request_end" && event.success)
                 this.emitAgentEvent({
                   type: "networkClear",
@@ -2463,9 +2490,19 @@ export class WorkflowEngine {
                   : failure;
         const agentTimeoutMs =
           e instanceof AgentTimeoutError ? e.timeoutMs : undefined;
-        const label = safeFailureLabel(category, agentTimeoutMs);
+        const failureTimeoutMs =
+          e instanceof ProviderRequestDeadlineError
+            ? e.deadlineMs
+            : e instanceof ReasoningStallError
+              ? e.thresholdMs
+              : agentTimeoutMs;
+        const label = safeFailureLabel(category, failureTimeoutMs);
         const durationMs = Date.now() - started;
-        const error = failedRequest?.error ?? serializeErrorDiagnostics(e);
+        const error =
+          category === "provider_request_deadline" ||
+          category === "reasoning_stall"
+            ? serializeErrorDiagnostics(e)
+            : (failedRequest?.error ?? serializeErrorDiagnostics(e));
         const abortReason =
           control.intention === "abort"
             ? "team-abort"
@@ -2534,12 +2571,28 @@ export class WorkflowEngine {
               s.config.workflow.networkRetry.maxRetries,
             waiting: false,
           },
-          providerTimeouts: {
-            ...failedRequest?.providerTimeouts,
-            requestTimeoutMs:
-              failedRequest?.providerTimeouts?.requestTimeoutMs ??
-              resolveRequestTimeout(s.config, role),
-          },
+          ...(failedRequest
+            ? {
+                providerTimeouts: {
+                  ...failedRequest.providerTimeouts,
+                  requestTimeoutMs:
+                    failedRequest.providerTimeouts?.requestTimeoutMs ??
+                    resolveRequestTimeout(s.config, role),
+                  providerRequestDeadlineMs:
+                    failedRequest.providerTimeouts?.providerRequestDeadlineMs ??
+                    resolveProviderRequestLimits(s.config, role)
+                      .providerRequestDeadlineMs,
+                  reasoningStallTimeoutMs:
+                    failedRequest.providerTimeouts?.reasoningStallTimeoutMs ??
+                    resolveProviderRequestLimits(s.config, role)
+                      .reasoningStallTimeoutMs,
+                },
+              }
+            : {
+                providerTimeouts: {
+                  requestTimeoutMs: resolveRequestTimeout(s.config, role),
+                },
+              }),
           ...(agentTimeoutMs ? { timeoutMs: agentTimeoutMs } : {}),
         });
         await logged?.logger.flush();

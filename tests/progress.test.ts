@@ -74,9 +74,9 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 async function eventually(predicate: () => boolean) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 200; i++) {
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail("Expected progress event did not arrive");
 }

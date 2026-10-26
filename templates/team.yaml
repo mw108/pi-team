@@ -11,6 +11,8 @@ workflow:
   maxResearchClarifications: 5
   agentTimeoutMs: 600000 # total agent execution budget; 0 disables only the wall-clock timeout
   requestTimeoutMs: 300000 # each provider request; 0 uses Pi's unlimited mode
+  providerRequestDeadlineMs: 1200000 # absolute wall-clock limit per provider request; 0 disables
+  reasoningStallTimeoutMs: 600000 # continuous reasoning without tool/final transition; 0 disables
   modelPreflight:
     coldStartTimeoutMs: 600000 # total model readiness deadline; separate from agent/request timeouts
     pollIntervalMs: 3000

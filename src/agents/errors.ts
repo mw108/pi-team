@@ -25,6 +25,37 @@ export class AgentTimeoutError extends Error {
   }
 }
 
+export class ProviderRequestDeadlineError extends Error {
+  readonly category = "provider_request_deadline";
+  constructor(
+    readonly agentId: Role,
+    readonly deadlineMs: number,
+    readonly attempt: number,
+  ) {
+    super(
+      `${agentId} provider request exceeded its hard deadline after ${deadlineMs} ms (run ${attempt}). Next: /team-retry ${agentId}`,
+    );
+    this.name = "ProviderRequestDeadlineError";
+  }
+}
+
+export class ReasoningStallError extends Error {
+  readonly category = "reasoning_stall";
+  constructor(
+    readonly agentId: Role,
+    readonly thresholdMs: number,
+    readonly attempt: number,
+    readonly recoveryFailed = false,
+  ) {
+    super(
+      recoveryFailed
+        ? `${agentId} finalization failed after reasoning-stall recovery. The provider repeatedly exceeded its reasoning budget. Next: /team-retry ${agentId}`
+        : `${agentId} reasoning stall detected after ${thresholdMs} ms without a tool call or final response (run ${attempt}). Next: /team-retry ${agentId}`,
+    );
+    this.name = "ReasoningStallError";
+  }
+}
+
 export class AgentDoomLoopError extends Error {
   readonly category = "doom_loop";
   constructor(
@@ -88,6 +119,8 @@ export type FailureCategory =
   | "agent_output"
   | "cancelled"
   | "timeout"
+  | "provider_request_deadline"
+  | "reasoning_stall"
   | "http_503"
   | "rate_limit"
   | "network"
@@ -99,6 +132,9 @@ export function classifyFailure(error: unknown): FailureCategory {
   if (error instanceof AgentOutputError) return "agent_output";
   if (error instanceof AgentDoomLoopError) return "doom_loop";
   if (error instanceof AgentTimeoutError) return "timeout";
+  if (error instanceof ProviderRequestDeadlineError)
+    return "provider_request_deadline";
+  if (error instanceof ReasoningStallError) return "reasoning_stall";
   const value = error as { status?: number; code?: string; name?: string };
   if (value?.status === 429 || value?.code === "429") return "rate_limit";
   if (value?.status === 503 || value?.code === "503") return "http_503";
@@ -130,6 +166,10 @@ export function explainFailure(error: unknown): {
     return { category, matchedRule: `AgentOutputError:${error.kind}` };
   if (error instanceof AgentTimeoutError)
     return { category, matchedRule: "AgentTimeoutError" };
+  if (error instanceof ProviderRequestDeadlineError)
+    return { category, matchedRule: "ProviderRequestDeadlineError" };
+  if (error instanceof ReasoningStallError)
+    return { category, matchedRule: "ReasoningStallError" };
   const value = error as { status?: number; code?: string };
   if (value?.status === 429 || value?.code === "429")
     return { category, matchedRule: "status/code=429" };
@@ -176,6 +216,10 @@ export function safeFailureLabel(
               .padStart(2, "0")}`
           : ""
       }`;
+    case "provider_request_deadline":
+      return `provider request hard deadline${timeoutMs ? ` after ${Math.floor(timeoutMs / 60000)}m` : ""}`;
+    case "reasoning_stall":
+      return `reasoning stall${timeoutMs ? ` after ${Math.floor(timeoutMs / 60000)}m without a tool call or final response` : ""}`;
     case "http_503":
       return "HTTP 503";
     case "rate_limit":

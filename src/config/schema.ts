@@ -61,6 +61,8 @@ const agent = z
       .union([z.literal(0), z.number().int().min(1000).max(86400000)])
       .optional(),
     requestTimeoutMs: z.number().int().min(0).optional(),
+    providerRequestDeadlineMs: z.number().int().min(0).max(86400000).optional(),
+    reasoningStallTimeoutMs: z.number().int().min(0).max(86400000).optional(),
     maxToolCalls: z.number().int().min(0).optional(),
     doomLoop: z
       .object({
@@ -183,6 +185,18 @@ export const configSchema = z
           .union([z.literal(0), z.number().int().min(1000).max(86400000)])
           .default(300000),
         requestTimeoutMs: z.number().int().min(0).optional(),
+        providerRequestDeadlineMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(86400000)
+          .optional(),
+        reasoningStallTimeoutMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(86400000)
+          .optional(),
         modelPreflight: z
           .object({
             coldStartTimeoutMs: z

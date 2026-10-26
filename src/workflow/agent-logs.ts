@@ -359,6 +359,16 @@ export class AgentLogStore {
         label = `model warmup completed after ${seconds(event.durationMs)}`;
       if (event.type === "model_preflight_warmup_failed")
         label = `model warmup failed: ${event.message}`;
+      if (event.type === "provider_request_deadline_exceeded")
+        label = `provider request ${event.providerRequest} exceeded its hard deadline after ${seconds(event.requestDurationMs)}`;
+      if (event.type === "reasoning_stall_detected")
+        label = `reasoning stall detected after ${seconds(event.reasoningOnlyDurationMs)} without a tool call or final response`;
+      if (event.type === "reasoning_stall_recovery_started")
+        label = "reasoning-stall recovery started";
+      if (event.type === "reasoning_stall_recovery_succeeded")
+        label = "reasoning-stall recovery succeeded";
+      if (event.type === "reasoning_stall_recovery_failed")
+        label = "reasoning-stall recovery failed";
       if (event.type === "provider_request_context")
         lines.push(
           `${time} provider request ${event.providerRequest} context · ${(event.tools as unknown[] | undefined)?.length ?? 0} tools`,
@@ -379,6 +389,16 @@ export class AgentLogStore {
             | {
                 requestTimeoutMs?:
                   number | { value: number; source: string; mode?: string };
+                providerRequestDeadlineMs?: {
+                  value: number;
+                  source: string;
+                  mode?: string;
+                };
+                reasoningStallTimeoutMs?: {
+                  value: number;
+                  source: string;
+                  mode?: string;
+                };
               }
             | undefined
         )?.requestTimeoutMs;
@@ -390,6 +410,36 @@ export class AgentLogStore {
         if (requestTimeout)
           lines.push(
             `  provider request timeout: ${requestTimeout.mode === "unlimited" ? "unlimited" : seconds(requestTimeout.value)} (${requestTimeout.source})`,
+          );
+        const hardDeadline = (
+          event.providerTimeouts as
+            | {
+                providerRequestDeadlineMs?: {
+                  value: number;
+                  source: string;
+                  mode?: string;
+                };
+              }
+            | undefined
+        )?.providerRequestDeadlineMs;
+        if (hardDeadline)
+          lines.push(
+            `  provider hard deadline: ${hardDeadline.mode === "disabled" ? "disabled" : seconds(hardDeadline.value)} (${hardDeadline.source})`,
+          );
+        const stallTimeout = (
+          event.providerTimeouts as
+            | {
+                reasoningStallTimeoutMs?: {
+                  value: number;
+                  source: string;
+                  mode?: string;
+                };
+              }
+            | undefined
+        )?.reasoningStallTimeoutMs;
+        if (stallTimeout)
+          lines.push(
+            `  reasoning stall threshold: ${stallTimeout.mode === "disabled" ? "disabled" : seconds(stallTimeout.value)} (${stallTimeout.source})`,
           );
         if (event.agentTimeoutMs !== undefined)
           lines.push(

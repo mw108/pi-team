@@ -30,6 +30,10 @@ import {
   type ToolCallLogLevel,
 } from "./provider-tool-calls.ts";
 import { providerRequestContext } from "./request-context.ts";
+import type {
+  ResolvedProviderDuration,
+  ResolvedProviderRequestLimits,
+} from "./provider-request-limits.ts";
 
 export interface ResolvedNetworkRetry {
   maxRetries: number; // 0 means unlimited.
@@ -74,7 +78,12 @@ export type ProviderRequestEvent = {
     | "provider_progress"
     | "provider_tool_call_raw"
     | "textual_tool_call_recovered"
-    | "tool_call_burst_stream_cutoff";
+    | "tool_call_burst_stream_cutoff"
+    | "provider_request_deadline_exceeded"
+    | "reasoning_stall_detected"
+    | "reasoning_stall_recovery_started"
+    | "reasoning_stall_recovery_succeeded"
+    | "reasoning_stall_recovery_failed";
   providerRequest: number;
   provider: string;
   model: string;
@@ -95,12 +104,34 @@ export type ProviderRequestEvent = {
   observed?: number;
   limit?: number;
   outcome?: "doom_loop_cutoff";
+  cancellationReason?: "provider_request_deadline" | "reasoning_stall";
+  deadlineMs?: number;
+  reasoningStallThresholdMs?: number;
+  reasoningOnlyDurationMs?: number;
+  reasoningStreamEventCount?: number;
+  toolCallStarted?: boolean;
+  finalResponseStarted?: boolean;
+  recoveryOutcome?: "started" | "succeeded" | "failed";
   providerTimeouts?: {
     requestTimeoutMs?: ResolvedRequestTimeout | number;
+    providerRequestDeadlineMs?: ResolvedProviderDuration;
+    reasoningStallTimeoutMs?: ResolvedProviderDuration;
     maxRetries?: number;
     httpIdleTimeoutMs?: { value: number; source: string };
   };
 } & Partial<Omit<RawToolCallEvent, "type">>;
+
+export type ProviderRequestCutoff = ProviderRequestEvent & {
+  type: "provider_request_deadline_exceeded" | "reasoning_stall_detected";
+  cancellationReason: "provider_request_deadline" | "reasoning_stall";
+};
+
+type Timer = ReturnType<typeof setTimeout>;
+export interface ProviderWatchdogOptions {
+  now?: () => number;
+  setTimer?: (callback: () => void, delayMs: number) => Timer;
+  clearTimer?: (timer: Timer) => void;
+}
 
 export type ProviderProgressState =
   "waiting" | "generating" | "reasoning" | "tool_calling";
@@ -300,8 +331,16 @@ export function configureNetworkRetry(
   ) => void,
   rawToolCallLevel: ToolCallLogLevel = "summary",
   isOutputRepair?: () => boolean,
+  requestLimits?: ResolvedProviderRequestLimits,
+  onRequestCutoff?: (event: ProviderRequestCutoff) => void,
+  watchdog: ProviderWatchdogOptions = {},
 ): void {
   const original = runtime.streamSimple.bind(runtime);
+  // Callers that inject a clock for deterministic diagnostics keep one time
+  // domain; production supplies performance.now explicitly from PiRunner.
+  const monotonicNow = watchdog.now ?? now;
+  const setWatchdogTimer = watchdog.setTimer ?? setTimeout;
+  const clearWatchdogTimer = watchdog.clearTimer ?? clearTimeout;
   let requestNumber = 0;
   runtime.streamSimple = (model, context, options) => {
     // Keep the host's executable tool registry intact during output repair.
@@ -358,6 +397,7 @@ export function configureNetworkRetry(
         let retryAfter: number | undefined;
         const providerRequest = ++requestNumber;
         const requestStarted = now();
+        const requestStartedMonotonic = monotonicNow();
         const requestStartedAt = new Date(requestStarted).toISOString();
         const identity = {
           providerRequest,
@@ -414,6 +454,13 @@ export function configureNetworkRetry(
               ? { requestTimeoutMs: options.timeoutMs }
               : {}),
           maxRetries: 0,
+          ...(requestLimits
+            ? {
+                providerRequestDeadlineMs:
+                  requestLimits.providerRequestDeadlineMs,
+                reasoningStallTimeoutMs: requestLimits.reasoningStallTimeoutMs,
+              }
+            : {}),
         };
         if (rawToolCallLevel !== "off") {
           try {
@@ -432,14 +479,120 @@ export function configureNetworkRetry(
           providerTimeouts,
         });
         let rawError: unknown;
-        let firstEventAt: number | undefined;
-        let lastActivityAt: number | undefined;
+        let firstEventMonotonic: number | undefined;
+        let lastActivityMonotonic: number | undefined;
         let responseToolCallCount = 0;
         const responseToolCallIndices = new Set<number>();
         let controlledCutoff = false;
-        const requestAbort = streamGuard ? new AbortController() : undefined;
-        const abortRequestFromParent = () =>
-          requestAbort?.abort(signal?.reason);
+        let reasoningStartedAt: number | undefined;
+        let reasoningStreamEventCount = 0;
+        let toolCallStarted = false;
+        let finalResponseStarted = false;
+        let cutoff: ProviderRequestCutoff | undefined;
+        let deadlineTimer: Timer | undefined;
+        let reasoningTimer: Timer | undefined;
+        type StopReason = "provider_request_deadline" | "reasoning_stall";
+        let resolveStop!: (reason: StopReason) => void;
+        let stopResolved = false;
+        const stop = new Promise<StopReason>((resolve) => {
+          resolveStop = resolve;
+        });
+        const requestAbort = new AbortController();
+        const stopRequest = (reason: StopReason) => {
+          if (stopResolved) return;
+          stopResolved = true;
+          requestAbort.abort(reason);
+          resolveStop(reason);
+        };
+        const emitCutoff = (
+          type:
+            "provider_request_deadline_exceeded" | "reasoning_stall_detected",
+          cancellationReason: "provider_request_deadline" | "reasoning_stall",
+        ) => {
+          if (cutoff || controlledCutoff || signal?.aborted) return;
+          const at = monotonicNow();
+          cutoff = {
+            type,
+            ...identity,
+            requestDurationMs: Math.max(0, at - requestStartedMonotonic),
+            ...(firstEventMonotonic === undefined
+              ? {}
+              : {
+                  timeToFirstEventMs: Math.max(
+                    0,
+                    firstEventMonotonic - requestStartedMonotonic,
+                  ),
+                }),
+            ...(lastActivityMonotonic === undefined
+              ? {}
+              : {
+                  timeSinceLastActivityMs: Math.max(
+                    0,
+                    at - lastActivityMonotonic,
+                  ),
+                }),
+            cancellationReason,
+            ...(cancellationReason === "provider_request_deadline"
+              ? {
+                  deadlineMs: requestLimits!.providerRequestDeadlineMs.value,
+                }
+              : {
+                  reasoningStallThresholdMs:
+                    requestLimits!.reasoningStallTimeoutMs.value,
+                }),
+            ...(reasoningStartedAt === undefined
+              ? {}
+              : {
+                  reasoningOnlyDurationMs: Math.max(0, at - reasoningStartedAt),
+                }),
+            reasoningStreamEventCount,
+            streamEventCount: progress.streamEventCount,
+            state: progress.state,
+            toolCallStarted,
+            finalResponseStarted,
+            providerTimeouts,
+          };
+          try {
+            observeRequest?.(cutoff);
+          } catch {
+            // Diagnostics must not prevent the cutoff.
+          }
+          try {
+            onRequestCutoff?.(cutoff);
+          } catch {
+            // Recovery bookkeeping must not prevent cancellation.
+          }
+          stopRequest(cancellationReason);
+        };
+        const startReasoningTimer = () => {
+          if (
+            reasoningStartedAt !== undefined ||
+            !requestLimits?.reasoningStallTimeoutMs.value
+          )
+            return;
+          reasoningStartedAt = monotonicNow();
+          reasoningTimer = setWatchdogTimer(
+            () => emitCutoff("reasoning_stall_detected", "reasoning_stall"),
+            requestLimits.reasoningStallTimeoutMs.value,
+          );
+          reasoningTimer.unref?.();
+        };
+        const stopReasoningTimer = () => {
+          if (reasoningTimer) clearWatchdogTimer(reasoningTimer);
+          reasoningTimer = undefined;
+        };
+        if (requestLimits?.providerRequestDeadlineMs.value) {
+          deadlineTimer = setWatchdogTimer(
+            () =>
+              emitCutoff(
+                "provider_request_deadline_exceeded",
+                "provider_request_deadline",
+              ),
+            requestLimits.providerRequestDeadlineMs.value,
+          );
+          deadlineTimer.unref?.();
+        }
+        const abortRequestFromParent = () => requestAbort.abort(signal?.reason);
         signal?.addEventListener("abort", abortRequestFromParent, {
           once: true,
         });
@@ -449,7 +602,7 @@ export function configureNetworkRetry(
           ...(requestTimeout
             ? { timeoutMs: piRequestTimeoutMs(requestTimeout) }
             : {}),
-          signal: requestAbort?.signal ?? signal,
+          signal: requestAbort.signal,
           maxRetries: 0,
           onProviderStreamEvent: async (
             data: unknown,
@@ -464,9 +617,10 @@ export function configureNetworkRetry(
               )
                 rawToolCalls.observe(data);
               const at = now();
+              const monotonicAt = monotonicNow();
               progress.firstActivityAt ??= at;
               progress.lastActivityAt = at;
-              lastActivityAt = at;
+              lastActivityMonotonic = monotonicAt;
               publishProgress();
             } catch {
               // Raw provider data is never required for agent execution.
@@ -509,11 +663,25 @@ export function configureNetworkRetry(
         };
         let events: AssistantMessageEvent[] = [];
         try {
-          for await (const event of original(
+          const providerStream = original(
             model,
             requestContext,
             requestOptions,
-          )) {
+          );
+          const iterator = providerStream[Symbol.asyncIterator]();
+          for (;;) {
+            const next = await Promise.race([
+              iterator
+                .next()
+                .then((value) => ({ kind: "event" as const, value })),
+              stop.then((reason) => ({ kind: "stop" as const, reason })),
+            ]);
+            if (next.kind === "stop") {
+              void Promise.resolve(iterator.return?.()).catch(() => {});
+              break;
+            }
+            if (next.value.done) break;
+            const event = next.value.value;
             if (
               event.type === "toolcall_start" &&
               streamGuard &&
@@ -529,7 +697,7 @@ export function configureNetworkRetry(
                   (limit > 0 && responseToolCallCount > limit)
                 ) {
                   controlledCutoff = true;
-                  requestAbort?.abort("doom_loop_tool_call_burst");
+                  requestAbort.abort("doom_loop_tool_call_burst");
                   await streamGuard.cutoff(
                     providerRequest,
                     responseToolCallCount,
@@ -540,6 +708,7 @@ export function configureNetworkRetry(
               }
             }
             const at = now();
+            const monotonicAt = monotonicNow();
             // Pi's "start" is emitted before an HTTP response. Terminal
             // "error"/"done" events are outcomes, not stream activity.
             if (
@@ -547,16 +716,26 @@ export function configureNetworkRetry(
               event.type !== "error" &&
               event.type !== "done"
             ) {
-              firstEventAt ??= at;
-              lastActivityAt = at;
+              firstEventMonotonic ??= monotonicAt;
+              lastActivityMonotonic = monotonicAt;
               progress.firstActivityAt ??= at;
               progress.lastActivityAt = at;
               progress.streamEventCount++;
-              if (event.type.startsWith("thinking_"))
+              if (event.type.startsWith("thinking_")) {
                 progress.state = "reasoning";
-              else if (event.type.startsWith("toolcall_"))
+                reasoningStreamEventCount++;
+                startReasoningTimer();
+              } else if (event.type.startsWith("toolcall_")) {
                 progress.state = "tool_calling";
-              else progress.state = "generating";
+                if (event.type === "toolcall_start") toolCallStarted = true;
+                if (event.type === "toolcall_end") stopReasoningTimer();
+              } else {
+                progress.state = "generating";
+                if (event.type.startsWith("text_")) {
+                  finalResponseStarted = true;
+                  stopReasoningTimer();
+                }
+              }
               publishProgress();
             }
             events.push(event);
@@ -570,9 +749,21 @@ export function configureNetworkRetry(
             ];
           }
         }
+        if (cutoff)
+          events = [
+            providerErrorEvent(
+              model,
+              cutoff.cancellationReason === "reasoning_stall"
+                ? `REASONING_STALL: ${cutoff.reasoningStallThresholdMs} ms without a tool call or final response`
+                : `PROVIDER_REQUEST_DEADLINE: ${cutoff.deadlineMs} ms absolute request deadline exceeded`,
+              true,
+            ),
+          ];
         if (controlledCutoff && signal?.aborted)
           events = [providerErrorEvent(model, "Request aborted", true)];
         signal?.removeEventListener("abort", abortRequestFromParent);
+        if (deadlineTimer) clearWatchdogTimer(deadlineTimer);
+        stopReasoningTimer();
         try {
           stopProgress();
         } catch {
@@ -600,15 +791,29 @@ export function configureNetworkRetry(
           for (const call of rawToolCalls.events(undefined, true))
             observeRequest?.({ ...rawIdentity, ...call });
         }
-        const requestDurationMs = now() - requestStarted;
+        const requestEndedMonotonic = monotonicNow();
+        const requestDurationMs = Math.max(
+          0,
+          requestEndedMonotonic - requestStartedMonotonic,
+        );
         const timing = {
           requestDurationMs,
-          ...(firstEventAt === undefined
+          ...(firstEventMonotonic === undefined
             ? {}
-            : { timeToFirstEventMs: firstEventAt - requestStarted }),
-          ...(lastActivityAt === undefined
+            : {
+                timeToFirstEventMs: Math.max(
+                  0,
+                  firstEventMonotonic - requestStartedMonotonic,
+                ),
+              }),
+          ...(lastActivityMonotonic === undefined
             ? {}
-            : { timeSinceLastActivityMs: now() - lastActivityAt }),
+            : {
+                timeSinceLastActivityMs: Math.max(
+                  0,
+                  requestEndedMonotonic - lastActivityMonotonic,
+                ),
+              }),
         };
         if (controlledCutoff && !signal?.aborted) {
           observeRequest?.({

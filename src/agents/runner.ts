@@ -10,6 +10,7 @@ import {
 import { z } from "zod";
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { agentDir } from "../config/loader.ts";
 import { commandSchema } from "../config/schema.ts";
@@ -73,6 +74,8 @@ import {
   AgentOutputError,
   AgentDoomLoopError,
   AgentTimeoutError,
+  ProviderRequestDeadlineError,
+  ReasoningStallError,
   getAgentTimeoutMs,
 } from "./errors.ts";
 import {
@@ -88,7 +91,9 @@ import {
   type NetworkRetryEvent,
   type ProviderRequestEvent,
   type ProviderProgressUpdate,
+  type ProviderRequestCutoff,
 } from "./network-retry.ts";
+import { resolveProviderRequestLimits } from "./provider-request-limits.ts";
 import {
   ensureRouterModelReady,
   type ModelPreflightEvent,
@@ -354,6 +359,7 @@ export class PiRunner implements AgentRunner {
     ) => void,
     contractApproval?: RuntimeContractApprover,
     mutationFailure?: { error?: unknown },
+    requestCutoff?: (event: ProviderRequestCutoff) => void,
     preflightLifecycle?: { start(): void; end(): void },
   ): Promise<AgentSession> {
     const config = effectiveConfig(s, role),
@@ -437,6 +443,9 @@ export class PiRunner implements AgentRunner {
       normalizedResponse,
       config.logging.agentLogs.level,
       () => outputRepairActive,
+      resolveProviderRequestLimits(config, role),
+      requestCutoff,
+      { now: performance.now.bind(performance) },
     );
     const paths: string[] = [],
       factories: any[] = [];
@@ -786,6 +795,7 @@ export class PiRunner implements AgentRunner {
       if (verified) state.verifiedCommandResults.push(verified);
     };
     let executionSignal: AbortSignal | undefined;
+    let latestRequestCutoff: ProviderRequestCutoff | undefined;
     let timeoutStartedAt: number | undefined;
     let timedOut = false;
     let agentTimeoutElapsed = (): number | null => null;
@@ -911,6 +921,9 @@ export class PiRunner implements AgentRunner {
       normalizedResponse,
       pausableContractApproval,
       mutationFailure,
+      (event) => {
+        latestRequestCutoff = event;
+      },
       {
         start: () => preflightPauses.push(pauseAgentTimeout("model_preflight")),
         end: () => preflightPauses.pop()?.(),
@@ -955,6 +968,50 @@ export class PiRunner implements AgentRunner {
     agentTimeoutRemaining = () => timeoutBudget.remaining();
     timeoutBudget.start();
     signal?.addEventListener("abort", abort, { once: true });
+    let reasoningStallRecovery: ProviderRequestCutoff | undefined;
+    const emitReasoningRecovery = (
+      type:
+        | "reasoning_stall_recovery_started"
+        | "reasoning_stall_recovery_succeeded"
+        | "reasoning_stall_recovery_failed",
+    ) => {
+      if (!reasoningStallRecovery) return;
+      providerEvent?.({
+        ...reasoningStallRecovery,
+        type,
+        recoveryOutcome:
+          type === "reasoning_stall_recovery_started"
+            ? "started"
+            : type === "reasoning_stall_recovery_succeeded"
+              ? "succeeded"
+              : "failed",
+      });
+    };
+    const limitError = (
+      cutoff: ProviderRequestCutoff,
+      recoveryFailed = false,
+    ) =>
+      cutoff.cancellationReason === "provider_request_deadline"
+        ? new ProviderRequestDeadlineError(
+            role,
+            cutoff.deadlineMs ??
+              resolveProviderRequestLimits(effectiveConfig(state), role)
+                .providerRequestDeadlineMs.value,
+            attempt,
+          )
+        : new ReasoningStallError(
+            role,
+            cutoff.reasoningStallThresholdMs ??
+              resolveProviderRequestLimits(effectiveConfig(state), role)
+                .reasoningStallTimeoutMs.value,
+            attempt,
+            recoveryFailed,
+          );
+    const consumeRequestCutoff = (): ProviderRequestCutoff | undefined => {
+      const cutoff = latestRequestCutoff;
+      latestRequestCutoff = undefined;
+      return cutoff;
+    };
     try {
       if (signal?.aborted) throw new Error("Workflow interrupted");
       const input = await contextFor(role, state);
@@ -1041,6 +1098,45 @@ export class PiRunner implements AgentRunner {
       await session.prompt(JSON.stringify(sanitizeContextForProvider(input)), {
         expandPromptTemplates: false,
       });
+      const initialCutoff = consumeRequestCutoff();
+      if (initialCutoff?.cancellationReason === "provider_request_deadline")
+        throw limitError(initialCutoff);
+      if (initialCutoff?.cancellationReason === "reasoning_stall") {
+        reasoningStallRecovery = initialCutoff;
+        emitReasoningRecovery("reasoning_stall_recovery_started");
+        const prepareOutputRepair = this.outputRepair.get(session);
+        if (prepareOutputRepair) prepareOutputRepair();
+        else session.setActiveToolsByName([]);
+        await session.prompt(
+          `Your previous response exceeded the allowed reasoning budget without producing a tool call or final answer.\n\nDo not repeat the previous investigation. Use only evidence already collected in this session. Return the required complete structured result now. If evidence is insufficient, report limitations or an incomplete/blocked assessment explicitly. Do not invent results, claim unperformed tests, or mark a security assessment successful merely because the reasoning budget expired. Tools are disabled during this one finalization attempt.`,
+          { expandPromptTemplates: false },
+        );
+        const recoveryCutoff = consumeRequestCutoff();
+        if (recoveryCutoff) {
+          emitReasoningRecovery("reasoning_stall_recovery_failed");
+          throw limitError(
+            recoveryCutoff,
+            recoveryCutoff.cancellationReason === "reasoning_stall",
+          );
+        }
+        const recoveryMessage = session.messages
+          .filter((message) => message.role === "assistant")
+          .at(-1) as any;
+        if (
+          recoveryMessage?.stopReason === "error" ||
+          recoveryMessage?.stopReason === "aborted"
+        ) {
+          emitReasoningRecovery("reasoning_stall_recovery_failed");
+          throw new ReasoningStallError(
+            role,
+            initialCutoff.reasoningStallThresholdMs ??
+              resolveProviderRequestLimits(effectiveConfig(state), role)
+                .reasoningStallTimeoutMs.value,
+            attempt,
+            true,
+          );
+        }
+      }
       if (mutationFailure.error)
         throw new MutationStatePersistenceError(mutationFailure.error);
       if (timedOut && timeoutMs !== undefined)
@@ -1112,6 +1208,17 @@ export class PiRunner implements AgentRunner {
             break;
           } catch (error) {
             if (!(error instanceof AgentOutputError)) throw error;
+            if (reasoningStallRecovery) {
+              emitReasoningRecovery("reasoning_stall_recovery_failed");
+              throw new ReasoningStallError(
+                role,
+                reasoningStallRecovery.reasoningStallThresholdMs ??
+                  resolveProviderRequestLimits(effectiveConfig(state), role)
+                    .reasoningStallTimeoutMs.value,
+                attempt,
+                true,
+              );
+            }
             const diagnostic = redactVisibleText(
               error.diagnostic ?? error.message,
             ).slice(0, 1500);
@@ -1184,6 +1291,37 @@ export class PiRunner implements AgentRunner {
         }
       };
       await validateFinal();
+      if (reasoningStallRecovery && role === "pentester") {
+        if (result.status === "PASS")
+          result = {
+            status: "BLOCKED",
+            findings: [],
+            coverage: result.coverage,
+            limitations: [
+              ...result.limitations,
+              "The provider reasoning budget expired before the assessment completed; PASS cannot be established from an interrupted assessment.",
+            ],
+            blocker: {
+              code: "REASONING_STALL_INCOMPLETE",
+              message:
+                "Pen Tester could not complete the assessment because the provider exceeded its reasoning budget.",
+              remediation: `Inspect the attempt log and run /team-retry ${role}.`,
+            },
+          };
+      }
+      if (reasoningStallRecovery && role === "securityReviewer") {
+        emitReasoningRecovery("reasoning_stall_recovery_failed");
+        throw new ReasoningStallError(
+          role,
+          reasoningStallRecovery.reasoningStallThresholdMs ??
+            resolveProviderRequestLimits(effectiveConfig(state), role)
+              .reasoningStallTimeoutMs.value,
+          attempt,
+          true,
+        );
+      }
+      if (reasoningStallRecovery)
+        emitReasoningRecovery("reasoning_stall_recovery_succeeded");
       if (
         role === "tester" &&
         result.type === "QUESTION_REQUEST" &&
