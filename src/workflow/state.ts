@@ -53,6 +53,8 @@ export const approvalSchema = z.object({
     "sensitivePaths",
     "orphanedImplementation",
     "securityRisk",
+    "pentestUnavailability",
+    "pentestContractClarification",
     "credentialFinding",
     "technicalRecovery",
   ]),
@@ -110,6 +112,47 @@ export const securityRiskReviewSchema = z.object({
   reviewedAt: z.string().optional(),
 });
 export type SecurityRiskReview = z.infer<typeof securityRiskReviewSchema>;
+export const pentestUnavailabilityReviewSchema = z
+  .object({
+    status: z.enum(["pending", "ignored", "skipped", "stopped"]),
+    resultHash: z.string().regex(/^[a-f0-9]{64}$/),
+    scopeHash: z.string().regex(/^[a-f0-9]{64}$/),
+    contractHash: z.string().regex(/^[a-f0-9]{64}$/),
+    pentesterAttempt: z.number().int().positive(),
+    requestedAt: z.string().datetime(),
+    decidedAt: z.string().datetime().optional(),
+    transitionedAt: z.string().datetime().optional(),
+    affectedTests: z.array(
+      z
+        .object({
+          id: z.string(),
+          capabilityId: z.string(),
+          description: z.string(),
+          requiredCapability: z.string(),
+          testMethod: z.enum(["HTTP", "COMMAND", "STATIC", "OTHER"]),
+          unavailableBecause: z.string(),
+          alternativeEvidence: z.string().optional(),
+          evidenceIds: z.array(z.string()),
+        })
+        .strict(),
+    ),
+  })
+  .strict()
+  .superRefine((review, ctx) => {
+    if (review.status === "pending" && review.decidedAt)
+      ctx.addIssue({
+        code: "custom",
+        message: "Pending Pentest review cannot have decidedAt",
+      });
+    if (review.status !== "pending" && !review.decidedAt)
+      ctx.addIssue({
+        code: "custom",
+        message: "Resolved Pentest review requires decidedAt",
+      });
+  });
+export type PentestUnavailabilityReview = z.infer<
+  typeof pentestUnavailabilityReviewSchema
+>;
 export const credentialFindingIdentitySchema = z
   .object({
     scanner: z.enum(["builtin", "gitleaks"]),
@@ -288,6 +331,7 @@ export const stateSchema = z.object({
   ),
   pendingQuestion: pendingQuestionSchema.optional(),
   securityRiskReview: securityRiskReviewSchema.optional(),
+  pentestUnavailabilityReview: pentestUnavailabilityReviewSchema.optional(),
   pendingResearchQuestions: z.array(z.string().min(1)).optional(),
   researchClarificationPending: z.boolean().optional(),
   resumePhase: z.enum(phases).optional(),
@@ -911,6 +955,10 @@ export function sanitizeWorkflowStateText(state: WorkflowState): void {
       state.pendingResearchQuestions.map(redactVisibleText);
   if (state.pendingApproval)
     state.pendingApproval = redactStructured(state.pendingApproval);
+  if (state.pentestUnavailabilityReview)
+    state.pentestUnavailabilityReview = redactStructured(
+      state.pentestUnavailabilityReview,
+    );
   if (state.pendingCredentialFinding?.excerpt)
     state.pendingCredentialFinding.excerpt = redactVisibleText(
       state.pendingCredentialFinding.excerpt,

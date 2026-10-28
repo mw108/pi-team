@@ -27,6 +27,7 @@ import { resolveRequestTimeout } from "../agents/request-timeout.ts";
 import {
   parseResult,
   contractSchema,
+  pentestSchema,
   type Role,
   type Question,
 } from "../agents/schemas.ts";
@@ -104,6 +105,10 @@ import {
   type CredentialFindingIdentity,
 } from "./state.ts";
 import { fix, phaseRoles, getPhaseRoles, transition } from "./router.ts";
+import {
+  pentestUnavailabilityRequest,
+  pentestUnavailableResultHash,
+} from "./pentest-unavailability.ts";
 import {
   currentSecurityRiskReview,
   isLegacySecurityRiskBlock,
@@ -639,6 +644,73 @@ export class WorkflowEngine {
       delete state.securityRiskReview;
     state.phase = "ABORTED";
     record(state, "workflow_aborted", reason);
+  }
+  private applyRecordedPentestDecision(state: WorkflowState) {
+    const review = state.pentestUnavailabilityReview;
+    if (!review || review.status === "pending" || review.transitionedAt) return;
+    const result = pentestSchema.parse(state.results.pentester);
+    if (
+      result.status !== "PENTEST_UNAVAILABLE" ||
+      pentestUnavailableResultHash(result) !== review.resultHash
+    )
+      throw new Error(
+        "Pentest evidence changed after the user decision; retry the Pen Tester",
+      );
+    const transitionedAt = new Date().toISOString();
+    if (review.status === "ignored") {
+      state.results.previous_pentester = result;
+      state.phase = "PENTEST";
+      record(
+        state,
+        "pentest_limitation_ignored",
+        JSON.stringify({
+          resultHash: review.resultHash,
+          affectedTests: review.affectedTests.map((test) => test.id),
+          resultingTransition: "PENTEST",
+        }),
+      );
+    } else if (review.status === "skipped") {
+      state.results.pentester = pentestSchema.parse({
+        status: "PENTEST_SKIPPED_BY_USER",
+        findings: result.findings,
+        coverage: result.coverage,
+        limitations: result.limitations,
+        affectedTests: result.affectedTests,
+        userDecision: {
+          action: "SKIP_PENTEST_FOR_WORKFLOW",
+          decidedAt: review.decidedAt,
+          resultHash: review.resultHash,
+        },
+      });
+      state.phase = "SECURITY_REVIEW";
+      record(
+        state,
+        "pentest_skipped_by_user",
+        JSON.stringify({
+          resultHash: review.resultHash,
+          affectedTests: review.affectedTests.map((test) => test.id),
+          resultingTransition: "SECURITY_REVIEW",
+        }),
+      );
+    } else {
+      state.phase = "ABORTED";
+      delete state.inFlight;
+      delete state.manualRetry;
+      record(
+        state,
+        "workflow_stopped_by_user",
+        JSON.stringify({
+          reason: "Pentest coverage limitation",
+          resultHash: review.resultHash,
+          affectedTests: review.affectedTests.map((test) => test.id),
+          resultingTransition: "ABORTED",
+        }),
+      );
+    }
+    delete state.pendingApproval;
+    delete state.resumePhase;
+    delete state.blocker;
+    review.transitionedAt = transitionedAt;
   }
   retryConfirmation(state: WorkflowState, role: Role) {
     if (
@@ -1300,6 +1372,8 @@ export class WorkflowEngine {
       );
   }
   private invalidateDependents(state: WorkflowState, role: Role) {
+    if (role === "pentester" || this.dependentRoles(role).includes("pentester"))
+      delete state.pentestUnavailabilityReview;
     if (
       role === "securityReviewer" ||
       this.dependentRoles(role).includes("securityReviewer")
@@ -3544,6 +3618,16 @@ export class WorkflowEngine {
             continue;
           }
           if (
+            s.pentestUnavailabilityReview &&
+            s.pentestUnavailabilityReview.status !== "pending" &&
+            !s.pentestUnavailabilityReview.transitionedAt &&
+            !s.pendingApproval
+          ) {
+            this.applyRecordedPentestDecision(s);
+            await this.store.save(s);
+            continue;
+          }
+          if (
             s.securityRiskReview &&
             !s.pendingApproval &&
             !s.pendingQuestion &&
@@ -3709,7 +3793,122 @@ export class WorkflowEngine {
               "approval_submitted",
               JSON.stringify({ kind: request.kind, selected }),
             );
-            if (request.kind === "technicalRecovery") {
+            if (request.kind === "pentestContractClarification") {
+              if (
+                selected.length !== 1 ||
+                !["required", "not_required", "stop"].includes(selected[0])
+              )
+                throw new Error(
+                  "Pentest Contract clarification requires exactly one listed action",
+                );
+              const result = pentestSchema.parse(s.results.pentester);
+              if (result.status !== "PENTEST_UNAVAILABLE")
+                throw new Error(
+                  "Pentest evidence changed while Contract clarification was pending",
+                );
+              const decision = selected[0];
+              record(
+                s,
+                "pentest_contract_classification_recorded",
+                JSON.stringify({
+                  workflowId: s.id,
+                  decision,
+                  affectedTests: result.affectedTests?.map((test) => test.id),
+                  capabilityIds: result.affectedTests?.map(
+                    (test) => test.capabilityId,
+                  ),
+                }),
+              );
+              delete s.pendingApproval;
+              delete s.resumePhase;
+              if (decision === "required") {
+                s.phase = "PENTEST";
+                fix(
+                  s,
+                  "FIX_LOCAL",
+                  "The user confirmed that the unavailable Pentest capability is required by the Implementation Contract.",
+                );
+              } else if (decision === "not_required") {
+                const attempt =
+                  s.history.findLast(
+                    (event) =>
+                      event.event === "agent_attempt_started" &&
+                      event.meta?.agent === "pentester",
+                  )?.meta?.attempt ?? 1;
+                s.pendingApproval = pentestUnavailabilityRequest(
+                  s,
+                  result,
+                  attempt,
+                );
+                s.resumePhase = "PENTEST";
+                s.phase = "WAITING_USER";
+              } else {
+                s.phase = "ABORTED";
+                record(
+                  s,
+                  "workflow_stopped_by_user",
+                  JSON.stringify({
+                    reason: "Unclear Pentest Contract requirement",
+                    resultingTransition: "ABORTED",
+                  }),
+                );
+              }
+              await this.store.save(s);
+              continue;
+            } else if (request.kind === "pentestUnavailability") {
+              if (
+                selected.length !== 1 ||
+                !["ignore", "skip", "stop"].includes(selected[0])
+              )
+                throw new Error(
+                  "Pentest availability decision requires exactly one listed action",
+                );
+              const review = s.pentestUnavailabilityReview;
+              const result = pentestSchema.parse(s.results.pentester);
+              if (
+                !review ||
+                review.status !== "pending" ||
+                result.status !== "PENTEST_UNAVAILABLE" ||
+                pentestUnavailableResultHash(result) !== review.resultHash
+              )
+                throw new Error(
+                  "Pentest evidence changed while the decision was pending",
+                );
+              const decision = selected[0] as "ignore" | "skip" | "stop";
+              review.status =
+                decision === "ignore"
+                  ? "ignored"
+                  : decision === "skip"
+                    ? "skipped"
+                    : "stopped";
+              review.decidedAt = new Date().toISOString();
+              record(
+                s,
+                "pentest_user_decision_recorded",
+                JSON.stringify({
+                  workflowId: s.id,
+                  pentesterAttempt: review.pentesterAttempt,
+                  decision,
+                  resultHash: review.resultHash,
+                  affectedTests: review.affectedTests.map((test) => test.id),
+                  evidenceIds: review.affectedTests.flatMap(
+                    (test) => test.evidenceIds,
+                  ),
+                  resultingTransition:
+                    decision === "ignore"
+                      ? "PENTEST"
+                      : decision === "skip"
+                        ? "SECURITY_REVIEW"
+                        : "ABORTED",
+                }),
+              );
+              delete s.pendingApproval;
+              delete s.resumePhase;
+              // Persist authorization before applying its transition. A restart
+              // reconciles this recorded decision exactly once.
+              await this.store.save(s);
+              continue;
+            } else if (request.kind === "technicalRecovery") {
               if (
                 selected.length !== 1 ||
                 !["retry_implementor", "revise_requirements", "abort"].includes(

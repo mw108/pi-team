@@ -488,6 +488,20 @@ async function planWorkflowRecovery(
   if (active) return unsafe("Workflow is already running.");
   if (
     state.phase === "WAITING_USER" &&
+    state.pentestUnavailabilityReview &&
+    state.pentestUnavailabilityReview.status !== "pending" &&
+    !state.pentestUnavailabilityReview.transitionedAt &&
+    !state.pendingApproval
+  )
+    return {
+      kind: "continue",
+      nextPhase: "WAITING_USER",
+      agentId: "pentester",
+      reason:
+        "A durable Pentest decision is ready for its recorded workflow transition.",
+    };
+  if (
+    state.phase === "WAITING_USER" &&
     state.securityRiskReview &&
     !state.pendingApproval &&
     !state.pendingQuestion &&

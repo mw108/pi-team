@@ -140,6 +140,24 @@ export const contractSchema = z
     requiredTests: z.array(requiredTestSchema),
     acceptanceCriteria: strings,
     knownRisks: strings,
+    pentestCapabilities: z
+      .array(
+        z
+          .object({
+            id: z.string().regex(/^[a-z][a-z0-9-]*$/),
+            description: text,
+            requirement: z.enum([
+              "REQUIRED",
+              "OPTIONAL",
+              "INTENTIONALLY_ABSENT",
+            ]),
+            testMethod: z.enum(["HTTP", "COMMAND", "STATIC", "OTHER"]),
+            interfaces: strings,
+            rationale: text,
+          })
+          .strict(),
+      )
+      .optional(),
   })
   .superRefine((contract, ctx) => {
     const actions = new Map<string, Set<string>>();
@@ -172,6 +190,18 @@ export const contractSchema = z
           path: ["requiredTests", index],
           message: `Conflicting test actions for: ${test.file}`,
         });
+    }
+    const capabilityIds = new Set<string>();
+    for (const [index, capability] of (
+      contract.pentestCapabilities ?? []
+    ).entries()) {
+      if (capabilityIds.has(capability.id))
+        ctx.addIssue({
+          code: "custom",
+          path: ["pentestCapabilities", index, "id"],
+          message: `Duplicate pentest capability id: ${capability.id}`,
+        });
+      capabilityIds.add(capability.id);
     }
   });
 export const implementationSchema = z.union([
@@ -241,13 +271,41 @@ export const pentestBlockerSchema = z.object({
   message: text,
   remediation: text.optional(),
 });
+export const unavailablePentestTestSchema = z
+  .object({
+    id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
+    description: text,
+    capabilityId: z.string().regex(/^[a-z][a-z0-9-]*$/),
+    requiredCapability: text,
+    testMethod: z.enum(["HTTP", "COMMAND", "STATIC", "OTHER"]),
+    unavailableBecause: text,
+    alternativeEvidence: z.string().min(1).optional(),
+    evidenceIds: strings,
+  })
+  .strict();
 export const pentestSchema = z
   .object({
-    status: z.enum(["PASS", "FINDINGS", "BLOCKED"]),
+    status: z.enum([
+      "PASS",
+      "FINDINGS",
+      "BLOCKED",
+      "PENTEST_UNAVAILABLE",
+      "COMPLETED_WITH_LIMITATIONS",
+      "PENTEST_SKIPPED_BY_USER",
+    ]),
     findings: z.array(pentestFindingSchema),
     coverage: strings,
     limitations: strings,
     blocker: pentestBlockerSchema.optional(),
+    affectedTests: z.array(unavailablePentestTestSchema).optional(),
+    userDecision: z
+      .object({
+        action: z.literal("SKIP_PENTEST_FOR_WORKFLOW"),
+        decidedAt: z.string().datetime(),
+        resultHash: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict()
+      .optional(),
   })
   .superRefine((result, ctx) => {
     if (result.status === "PASS" && result.findings.length)
@@ -261,6 +319,50 @@ export const pentestSchema = z
         code: "custom",
         message: "Only BLOCKED may have a blocker",
       });
+    if (
+      [
+        "PENTEST_UNAVAILABLE",
+        "COMPLETED_WITH_LIMITATIONS",
+        "PENTEST_SKIPPED_BY_USER",
+      ].includes(result.status) &&
+      !result.affectedTests?.length
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: `${result.status} requires affectedTests`,
+      });
+    if (
+      ![
+        "PENTEST_UNAVAILABLE",
+        "COMPLETED_WITH_LIMITATIONS",
+        "PENTEST_SKIPPED_BY_USER",
+      ].includes(result.status) &&
+      result.affectedTests?.length
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: `${result.status} cannot carry unavailable affectedTests`,
+      });
+    if (result.status === "PENTEST_SKIPPED_BY_USER" && !result.userDecision)
+      ctx.addIssue({
+        code: "custom",
+        message: "PENTEST_SKIPPED_BY_USER requires a host userDecision",
+      });
+    if (result.status !== "PENTEST_SKIPPED_BY_USER" && result.userDecision)
+      ctx.addIssue({
+        code: "custom",
+        message: "Only PENTEST_SKIPPED_BY_USER may have a userDecision",
+      });
+    const affectedIds = new Set<string>();
+    for (const [index, affected] of (result.affectedTests ?? []).entries()) {
+      if (affectedIds.has(affected.id))
+        ctx.addIssue({
+          code: "custom",
+          path: ["affectedTests", index, "id"],
+          message: `Duplicate affected test id: ${affected.id}`,
+        });
+      affectedIds.add(affected.id);
+    }
   });
 export type PentestResult = z.infer<typeof pentestSchema>;
 export const securitySchema = z.object({

@@ -1,6 +1,14 @@
 import { block, record, type WorkflowState, type Phase } from "./state.ts";
 import { pentestSchema, type Role } from "../agents/schemas.ts";
 import { enforcePentestPolicy } from "./pentest-policy.ts";
+import {
+  classifyPentestUnavailability,
+  completedWithAcceptedLimitations,
+  hasCurrentIgnoredPentestDecision,
+  isAuthorizedPentestSkip,
+  matchingIgnoredPentestScope,
+  pentestUnavailabilityRequest,
+} from "./pentest-unavailability.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
 import {
   currentSecurityRiskReview,
@@ -43,6 +51,7 @@ export function fix(
 ) {
   record(s, route, s.phase);
   delete s.securityRiskReview;
+  delete s.pentestUnavailabilityReview;
   if (route === "FIX_REQUIREMENTS") {
     const sourcePhase = s.phase;
     const sourceAgent = getPhaseRoles(s, sourcePhase)?.[0];
@@ -134,6 +143,7 @@ export function transition(s: WorkflowState) {
       }
       delete s.gateHashes;
       delete s.securityRiskReview;
+      delete s.pentestUnavailabilityReview;
       s.phase = "SOLVE";
       break;
     case "SOLVE":
@@ -223,12 +233,89 @@ export function transition(s: WorkflowState) {
       break;
     }
     case "PENTEST": {
-      const result = enforcePentestPolicy(
+      let result = enforcePentestPolicy(
         s,
         pentestSchema.parse(s.results.pentester),
       );
+      if (
+        ["PASS", "FINDINGS"].includes(result.status) &&
+        hasCurrentIgnoredPentestDecision(s)
+      )
+        result = completedWithAcceptedLimitations(s, result);
       s.results.pentester = result;
-      if (result.status === "BLOCKED") {
+      if (result.status === "PENTEST_UNAVAILABLE") {
+        const classification = classifyPentestUnavailability(s, result);
+        if (classification.kind === "required") {
+          record(
+            s,
+            "pentest_unavailable_required_capability",
+            JSON.stringify({ capabilityIds: classification.capabilityIds }),
+          );
+          fix(
+            s,
+            "FIX_LOCAL",
+            `Required implementation capabilities are unavailable: ${classification.capabilityIds.join(", ")}`,
+          );
+          break;
+        }
+        if (classification.kind === "uncertain") {
+          record(
+            s,
+            "pentest_unavailable_contract_uncertain",
+            JSON.stringify({ capabilityIds: classification.capabilityIds }),
+          );
+          s.pentestCycle = Math.max(0, s.pentestCycle - 1);
+          s.pendingApproval = {
+            kind: "pentestContractClarification",
+            title: "Clarify unavailable Pentest capability",
+            prompt: `The current Implementation Contract does not explicitly classify these unavailable capabilities: ${classification.capabilityIds.join(", ")}. Confirm whether their absence is an implementation defect before Pi-Team offers any Pentest waiver. This clarification applies only to this workflow and does not rewrite project configuration.`,
+            options: [
+              {
+                value: "required",
+                label: "Required capability",
+                description:
+                  "Treat the missing capability as an implementation defect and route normal remediation",
+              },
+              {
+                value: "not_required",
+                label: "Not required by the Contract",
+                description:
+                  "Confirm the interface is optional or intentionally absent, then review the Pentest coverage decision",
+              },
+              {
+                value: "stop",
+                label: "Stop workflow",
+                description:
+                  "Stop without running downstream agents; preserve state, evidence, and repository changes",
+              },
+            ],
+          };
+          s.resumePhase = "PENTEST";
+          s.phase = "WAITING_USER";
+          break;
+        }
+        if (matchingIgnoredPentestScope(s, result)) {
+          result = completedWithAcceptedLimitations(s, result);
+          s.results.pentester = result;
+          record(
+            s,
+            "pentest_limitation_finalized",
+            "All feasible checks are complete; the previously accepted limitation remains unverified",
+          );
+          s.phase = "SECURITY_REVIEW";
+          break;
+        }
+        s.pentestCycle = Math.max(0, s.pentestCycle - 1);
+        const attempt =
+          s.history.findLast(
+            (event) =>
+              event.event === "agent_attempt_started" &&
+              event.meta?.agent === "pentester",
+          )?.meta?.attempt ?? 1;
+        s.pendingApproval = pentestUnavailabilityRequest(s, result, attempt);
+        s.resumePhase = "PENTEST";
+        s.phase = "WAITING_USER";
+      } else if (result.status === "BLOCKED") {
         s.pentestCycle = Math.max(0, s.pentestCycle - 1);
         const attempt = s.history.findLast(
           (event) =>
@@ -247,6 +334,20 @@ export function transition(s: WorkflowState) {
               }
             : undefined,
         );
+      } else if (result.status === "PENTEST_SKIPPED_BY_USER") {
+        if (!isAuthorizedPentestSkip(s, result))
+          block(
+            s,
+            "Pentest skip result lacks matching workflow-level user authorization",
+          );
+        else s.phase = "SECURITY_REVIEW";
+      } else if (result.status === "COMPLETED_WITH_LIMITATIONS") {
+        if (!matchingIgnoredPentestScope(s, result))
+          block(
+            s,
+            "Pentest completion with limitations lacks a matching user decision",
+          );
+        else s.phase = "SECURITY_REVIEW";
       } else s.phase = "SECURITY_REVIEW";
       break;
     }

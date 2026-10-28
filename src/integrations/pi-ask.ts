@@ -96,6 +96,8 @@ export function approvalParams(request: ApprovalRequest) {
           "contractPath",
           "contractExtension",
           "securityRisk",
+          "pentestUnavailability",
+          "pentestContractClarification",
           "credentialFinding",
           "technicalRecovery",
         ].includes(request.kind)

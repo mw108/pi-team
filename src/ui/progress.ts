@@ -185,6 +185,16 @@ export function deriveAgentProgressState(
   )
     return { status: "completed", attempt: latest.meta?.attempt };
   if (
+    role === "pentester" &&
+    state.phase === "WAITING_USER" &&
+    state.pentestUnavailabilityReview?.status === "pending"
+  )
+    return {
+      status: "waiting",
+      attempt: latest?.meta?.attempt,
+      detail: "user decision required for unavailable Pentest checks",
+    };
+  if (
     currentResult &&
     state.phase === "BLOCKED" &&
     (role === "tester" || role === "pentester") &&
@@ -458,6 +468,23 @@ export function renderProgress(
       "Next action: /team-continue opens the security-risk confirmation.",
     );
   }
+  const pentestReview = state.pentestUnavailabilityReview;
+  if (pentestReview?.status === "pending")
+    lines.push(
+      "Pentest cannot be fully executed; an explicit user decision is required.",
+      `Affected checks: ${pentestReview.affectedTests.map((test) => test.description).join("; ")}`,
+      `Next action: /team resume ${state.id} opens Ignore, Skip Pentest for this workflow, and Stop workflow.`,
+    );
+  else if (pentestReview?.status === "ignored")
+    lines.push(
+      "Pentest limitation: accepted for continued applicable testing; affected checks remain unverified.",
+    );
+  else if (pentestReview?.status === "skipped")
+    lines.push(
+      "Pentest gate: skipped by explicit user decision for this workflow only; Security Review remains required.",
+    );
+  else if (pentestReview?.status === "stopped")
+    lines.push("Workflow stopped by explicit user decision during Pentest.");
   const requirement = pendingFixRequirements(state);
   if (requirement) {
     lines.push(
@@ -471,6 +498,11 @@ export function renderProgress(
     lines.push(
       "Implementation is blocked by a technical or ambiguous host-side failure.",
       `Next action: /team resume ${state.id} opens Retry Implementor, Revise requirements, and Abort workflow choices.`,
+    );
+  if (state.pendingApproval?.kind === "pentestContractClarification")
+    lines.push(
+      "Pentest availability requires Contract clarification before any waiver can be offered.",
+      `Next action: /team resume ${state.id} opens Required capability, Not required by the Contract, and Stop workflow choices.`,
     );
   for (const request of state.pendingRuntimeCommands ?? [])
     lines.push(
@@ -635,11 +667,15 @@ export function renderLiveProgress(
             ? state.securityRiskReview.status === "pending"
               ? "◉ Waiting for user review of accepted security risks · /team-continue to reopen"
               : "✓ Security risks approved · /team-continue to resume"
-            : state.pendingCredentialFinding
-              ? `◉ COMMIT waiting for credential approval in ${state.pendingCredentialFinding.path}${state.pendingCredentialFinding.line ? `:${state.pendingCredentialFinding.line}` : ""} · /team resume ${state.id}`
-              : requirement
-                ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
-                : "◉ Waiting for user input",
+            : state.pentestUnavailabilityReview?.status === "pending"
+              ? `◉ Pentest cannot be fully executed · /team resume ${state.id} to choose Ignore, Skip, or Stop`
+              : state.pendingApproval?.kind === "pentestContractClarification"
+                ? `◉ Pentest capability needs Contract clarification · /team resume ${state.id}`
+                : state.pendingCredentialFinding
+                  ? `◉ COMMIT waiting for credential approval in ${state.pendingCredentialFinding.path}${state.pendingCredentialFinding.line ? `:${state.pendingCredentialFinding.line}` : ""} · /team resume ${state.id}`
+                  : requirement
+                    ? `◉ Waiting for requirement clarification requested by ${getAgentDisplayName(state.config, requirement.sourceAgent)} during ${requirement.sourcePhase} · /team resume ${state.id} · /team-retry ${requirement.sourceAgent} override`
+                    : "◉ Waiting for user input",
         ]
       : [];
   const reserved =

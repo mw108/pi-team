@@ -119,8 +119,21 @@ export async function contextFor(
     context.actualDiff = await providerDiff(s);
     context.baselineDirtyPaths = s.baseline.dirtyPaths;
   }
-  if (role === "securityReviewer" && s.config.qualityGates.pentest.enabled)
+  if (role === "securityReviewer" && s.config.qualityGates.pentest.enabled) {
     copy("pentester");
+    if (s.pentestUnavailabilityReview)
+      context.pentestGate = {
+        status:
+          s.results.pentester?.status === "PENTEST_SKIPPED_BY_USER"
+            ? "SKIPPED_BY_USER"
+            : s.results.pentester?.status,
+        userDecision: s.pentestUnavailabilityReview.status,
+        scope: "this workflow only",
+        affectedTests: s.pentestUnavailabilityReview.affectedTests,
+        instruction:
+          "A skipped or limited Pentest is not a successful Pentest. Independently review the current code, classify every preserved finding, account for unverified checks, and require remediation for confirmed vulnerabilities.",
+      };
+  }
   if (role === "pentester")
     context.localHttpPolicy = {
       ...s.config.pentest.localHttp,
@@ -128,6 +141,15 @@ export async function contextFor(
         ...s.config.pentest.localHttp.allowedOrigins,
         ...s.config.pentest.localUrls.map((value) => new URL(value).origin),
       ],
+    };
+  if (
+    role === "pentester" &&
+    s.pentestUnavailabilityReview?.status === "ignored"
+  )
+    context.pentestContinuation = {
+      acceptedLimitations: s.pentestUnavailabilityReview.affectedTests,
+      instruction:
+        "The user accepted only the listed unavailable test methods. Do not retry them. Continue other applicable checks, preserve every existing finding and completed check, and keep each accepted limitation explicitly unverified. Do not claim it passed. Return COMPLETED_WITH_LIMITATIONS when all feasible checks are complete. Return PENTEST_UNAVAILABLE again only for materially different evidence or scope.",
     };
   if (role === "tester") {
     context.approvedCommands = effectiveConfig(s, role).commands.filter((c) =>

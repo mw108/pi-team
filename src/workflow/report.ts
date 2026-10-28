@@ -95,10 +95,24 @@ export async function buildCompletionReportInput(
       ? `BLOCKED: ${pentest.blocker?.message ?? "Required testing incomplete"}`
       : pentest?.status === "FINDINGS"
         ? `FINDINGS: ${pentest.findings.length} issue(s)`
-        : pentest?.status === "PASS"
-          ? "PASS"
-          : undefined,
+        : pentest?.status === "COMPLETED_WITH_LIMITATIONS"
+          ? `COMPLETED WITH LIMITATIONS: ${pentest.affectedTests?.length ?? 0} check(s) remain unverified`
+          : pentest?.status === "PENTEST_SKIPPED_BY_USER"
+            ? "SKIPPED BY USER: workflow-scoped waiver; Security Review still required"
+            : pentest?.status === "PENTEST_UNAVAILABLE"
+              ? `UNAVAILABLE: ${pentest.affectedTests?.length ?? 0} check(s) could not run`
+              : pentest?.status === "PASS"
+                ? "PASS"
+                : undefined,
   );
+  if (
+    [
+      "COMPLETED_WITH_LIMITATIONS",
+      "PENTEST_SKIPPED_BY_USER",
+      "PENTEST_UNAVAILABLE",
+    ].includes(pentest?.status ?? "")
+  )
+    validation.find((entry) => entry.label === "Pentest")!.status = "warning";
   const security = s.results.securityReviewer;
   if (
     s.config.qualityGates.pentest.enabled &&
@@ -186,6 +200,9 @@ export async function buildCompletionReportInput(
       )
       .map((v) => `${v.label}: ${v.status}`),
     ...(s.reportFailure ? [`Narrative report failed: ${s.reportFailure}`] : []),
+    ...(pentest?.affectedTests ?? []).map(
+      (test) => `Pentest check remains unverified: ${test.description}`,
+    ),
   ]);
   const commitResult = s.results.commitAgent;
   const excludedCommitPaths = unique(
