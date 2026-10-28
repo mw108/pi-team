@@ -517,6 +517,17 @@ export const persistedTestSchema = z.object({
             "INDETERMINATE",
           ])
           .optional(),
+        requiredCommandId: text.optional(),
+        satisfiedByCommandId: text.optional(),
+        matchType: z.enum(["EXACT", "VERIFIED_EQUIVALENT"]).optional(),
+        matchReasonCode: z
+          .enum([
+            "EXACT_COMMAND_IDENTITY",
+            "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE",
+            "PHPUNIT_VERIFIED_WRAPPER_EQUIVALENCE",
+          ])
+          .optional(),
+        matchEvidence: z.array(text).max(8).optional(),
         supersededBy: z.string().uuid().optional(),
       }),
     )

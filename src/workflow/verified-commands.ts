@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { z } from "zod";
 import type { Command } from "../config/schema.ts";
 import type { CommandEvidence } from "../agents/commands.ts";
@@ -114,6 +114,8 @@ export const verifiedCommandResultSchema = z.object({
     gateHashes: z.record(z.string()),
     packageJsonHash: z.string().optional(),
     composerJsonHash: z.string().optional(),
+    validationConfigHashes: z.record(z.string()).optional(),
+    projectPathHash: z.string().optional(),
   }),
   execution: z
     .object({
@@ -135,11 +137,48 @@ export async function repositoryEvidenceState(state: WorkflowState) {
     metadataHash("package.json"),
     metadataHash("composer.json"),
   ]);
+  const validationPaths = new Set([
+    "phpunit.xml",
+    "phpunit.xml.dist",
+    ".env.testing",
+    "composer.lock",
+  ]);
+  for (const configName of ["phpunit.xml", "phpunit.xml.dist"]) {
+    const source = await readFile(join(state.cwd, configName), "utf8").catch(
+      () => undefined,
+    );
+    const bootstrap = source?.match(/\bbootstrap\s*=\s*["']([^"']+)["']/i)?.[1];
+    if (!bootstrap) continue;
+    const absolute = resolve(state.cwd, bootstrap);
+    const repositoryRelative = relative(state.cwd, absolute).replace(
+      /\\/g,
+      "/",
+    );
+    if (
+      repositoryRelative &&
+      repositoryRelative !== ".." &&
+      !repositoryRelative.startsWith("../")
+    )
+      validationPaths.add(repositoryRelative);
+  }
+  const validationConfigHashes: Record<string, string> = {};
+  for (const name of [...validationPaths].sort()) {
+    const hash = await metadataHash(name);
+    if (hash) validationConfigHashes[name] = hash;
+  }
   return {
     head: await head(state.cwd),
     gateHashes: await gateSnapshot(state),
     packageJsonHash,
     composerJsonHash,
+    validationConfigHashes,
+    projectPathHash: createHash("sha256")
+      .update(
+        process.platform === "win32"
+          ? resolve(state.cwd).toLowerCase()
+          : resolve(state.cwd),
+      )
+      .digest("hex"),
   };
 }
 
@@ -568,6 +607,11 @@ export function isVerifiedCommandResultCurrent(
       result.repoState.packageJsonHash === current.packageJsonHash) &&
     (result.repoState.composerJsonHash === undefined ||
       result.repoState.composerJsonHash === current.composerJsonHash) &&
+    (result.repoState.validationConfigHashes === undefined ||
+      JSON.stringify(result.repoState.validationConfigHashes) ===
+        JSON.stringify(current.validationConfigHashes)) &&
+    (result.repoState.projectPathHash === undefined ||
+      result.repoState.projectPathHash === current.projectPathHash) &&
     JSON.stringify(result.repoState.gateHashes) ===
       JSON.stringify(current.gateHashes)
   );
@@ -588,6 +632,303 @@ export function currentVerifiedCommandResults(
       latest.set(result.commandIdentity, result);
   }
   return [...latest.values()];
+}
+
+export type ValidationObligationMatch = {
+  requiredCommandId: string;
+  executedCommandId: string;
+  executionId: string;
+  matchType: "EXACT" | "VERIFIED_EQUIVALENT";
+  reasonCode:
+    | "EXACT_COMMAND_IDENTITY"
+    | "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE"
+    | "PHPUNIT_VERIFIED_WRAPPER_EQUIVALENCE";
+  evidence: string[];
+};
+
+type PhpunitObligation = {
+  runner: "PROJECT_PHPUNIT" | "PATH_PHPUNIT";
+  wrapper: "DIRECT" | "LARAVEL_ARTISAN" | "COMPOSER_SCRIPT";
+  presentation: string[];
+  evidence: string[];
+};
+
+function normalizedTarget(value: string): string {
+  return value.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+/**
+ * Parse only PHPUnit options verified to alter console presentation. Any
+ * unknown, selection, configuration, bootstrap, coverage, or exit-semantics
+ * argument makes the invocation ineligible for equivalence.
+ */
+function phpunitPresentationOptions(args: string[]): string[] | undefined {
+  const options: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < args.length; index++) {
+    const argument = args[index];
+    let normalized: string | undefined;
+    if (argument === "--no-progress") normalized = "--no-progress";
+    else if (/^--colors=(?:never|auto)$/.test(argument)) normalized = argument;
+    else if (
+      argument === "--colors" &&
+      /^(?:never|auto)$/.test(args[index + 1] ?? "")
+    )
+      normalized = `--colors=${args[++index]}`;
+    else return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    options.push(normalized);
+  }
+  return options.sort();
+}
+
+function directPhpunitObligation(
+  command: Pick<Command, "executable" | "args">,
+): PhpunitObligation | undefined {
+  const executable = executableName(command.executable);
+  const target = normalizedTarget(command.executable);
+  let runner: PhpunitObligation["runner"] | undefined;
+  let args: string[] | undefined;
+  if (
+    executable === "php" &&
+    /(?:^|\/)vendor\/bin\/phpunit$/.test(
+      normalizedTarget(command.args[0] ?? ""),
+    )
+  ) {
+    runner = "PROJECT_PHPUNIT";
+    args = command.args.slice(1);
+  } else if (/(?:^|\/)vendor\/bin\/phpunit$/.test(target)) {
+    runner = "PROJECT_PHPUNIT";
+    args = command.args;
+  } else if (executable === "phpunit") {
+    runner = "PATH_PHPUNIT";
+    args = command.args;
+  }
+  if (!runner || !args) return;
+  const presentation = phpunitPresentationOptions(args);
+  if (!presentation) return;
+  return {
+    runner,
+    wrapper: "DIRECT",
+    presentation,
+    evidence: [
+      runner === "PROJECT_PHPUNIT"
+        ? "The command invokes the repository PHPUnit runner."
+        : "The command invokes the same PATH-resolved PHPUnit runner.",
+    ],
+  };
+}
+
+async function verifiedLaravelProject(cwd: string): Promise<boolean> {
+  try {
+    const [composer, artisan] = await Promise.all([
+      readFile(join(cwd, "composer.json"), "utf8"),
+      readFile(join(cwd, "artisan")),
+    ]);
+    if (artisan.byteLength > 262144) return false;
+    const document = JSON.parse(composer);
+    return Boolean(
+      document?.require?.["laravel/framework"] ??
+      document?.["require-dev"]?.["laravel/framework"],
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function artisanPhpunitObligation(
+  command: Pick<Command, "executable" | "args">,
+  cwd: string,
+): Promise<PhpunitObligation | undefined> {
+  const executable = executableName(command.executable);
+  const executableTarget = normalizedTarget(command.executable);
+  const phpArtisan =
+    executable === "php" &&
+    /(?:^|\/)artisan$/.test(normalizedTarget(command.args[0] ?? "")) &&
+    command.args[1] === "test";
+  const directArtisan =
+    /(?:^|\/)artisan$/.test(executableTarget) && command.args[0] === "test";
+  if (!phpArtisan && !directArtisan) return;
+  // Wrapper arguments are not silently translated into PHPUnit arguments.
+  // This proves only the wrapper's unmodified default full-suite behavior.
+  if (command.args.slice(phpArtisan ? 2 : 1).length) return;
+  if (!(await verifiedLaravelProject(cwd))) return;
+  return {
+    runner: "PROJECT_PHPUNIT",
+    wrapper: "LARAVEL_ARTISAN",
+    presentation: [],
+    evidence: [
+      "The checked-in Laravel Artisan test wrapper resolves to the project PHPUnit runner.",
+      "The wrapper has no scope, configuration, environment, or failure-handling arguments.",
+    ],
+  };
+}
+
+function singleComposerScriptCommand(
+  definition: unknown,
+): { executable: string; args: string[] } | undefined {
+  const value = Array.isArray(definition)
+    ? definition.length === 1 && typeof definition[0] === "string"
+      ? definition[0]
+      : undefined
+    : typeof definition === "string"
+      ? definition
+      : undefined;
+  if (!value) return;
+  const text = value.trim().replace(/^@php\s+/, "php ");
+  if (!text || /[;&|`$<>\r\n'"\\]/.test(text)) return;
+  const [executable, ...args] = text.split(/\s+/);
+  return executable ? { executable, args } : undefined;
+}
+
+async function composerPhpunitObligation(
+  command: Pick<Command, "executable" | "args">,
+  cwd: string,
+): Promise<PhpunitObligation | undefined> {
+  if (executableName(command.executable) !== "composer") return;
+  const scriptName =
+    command.args[0] === "run" ? command.args[1] : command.args[0];
+  const expectedLength = command.args[0] === "run" ? 2 : 1;
+  if (!scriptName || command.args.length !== expectedLength) return;
+  try {
+    const source = await readFile(join(cwd, "composer.json"));
+    if (source.byteLength > 262144) return;
+    const document = JSON.parse(source.toString("utf8"));
+    const inner = singleComposerScriptCommand(document?.scripts?.[scriptName]);
+    if (!inner) return;
+    const obligation =
+      directPhpunitObligation(inner) ??
+      (await artisanPhpunitObligation(inner, cwd));
+    if (!obligation) return;
+    return {
+      ...obligation,
+      wrapper: "COMPOSER_SCRIPT",
+      evidence: [
+        `The checked-in Composer script ${scriptName} contains one deterministic test command.`,
+        ...obligation.evidence,
+      ],
+    };
+  } catch {
+    return;
+  }
+}
+
+async function phpunitObligation(
+  command: Pick<Command, "executable" | "args">,
+  cwd: string,
+): Promise<PhpunitObligation | undefined> {
+  return (
+    directPhpunitObligation(command) ??
+    (await artisanPhpunitObligation(command, cwd)) ??
+    (await composerPhpunitObligation(command, cwd))
+  );
+}
+
+function identityIsPhpunit(
+  identity: EffectiveValidationIdentity | undefined,
+): boolean {
+  return identity?.validationType === "TEST" && identity.tool === "PHPUNIT";
+}
+
+/** Match exact argv first, then a narrowly proven PHPUnit obligation. */
+export async function matchValidationObligation(
+  required: Pick<Command, "id" | "executable" | "args" | "purpose">,
+  executed: VerifiedCommandResult,
+  cwd: string,
+): Promise<ValidationObligationMatch | undefined> {
+  if (executed.commandIdentity !== commandKey(executed.command)) return;
+  if (!["test", "static"].includes(executed.command.purpose)) return;
+  if (commandKey(required) === executed.commandIdentity)
+    return {
+      requiredCommandId: required.id,
+      executedCommandId: executed.command.id,
+      executionId: executed.executionId,
+      matchType: "EXACT",
+      reasonCode: "EXACT_COMMAND_IDENTITY",
+      evidence: ["Executable and argument identity match exactly."],
+    };
+
+  const [requiredIdentity, executedIdentity, requiredScope, executedScope] =
+    await Promise.all([
+      resolveEffectiveValidationIdentity(required, cwd),
+      resolveEffectiveValidationIdentity(
+        {
+          ...executed.command,
+          purpose: executed.command.purpose as Command["purpose"],
+        },
+        cwd,
+      ),
+      phpunitObligation(required, cwd),
+      phpunitObligation(executed.command, cwd),
+    ]);
+  if (
+    !identityIsPhpunit(requiredIdentity) ||
+    !identityIsPhpunit(executedIdentity) ||
+    !requiredScope ||
+    !executedScope ||
+    requiredScope.runner !== executedScope.runner
+  )
+    return;
+  if (
+    executed.effectiveValidationIdentity &&
+    !identityIsPhpunit(executed.effectiveValidationIdentity)
+  )
+    return;
+
+  const wrapperDifference = requiredScope.wrapper !== executedScope.wrapper;
+  return {
+    requiredCommandId: required.id,
+    executedCommandId: executed.command.id,
+    executionId: executed.executionId,
+    matchType: "VERIFIED_EQUIVALENT",
+    reasonCode: wrapperDifference
+      ? "PHPUNIT_VERIFIED_WRAPPER_EQUIVALENCE"
+      : "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE",
+    evidence: [
+      ...requiredScope.evidence.map((item) => `Required: ${item}`),
+      ...executedScope.evidence.map((item) => `Executed: ${item}`),
+      wrapperDifference
+        ? "Both verified invocations select the same default full PHPUnit suite."
+        : "Only allowlisted PHPUnit console presentation options differ.",
+    ],
+  };
+}
+
+/**
+ * Resolve one current execution per obligation. The latest equivalent evidence
+ * wins, while one execution cannot collapse two independently required gates.
+ */
+export async function resolveValidationObligationMatches(
+  required: Pick<Command, "id" | "executable" | "args" | "purpose">[],
+  candidates: VerifiedCommandResult[],
+  cwd: string,
+): Promise<ValidationObligationMatch[]> {
+  const available = new Set(
+    candidates.map((candidate) => candidate.executionId),
+  );
+  const matches: ValidationObligationMatch[] = [];
+  for (const command of required) {
+    const possible: {
+      match: ValidationObligationMatch;
+      completedAt: string;
+    }[] = [];
+    for (const candidate of candidates) {
+      if (!available.has(candidate.executionId)) continue;
+      const match = await matchValidationObligation(command, candidate, cwd);
+      if (match) possible.push({ match, completedAt: candidate.completedAt });
+    }
+    possible.sort(
+      (left, right) =>
+        right.completedAt.localeCompare(left.completedAt) ||
+        (left.match.matchType === "EXACT" ? -1 : 1),
+    );
+    const selected = possible[0]?.match;
+    if (!selected) continue;
+    matches.push(selected);
+    available.delete(selected.executionId);
+  }
+  return matches;
 }
 
 export type CommandOutcomeCategory =

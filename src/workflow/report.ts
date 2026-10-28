@@ -18,6 +18,9 @@ export interface ValidationCommandResult {
   durationMs?: number;
   applicability?: "REQUIRED" | "OPTIONAL" | "NOT_APPLICABLE" | "AMBIGUOUS";
   applicabilityReasonCode?: string;
+  requiredCommandId?: string;
+  matchType?: "EXACT" | "VERIFIED_EQUIVALENT";
+  matchReasonCode?: string;
 }
 export interface CompletionReportInput {
   workflowId: string;
@@ -154,11 +157,20 @@ export async function buildCompletionReportInput(
   );
   const validationCommands: ValidationCommandResult[] = [];
   for (const result of tester?.commands ?? []) {
-    const command = [...s.approvedCommands, ...s.config.commands].find(
-      (c) => c.id === result.id,
-    );
     const outcome = tester?.validationOutcomes?.find(
-      (candidate) => candidate.id === result.id,
+      (candidate) =>
+        candidate.id === result.id ||
+        candidate.satisfiedByCommandId === result.id,
+    );
+    const command = [
+      ...s.approvedCommands,
+      ...s.config.commands,
+      ...s.discoveredCommands.map((candidate) => candidate.command),
+      ...s.verifiedCommandResults.map((candidate) => candidate.command),
+    ].find(
+      (candidate) =>
+        candidate.id === result.id ||
+        candidate.id === outcome?.satisfiedByCommandId,
     );
     validationCommands.push({
       id: result.id,
@@ -178,6 +190,13 @@ export async function buildCompletionReportInput(
       ...(outcome?.applicabilityReasonCode
         ? { applicabilityReasonCode: outcome.applicabilityReasonCode }
         : {}),
+      ...(outcome?.requiredCommandId
+        ? { requiredCommandId: outcome.requiredCommandId }
+        : {}),
+      ...(outcome?.matchType ? { matchType: outcome.matchType } : {}),
+      ...(outcome?.matchReasonCode
+        ? { matchReasonCode: outcome.matchReasonCode }
+        : {}),
       ...(typeof result.durationMs === "number"
         ? { durationMs: result.durationMs }
         : {}),
@@ -195,7 +214,7 @@ export async function buildCompletionReportInput(
       detail:
         outcome?.applicability === "NOT_APPLICABLE"
           ? `${outcome.applicabilityExplanation ?? outcome.reason} Recorded execution: exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}.`
-          : `exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}`,
+          : `${outcome?.matchType === "VERIFIED_EQUIVALENT" ? `Required validation ${outcome.requiredCommandId} was satisfied by this verified-equivalent execution (${outcome.matchReasonCode}). ` : ""}exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}`,
     });
   }
   const reportedCommands = new Set(

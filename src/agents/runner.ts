@@ -63,6 +63,8 @@ import {
   currentVerifiedCommandResults,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  matchValidationObligation,
+  resolveValidationObligationMatches,
   resolveEffectiveValidationIdentity,
   supersedingInvocation,
   validationFailureFingerprint,
@@ -1101,12 +1103,25 @@ export class PiRunner implements AgentRunner {
           state,
           await repositoryEvidenceState(state),
         );
-        const requiredIdentities = new Set(required.map(commandKey));
+        const priorObligationMatches = await resolveValidationObligationMatches(
+          required,
+          refreshed.filter(
+            (item) =>
+              item.agent === "tester" &&
+              allowedCommandCategories("tester").includes(
+                item.command.purpose as "test" | "static",
+              ),
+          ),
+          state.cwd,
+        );
+        const priorObligationEvidence = new Set(
+          priorObligationMatches.map((match) => match.executionId),
+        );
         input.verifiedCommandResults = refreshed.filter(
           (item) =>
             item.agent !== "tester" ||
             item.attempt === attempt ||
-            requiredIdentities.has(item.commandIdentity),
+            priorObligationEvidence.has(item.executionId),
         );
         input.requiredValidationCommands = required;
         input.validationApplicability = applicability;
@@ -1381,7 +1396,39 @@ export class PiRunner implements AgentRunner {
         );
         const applicability = await validationApplicability(state);
         const required = requiredValidationCommands(applicability);
-        const requiredKeys = new Set(required.map(commandKey));
+        const testerEvidence = current.filter(
+          (item) =>
+            item.agent === "tester" &&
+            allowedCommandCategories("tester").includes(
+              item.command.purpose as "test" | "static",
+            ),
+        );
+        const obligationMatches = await resolveValidationObligationMatches(
+          required,
+          testerEvidence,
+          state.cwd,
+        );
+        const obligationMatchByExecution = new Map(
+          obligationMatches.map((match) => [match.executionId, match]),
+        );
+        const obligationMatchByRequired = new Map(
+          obligationMatches.map((match) => [match.requiredCommandId, match]),
+        );
+        const obligationRelatedExecutions = new Set<string>();
+        const obligationRequirementsByExecution = new Map<
+          string,
+          Set<string>
+        >();
+        for (const command of required)
+          for (const item of testerEvidence)
+            if (await matchValidationObligation(command, item, state.cwd)) {
+              obligationRelatedExecutions.add(item.executionId);
+              const related =
+                obligationRequirementsByExecution.get(item.executionId) ??
+                new Set<string>();
+              related.add(command.id);
+              obligationRequirementsByExecution.set(item.executionId, related);
+            }
         const policyFor = (identity: string) =>
           applicability.find(
             (policy) => commandKey(policy.command) === identity,
@@ -1390,7 +1437,12 @@ export class PiRunner implements AgentRunner {
           item: (typeof current)[number],
           outcome: ReturnType<typeof classifyVerifiedCommand>,
         ): ValidationApplicability | undefined => {
-          const policy = policyFor(item.commandIdentity);
+          const match = obligationMatchByExecution.get(item.executionId);
+          const policy = match
+            ? applicability.find(
+                (candidate) => candidate.command.id === match.requiredCommandId,
+              )
+            : policyFor(item.commandIdentity);
           if (policy || outcome.validationType !== "DIAGNOSTIC") return policy;
           return {
             command: {
@@ -1442,14 +1494,13 @@ export class PiRunner implements AgentRunner {
             ) &&
             item.agent === "tester" &&
             (item.attempt === attempt ||
-              requiredKeys.has(item.commandIdentity)),
+              obligationMatchByExecution.has(item.executionId)),
         );
         const authoritative: {
           item: (typeof current)[number];
           outcome: ReturnType<typeof classifyVerifiedCommand>;
           id: string;
         }[] = [];
-        const supersededIdentities = new Set<string>();
         const supersededOutcomes: any[] = [];
         for (const item of selected) {
           const outcome = classifyVerifiedCommand(item);
@@ -1462,7 +1513,6 @@ export class PiRunner implements AgentRunner {
             );
             if (superseded) {
               const policy = policyForEvidence(item, outcome);
-              supersededIdentities.add(item.commandIdentity);
               supersededOutcomes.push({
                 id: item.command.id,
                 validationType: outcome.validationType,
@@ -1498,16 +1548,16 @@ export class PiRunner implements AgentRunner {
             item,
             outcome,
             id:
+              obligationMatchByExecution.get(item.executionId)
+                ?.requiredCommandId ??
               required.find(
                 (command) => commandKey(command) === item.commandIdentity,
-              )?.id ?? item.command.id,
+              )?.id ??
+              item.command.id,
           });
         }
         const allEvidence = selected.map((item) => ({
-          id:
-            required.find(
-              (command) => commandKey(command) === item.commandIdentity,
-            )?.id ?? item.command.id,
+          id: item.command.id,
           exitCode: item.exitCode,
           output: item.output,
         }));
@@ -1516,6 +1566,19 @@ export class PiRunner implements AgentRunner {
           ...authoritative.map(({ item, outcome, id }) => {
             const policy = policyForEvidence(item, outcome);
             const notApplicable = policy?.status === "NOT_APPLICABLE";
+            const obligationMatch = obligationMatchByExecution.get(
+              item.executionId,
+            );
+            const supersedingObligationMatch = obligationMatch
+              ? undefined
+              : [
+                  ...(obligationRequirementsByExecution.get(item.executionId) ??
+                    []),
+                ]
+                  .map((requiredCommandId) =>
+                    obligationMatchByRequired.get(requiredCommandId),
+                  )
+                  .find(Boolean);
             return {
               id,
               validationType: outcome.validationType,
@@ -1524,8 +1587,13 @@ export class PiRunner implements AgentRunner {
               outcome: notApplicable ? "NOT_APPLICABLE" : outcome.category,
               reason: notApplicable
                 ? `${policy.explanation} The command's recorded execution outcome was ${outcome.category}; it is not reported as passing.`
-                : outcome.reason,
-              recoverable: notApplicable ? false : outcome.recoverable,
+                : supersedingObligationMatch
+                  ? `${outcome.reason}. A later verified-equivalent execution is authoritative for this validation obligation.`
+                  : outcome.reason,
+              recoverable:
+                notApplicable || supersedingObligationMatch
+                  ? false
+                  : outcome.recoverable,
               applicability: policy?.status ?? "REQUIRED",
               applicabilityReasonCode:
                 policy?.reasonCode ?? "EXECUTED_TESTER_VALIDATION",
@@ -1537,6 +1605,23 @@ export class PiRunner implements AgentRunner {
                 ? { buildAssessment: policy.buildAssessment }
                 : {}),
               ...(notApplicable ? { executionOutcome: outcome.category } : {}),
+              ...(obligationMatch
+                ? {
+                    requiredCommandId: obligationMatch.requiredCommandId,
+                    ...(outcome.category === "PASS"
+                      ? {
+                          satisfiedByCommandId:
+                            obligationMatch.executedCommandId,
+                        }
+                      : {}),
+                    matchType: obligationMatch.matchType,
+                    matchReasonCode: obligationMatch.reasonCode,
+                    matchEvidence: obligationMatch.evidence,
+                  }
+                : {}),
+              ...(supersedingObligationMatch
+                ? { supersededBy: supersedingObligationMatch.executionId }
+                : {}),
             };
           }),
         ];
@@ -1579,19 +1664,14 @@ export class PiRunner implements AgentRunner {
           return result;
         }
         const missing = required.filter(
-          (command) =>
-            !authoritative.some(
-              ({ item }) => item.commandIdentity === commandKey(command),
-            ) &&
-            !supersededIdentities.has(commandKey(command)) &&
-            !current.some(
-              (item) =>
-                item.commandIdentity === commandKey(command) &&
-                item.exitCode === 0 &&
-                item.agent === "tester",
-            ),
+          (command) => !obligationMatchByRequired.has(command.id),
         );
         const gateResults = authoritative.filter(({ item, outcome }) => {
+          if (
+            obligationRelatedExecutions.has(item.executionId) &&
+            !obligationMatchByExecution.has(item.executionId)
+          )
+            return false;
           const status = policyForEvidence(item, outcome)?.status;
           return (
             status === "REQUIRED" ||
@@ -1680,9 +1760,20 @@ export class PiRunner implements AgentRunner {
           const notApplicable = applicability.filter(
             (policy) => policy.status === "NOT_APPLICABLE",
           );
-          result.reason = notApplicable.length
-            ? `Host-verified required validation commands passed. ${notApplicable.map((policy) => `${policy.command.id}: build not applicable (${policy.explanation})`).join("; ")}.`
-            : "Host-verified required validation commands passed.";
+          const equivalent = obligationMatches.filter(
+            (match) => match.matchType === "VERIFIED_EQUIVALENT",
+          );
+          result.reason = [
+            "Host-verified required validation obligations passed.",
+            ...equivalent.map(
+              (match) =>
+                `Required validation ${match.requiredCommandId} was satisfied by equivalent execution ${match.executedCommandId} (${match.reasonCode}).`,
+            ),
+            ...notApplicable.map(
+              (policy) =>
+                `${policy.command.id}: build not applicable (${policy.explanation}).`,
+            ),
+          ].join(" ");
         }
         if (proposedStatus !== result.status)
           record(

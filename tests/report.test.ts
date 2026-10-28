@@ -182,6 +182,79 @@ test("report preserves a non-applicable build decision without reporting its exe
   );
 });
 
+test("report links an equivalent execution to its required validation obligation", async () => {
+  const cwd = await repository();
+  const s = newState(
+    cwd,
+    "equivalent PHPUnit",
+    noCommit(),
+    await baseline(cwd),
+  );
+  s.verifiedCommandResults.push({
+    executionId: "00000000-0000-4000-8000-000000000123",
+    command: {
+      id: "executed-phpunit",
+      executable: "php",
+      args: ["vendor/bin/phpunit", "--colors=never"],
+      purpose: "test",
+    },
+    commandIdentity: JSON.stringify([
+      "php",
+      ["vendor/bin/phpunit", "--colors=never"],
+    ]),
+    agent: "tester",
+    attempt: 1,
+    exitCode: 0,
+    output: "OK (73 tests, 415 assertions)",
+    completedAt: "2026-10-28T10:00:00.000Z",
+    repoState: { head: null, gateHashes: {} },
+  });
+  s.results.tester = {
+    status: "PASS",
+    commands: [
+      { id: "executed-phpunit", exitCode: 0, output: "OK (73 tests)" },
+    ],
+    failedAreas: [],
+    validationOutcomes: [
+      {
+        id: "required-phpunit",
+        validationType: "TEST",
+        validator: "PHPUNIT",
+        validatorSource: "interpreter",
+        outcome: "PASS",
+        reason: "Command completed successfully",
+        recoverable: false,
+        applicability: "REQUIRED",
+        requiredCommandId: "required-phpunit",
+        satisfiedByCommandId: "executed-phpunit",
+        matchType: "VERIFIED_EQUIVALENT",
+        matchReasonCode: "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE",
+        matchEvidence: ["Only console presentation options differ."],
+      },
+    ],
+  };
+  const input = await buildCompletionReportInput(s);
+  assert.deepEqual(
+    {
+      executable: input.validationCommands[0].executable,
+      args: input.validationCommands[0].args,
+      requiredCommandId: input.validationCommands[0].requiredCommandId,
+      matchType: input.validationCommands[0].matchType,
+    },
+    {
+      executable: "php",
+      args: ["vendor/bin/phpunit", "--colors=never"],
+      requiredCommandId: "required-phpunit",
+      matchType: "VERIFIED_EQUIVALENT",
+    },
+  );
+  assert.match(
+    input.validation.find((item) => item.label.includes("--colors=never"))
+      ?.detail ?? "",
+    /required-phpunit.*PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE/,
+  );
+});
+
 test("report input preserves review findings, limitations, cycles, and failed command evidence", async () => {
   const cwd = await repository();
   const cfg = config();

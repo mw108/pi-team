@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   commandTool,
@@ -20,8 +20,10 @@ import {
   directStaticValidatorIdentity,
   directTestRunnerIdentity,
   isVerifiedCommandResultCurrent,
+  matchValidationObligation,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  resolveValidationObligationMatches,
   resolveEffectiveValidationIdentity,
   resolveStaticValidatorIdentity,
   supersedingInvocation,
@@ -2091,4 +2093,539 @@ test("synthetic Laravel incident passes only when the unavailable Vite build is 
   )) as any;
   assert.equal(blocked.status, "BLOCKED");
   assert.match(blocked.reason, /vite executable could not be found/i);
+});
+
+async function phpunitFixture(composerScripts?: Record<string, unknown>) {
+  const cwd = await repository();
+  await mkdir(join(cwd, "vendor/bin"), { recursive: true });
+  await writeFile(join(cwd, "vendor/bin/phpunit"), "<?php\n");
+  await writeFile(
+    join(cwd, "phpunit.xml"),
+    '<phpunit bootstrap="tests/bootstrap.php"><testsuites><testsuite name="default"><directory>tests</directory></testsuite></testsuites></phpunit>\n',
+  );
+  await writeFile(join(cwd, "tests/bootstrap.php"), "<?php\n");
+  if (composerScripts) {
+    await writeFile(join(cwd, "artisan"), "<?php\n");
+    await writeFile(
+      join(cwd, "composer.json"),
+      JSON.stringify({
+        require: { "laravel/framework": "^13" },
+        scripts: composerScripts,
+      }),
+    );
+  }
+  return cwd;
+}
+
+test("PHPUnit obligation matching accepts only allowlisted presentation differences", async () => {
+  const cwd = await phpunitFixture();
+  const state = newState(
+    cwd,
+    "phpunit equivalence",
+    config(),
+    await baseline(cwd),
+  );
+  const required = {
+    id: "detected-80a27dc5b522",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  const positive = [
+    ["php", ["vendor/bin/phpunit"]],
+    ["php", ["vendor/bin/phpunit", "--colors=never"]],
+    ["php", ["vendor/bin/phpunit", "--colors=auto"]],
+    ["php", ["vendor/bin/phpunit", "--colors", "never"]],
+    ["php", ["vendor/bin/phpunit", "--no-progress"]],
+    ["php", ["vendor/bin/phpunit", "--no-progress", "--colors=never"]],
+    ["php", ["vendor/bin/phpunit", "--colors=never", "--no-progress"]],
+    ["php", ["vendor\\bin\\phpunit", "--colors=never"]],
+    ["vendor/bin/phpunit", ["--colors=never"]],
+  ] as const;
+  for (const [index, [executable, args]] of positive.entries()) {
+    const command = {
+      id: `positive-${index}`,
+      executable,
+      args: [...args],
+      purpose: "test" as const,
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      {
+        id: command.id,
+        exitCode: 0,
+        output: "OK (73 tests, 415 assertions)",
+        sandbox,
+      },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    const match = await matchValidationObligation(required, result, cwd);
+    assert.ok(match, `${executable} ${args.join(" ")}`);
+    assert.equal(
+      match.matchType,
+      index === 0 ? "EXACT" : "VERIFIED_EQUIVALENT",
+    );
+  }
+});
+
+test("PHPUnit obligation matching rejects scope, configuration, and failure-semantics changes", async () => {
+  const cwd = await phpunitFixture();
+  const state = newState(cwd, "phpunit scope", config(), await baseline(cwd));
+  const required = {
+    id: "required-suite",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  const rejected = [
+    ["--filter=UserSettingLanguageSwitchTest"],
+    ["--testsuite", "Unit"],
+    ["tests/Unit/UserSettingLanguageSwitchTest.php"],
+    ["tests/Unit/"],
+    ["--group", "localization"],
+    ["--exclude-group", "integration"],
+    ["--configuration", "phpunit.other.xml"],
+    ["--bootstrap", "tests/other-bootstrap.php"],
+    ["--do-not-fail-on-warning"],
+    ["--colors=always"],
+    ["--unknown-output-option"],
+    ["--colors=never", "--colors=never"],
+  ];
+  for (const [index, extra] of rejected.entries()) {
+    const command = {
+      id: `rejected-${index}`,
+      executable: "php",
+      args: ["vendor/bin/phpunit", ...extra],
+      purpose: "test" as const,
+      verificationId: "phpunit.full_suite",
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id: command.id, exitCode: 0, output: "OK", sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    assert.equal(
+      await matchValidationObligation(required, result, cwd),
+      undefined,
+      extra.join(" "),
+    );
+  }
+
+  const differentRunner = await recordVerifiedCommandResult(
+    state,
+    {
+      id: "path-phpunit",
+      executable: "phpunit",
+      args: ["--colors=never"],
+      purpose: "test",
+      timeoutMs: 120000,
+    },
+    { id: "path-phpunit", exitCode: 0, output: "OK", sandbox },
+    "tester",
+    1,
+  );
+  assert.ok(differentRunner);
+  assert.equal(
+    await matchValidationObligation(required, differentRunner, cwd),
+    undefined,
+  );
+});
+
+test("verified Laravel and single-command Composer wrappers may cover the default PHPUnit suite", async () => {
+  const cwd = await phpunitFixture({
+    test: "@php artisan test",
+    subset: "@php artisan test --filter=LocalizationTest",
+    composite: ["@php artisan config:clear", "@php artisan test"],
+    direct: "php vendor/bin/phpunit --colors=never --no-progress",
+  });
+  const state = newState(
+    cwd,
+    "wrapper equivalence",
+    config(),
+    await baseline(cwd),
+  );
+  const required = {
+    id: "required-suite",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  for (const [id, executable, args] of [
+    ["artisan", "php", ["artisan", "test"]],
+    ["composer-artisan", "composer", ["run", "test"]],
+    ["composer-direct", "composer", ["run", "direct"]],
+  ] as const) {
+    const command = {
+      id,
+      executable,
+      args: [...args],
+      purpose: "test" as const,
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id, exitCode: 0, output: "OK (73 tests, 415 assertions)", sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    const match = await matchValidationObligation(required, result, cwd);
+    assert.equal(match?.reasonCode, "PHPUNIT_VERIFIED_WRAPPER_EQUIVALENCE");
+  }
+
+  for (const script of ["subset", "composite"]) {
+    const command = {
+      id: `composer-${script}`,
+      executable: "composer",
+      args: ["run", script],
+      purpose: "test" as const,
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id: command.id, exitCode: 0, output: "OK", sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    assert.equal(
+      await matchValidationObligation(required, result, cwd),
+      undefined,
+    );
+  }
+});
+
+test("obligation resolution uses latest evidence and does not collapse independent gates", async () => {
+  const cwd = await phpunitFixture();
+  const state = newState(cwd, "latest evidence", config(), await baseline(cwd));
+  const required = {
+    id: "required-suite",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  const executions: VerifiedCommandResult[] = [];
+  for (const [index, args, exitCode] of [
+    [0, ["vendor/bin/phpunit", "--no-progress"], 1],
+    [1, ["vendor/bin/phpunit", "--colors=never"], 0],
+    [2, ["vendor/bin/phpunit", "--colors=auto"], 1],
+  ] as const) {
+    const command = {
+      id: `execution-${index}`,
+      executable: "php",
+      args: [...args],
+      purpose: "test" as const,
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      {
+        id: command.id,
+        exitCode,
+        output: exitCode ? "FAILURES!" : "OK",
+        completedAt: `2026-10-28T00:00:0${index}.000Z`,
+        sandbox,
+      },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    executions.push(result);
+  }
+  const latest = await resolveValidationObligationMatches(
+    [required],
+    executions,
+    cwd,
+  );
+  assert.equal(latest[0].executedCommandId, "execution-2");
+
+  const twoRequired = [
+    required,
+    {
+      ...required,
+      id: "independent-suite",
+      args: ["vendor/bin/phpunit", "--no-progress"],
+    },
+  ];
+  assert.equal(
+    (
+      await resolveValidationObligationMatches(
+        twoRequired,
+        [executions[1]],
+        cwd,
+      )
+    ).length,
+    1,
+  );
+});
+
+test("PHPUnit evidence becomes stale when configuration or bootstrap changes", async () => {
+  const cwd = await phpunitFixture();
+  const state = newState(cwd, "freshness", config(), await baseline(cwd));
+  const command = {
+    id: "phpunit",
+    executable: "php",
+    args: ["vendor/bin/phpunit", "--colors=never"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  const result = await recordVerifiedCommandResult(
+    state,
+    command,
+    { id: command.id, exitCode: 0, output: "OK", sandbox },
+    "tester",
+    1,
+  );
+  assert.ok(result);
+  assert.equal(
+    isVerifiedCommandResultCurrent(
+      result,
+      await repositoryEvidenceState(state),
+    ),
+    true,
+  );
+  await writeFile(join(cwd, "tests/bootstrap.php"), "<?php // changed\n");
+  assert.equal(
+    isVerifiedCommandResultCurrent(
+      result,
+      await repositoryEvidenceState(state),
+    ),
+    false,
+  );
+});
+
+test("an equivalent nonzero PHPUnit run blocks until a later equivalent correction passes", async () => {
+  const cwd = await phpunitFixture({});
+  const cfg = config();
+  const required = {
+    id: "required-phpunit",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  cfg.commands = [];
+  cfg.qualityGates.commit.enabled = false;
+  const state = newState(cwd, "equivalent failure", cfg, await baseline(cwd));
+  state.results.reviewer = {
+    ...contract,
+    filesToModify: ["app/Service.php"],
+  };
+  state.discoveredCommands = [
+    {
+      command: required,
+      source: "phpunit.xml + vendor/bin/phpunit",
+      confidence: "high",
+      category: "test",
+    },
+  ];
+  const addExecution = async (
+    id: string,
+    args: string[],
+    exitCode: number,
+    completedAt: string,
+  ) => {
+    const command = {
+      id,
+      executable: "php",
+      args,
+      purpose: "test" as const,
+      timeoutMs: 120000,
+    };
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      {
+        id,
+        exitCode,
+        output: exitCode
+          ? "FAILURES!\nTests: 1 failed, 72 passed"
+          : "OK (73 tests, 415 assertions)",
+        completedAt,
+        sandbox,
+      },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    state.verifiedCommandResults.push(result);
+  };
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async () => {},
+      getLastAssistantText: () =>
+        JSON.stringify({ status: "PASS", commands: [], failedAreas: [] }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+
+  await addExecution(
+    "failed-equivalent",
+    ["vendor/bin/phpunit", "--colors=never"],
+    1,
+    "2026-10-28T10:00:00.000Z",
+  );
+  const failed = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    1,
+  )) as any;
+  assert.equal(failed.status, "FAIL");
+  assert.deepEqual(failed.failedAreas, [required.id]);
+  const failedOutcome = failed.validationOutcomes.find(
+    (item: any) => item.requiredCommandId === required.id,
+  );
+  assert.equal(failedOutcome.matchType, "VERIFIED_EQUIVALENT");
+  assert.equal(failedOutcome.satisfiedByCommandId, undefined);
+
+  await addExecution(
+    "corrected-equivalent",
+    ["vendor/bin/phpunit", "--no-progress"],
+    0,
+    "2026-10-28T10:00:01.000Z",
+  );
+  const passed = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    2,
+  )) as any;
+  assert.equal(passed.status, "PASS", passed.reason);
+  assert.equal(
+    passed.validationOutcomes.find(
+      (item: any) => item.requiredCommandId === required.id,
+    ).satisfiedByCommandId,
+    "corrected-equivalent",
+  );
+  assert.equal(state.verifiedCommandResults.length, 2);
+});
+
+test("the reported Laravel PHPUnit incident is satisfied by equivalent persisted evidence", async () => {
+  const cwd = await phpunitFixture({});
+  const cfg = config();
+  cfg.commands = [];
+  cfg.qualityGates.commit.enabled = false;
+  let state = newState(cwd, "Laravel localization", cfg, await baseline(cwd));
+  state.results.reviewer = {
+    ...contract,
+    goal: "Validate Laravel localization",
+    filesToModify: ["math.js"],
+  };
+  const required = {
+    id: "detected-80a27dc5b522",
+    executable: "php",
+    args: ["vendor/bin/phpunit"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  state.discoveredCommands = [
+    {
+      command: required,
+      source: "phpunit.xml + vendor/bin/phpunit",
+      confidence: "high",
+      category: "test",
+      execution: {
+        platform: "win32",
+        launcher: "interpreter",
+        requiresShell: false,
+        interpreter: "php",
+        equivalentOf: "vendor/bin/phpunit",
+      },
+    },
+  ];
+  const executed = {
+    id: "detected-8ed057d5f441",
+    executable: "php",
+    args: ["vendor/bin/phpunit", "--colors=never"],
+    purpose: "test" as const,
+    verificationId: "phpunit.full_suite",
+    timeoutMs: 120000,
+  };
+  const evidence = await recordVerifiedCommandResult(
+    state,
+    executed,
+    {
+      id: executed.id,
+      exitCode: 0,
+      output: "PHPUnit 12.5.35\n\nOK (73 tests, 415 assertions)",
+      completedAt: "2026-10-28T10:00:00.000Z",
+      processStarted: true,
+      platform: "win32",
+      sandbox,
+    },
+    "tester",
+    4,
+  );
+  assert.ok(evidence);
+  state.verifiedCommandResults.push(evidence);
+  state = validateState(structuredClone(state));
+
+  let retryInput: any;
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async (input: string) => {
+        retryInput = JSON.parse(input);
+      },
+      getLastAssistantText: () =>
+        JSON.stringify({ status: "PASS", commands: [], failedAreas: [] }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const result = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    5,
+  )) as any;
+  assert.equal(result.status, "PASS", result.reason);
+  assert.equal(retryInput.verifiedCommandResults.length, 1);
+  assert.equal(
+    retryInput.verifiedCommandResults[0].command.id,
+    "detected-8ed057d5f441",
+  );
+  const outcome = result.validationOutcomes.find(
+    (item: any) => item.requiredCommandId === required.id,
+  );
+  assert.deepEqual(
+    {
+      outcome: outcome.outcome,
+      requiredCommandId: outcome.requiredCommandId,
+      satisfiedByCommandId: outcome.satisfiedByCommandId,
+      matchType: outcome.matchType,
+      matchReasonCode: outcome.matchReasonCode,
+    },
+    {
+      outcome: "PASS",
+      requiredCommandId: "detected-80a27dc5b522",
+      satisfiedByCommandId: "detected-8ed057d5f441",
+      matchType: "VERIFIED_EQUIVALENT",
+      matchReasonCode: "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE",
+    },
+  );
+  assert.equal(state.verifiedCommandResults.length, 1);
 });
