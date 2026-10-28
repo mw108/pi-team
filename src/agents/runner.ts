@@ -1374,6 +1374,24 @@ export class PiRunner implements AgentRunner {
         const applicability = await validationApplicability(state);
         const required = requiredValidationCommands(applicability);
         const requiredKeys = new Set(required.map(commandKey));
+        const policyFor = (identity: string) =>
+          applicability.find(
+            (policy) => commandKey(policy.command) === identity,
+          );
+        for (const policy of applicability)
+          record(
+            state,
+            "validation_applicability_decided",
+            `${policy.command.id}: ${policy.status}. ${policy.explanation}`,
+            {
+              agent: "tester",
+              attempt,
+              commandId: policy.command.id,
+              applicability: policy.status,
+              applicabilityReasonCode: policy.reasonCode,
+              applicabilityEvidence: policy.evidence.slice(0, 8),
+            },
+          );
         // Current evidence from an earlier Tester attempt may satisfy an
         // unchanged required gate. Ad-hoc diagnostics remain attempt-local.
         const selected = current.filter(
@@ -1402,6 +1420,7 @@ export class PiRunner implements AgentRunner {
               state.cwd,
             );
             if (superseded) {
+              const policy = policyFor(item.commandIdentity);
               supersededIdentities.add(item.commandIdentity);
               supersededOutcomes.push({
                 id: item.command.id,
@@ -1411,7 +1430,13 @@ export class PiRunner implements AgentRunner {
                 outcome: outcome.category,
                 reason: `${outcome.reason}. A later equivalent diagnostic superseded this invocation error.`,
                 recoverable: false,
-                applicability: "REQUIRED",
+                applicability: policy?.status ?? "REQUIRED",
+                applicabilityReasonCode:
+                  policy?.reasonCode ?? "EXECUTED_TESTER_VALIDATION",
+                applicabilityExplanation:
+                  policy?.explanation ??
+                  "The Tester executed this validation during the current attempt.",
+                applicabilityEvidence: policy?.evidence ?? [],
                 supersededBy: superseded.executionId,
               });
               record(state, "test_invocation_superseded", outcome.reason, {
@@ -1442,10 +1467,6 @@ export class PiRunner implements AgentRunner {
           exitCode: item.exitCode,
           output: item.output,
         }));
-        const policyFor = (identity: string) =>
-          applicability.find(
-            (policy) => commandKey(policy.command) === identity,
-          );
         result.validationOutcomes = [
           ...supersededOutcomes,
           ...authoritative.map(({ item, outcome, id }) => {
@@ -1458,10 +1479,16 @@ export class PiRunner implements AgentRunner {
               validatorSource: outcome.validatorIdentity.source,
               outcome: notApplicable ? "NOT_APPLICABLE" : outcome.category,
               reason: notApplicable
-                ? `${policy.reason} The command's recorded execution outcome was ${outcome.category}; it is not reported as passing.`
+                ? `${policy.explanation} The command's recorded execution outcome was ${outcome.category}; it is not reported as passing.`
                 : outcome.reason,
               recoverable: notApplicable ? false : outcome.recoverable,
               applicability: policy?.status ?? "REQUIRED",
+              applicabilityReasonCode:
+                policy?.reasonCode ?? "EXECUTED_TESTER_VALIDATION",
+              applicabilityExplanation:
+                policy?.explanation ??
+                "The Tester executed this validation during the current attempt.",
+              applicabilityEvidence: policy?.evidence ?? [],
               ...(notApplicable ? { executionOutcome: outcome.category } : {}),
             };
           }),
@@ -1484,9 +1511,12 @@ export class PiRunner implements AgentRunner {
             validator: identity?.tool ?? "UNKNOWN",
             validatorSource: identity?.source ?? "unknown",
             outcome: "NOT_APPLICABLE",
-            reason: policy.reason,
+            reason: policy.explanation,
             recoverable: false,
             applicability: policy.status,
+            applicabilityReasonCode: policy.reasonCode,
+            applicabilityExplanation: policy.explanation,
+            applicabilityEvidence: policy.evidence,
           });
         }
         if (commandDenied) {
@@ -1533,7 +1563,7 @@ export class PiRunner implements AgentRunner {
         ) {
           result.status = "BLOCKED";
           result.reason = ambiguous.length
-            ? `Validation applicability is unresolved: ${ambiguous.map((policy) => `${policy.command.id}: ${policy.reason}`).join("; ")}. Clarify whether each build is a required quality gate; command execution approval is not a gate waiver.`
+            ? `Validation applicability is unresolved: ${ambiguous.map((policy) => `${policy.command.id}: ${policy.explanation}`).join("; ")}. Clarify whether each build is a required quality gate; command execution approval is not a gate waiver.`
             : unresolved.length
               ? `${unresolved.map(({ id, outcome }) => `${id}: ${outcome.reason}`).join("; ")}. Run a valid, current verification command or resolve the required tool availability.`
               : `Required validation is missing: ${missing.map((c) => c.id).join(", ") || "no verified commands"}.`;
@@ -1596,7 +1626,7 @@ export class PiRunner implements AgentRunner {
             (policy) => policy.status === "NOT_APPLICABLE",
           );
           result.reason = notApplicable.length
-            ? `Host-verified required validation commands passed. ${notApplicable.map((policy) => `${policy.command.id}: build not applicable (${policy.reason})`).join("; ")}.`
+            ? `Host-verified required validation commands passed. ${notApplicable.map((policy) => `${policy.command.id}: build not applicable (${policy.explanation})`).join("; ")}.`
             : "Host-verified required validation commands passed.";
         }
         if (proposedStatus !== result.status)

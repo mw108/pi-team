@@ -1,5 +1,36 @@
 # Investigation and implementation choices
 
+## Explainable validation applicability follow-up (2026-10-28)
+
+The remaining Laravel/Vite regression was in
+`buildApplicability()` in `src/workflow/validation-applicability.ts`. After
+Contract and CI checks, it recursively scanned every PHP or Blade file under
+`resources/views`. The first `@vite`, `Vite::asset`, `mix`, or generated-asset
+reference immediately returned `REQUIRED`; the scan did not establish that the
+view was reachable or used. An incidental Laravel scaffold view could therefore
+turn a backend-only localization workflow into a mandatory Vite gate. The
+discovered `package.json scripts.build` command made the command available for
+classification, but `composer.json scripts.setup`, the localized email Blade
+templates, and `vite.config.js` did not themselves cause the decision.
+
+Applicability now follows explicit precedence: workflow configuration,
+positive Contract requirements, checked-in CI, verified test/CI script
+invocation, native framework/compiler gates, verified runtime consumers, and
+verified task scope. Setup, development, and build-script references are
+bounded supporting evidence rather than quality-gate declarations. Deployment,
+unknown script intent, and unresolved non-scaffold view usage remain
+`AMBIGUOUS`. An unreferenced default Laravel welcome view is recorded as
+incidental scaffold evidence. Server-rendered email localization has no asset
+build implication.
+
+Each host decision now carries a stable reason code, an English explanation,
+and bounded `{ source, reference, detail }` evidence. Tester outcomes and
+history persist this provenance; `/team-status` renders a concise build
+decision. The new fields are optional at persistence boundaries, so historical
+states remain readable and are not rewritten. Authorization, execution
+identity, evidence freshness, required-gate aggregation, repository drift, and
+Commit Agent protections remain independent and unchanged.
+
 ## Context-aware validation and diagnostic evidence (2026-10-28)
 
 The incident was caused by four independent boundary errors in the validation

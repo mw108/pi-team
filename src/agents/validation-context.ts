@@ -19,8 +19,9 @@ export interface CandidateValidationCommand {
   interpreter?: string;
   equivalentOf?: string;
   applicability?: ValidationApplicability["status"];
-  applicabilityReason?: string;
-  applicabilityEvidence?: string[];
+  applicabilityReasonCode?: string;
+  applicabilityExplanation?: string;
+  applicabilityEvidence?: ValidationApplicability["evidence"];
 }
 
 function validationHintPurpose(command: {
@@ -183,7 +184,8 @@ export function testerValidationContext(
     if (policy)
       Object.assign(candidate, {
         applicability: policy.status,
-        applicabilityReason: policy.reason,
+        applicabilityReasonCode: policy.reasonCode,
+        applicabilityExplanation: policy.explanation,
         applicabilityEvidence: policy.evidence,
       });
   }

@@ -444,6 +444,18 @@ export const persistedTestSchema = z.object({
         applicability: z
           .enum(["REQUIRED", "OPTIONAL", "NOT_APPLICABLE", "AMBIGUOUS"])
           .optional(),
+        applicabilityReasonCode: z.string().max(120).optional(),
+        applicabilityExplanation: z.string().max(2000).optional(),
+        applicabilityEvidence: z
+          .array(
+            z.object({
+              source: z.string().max(120),
+              reference: z.string().max(500).optional(),
+              detail: z.string().max(1000).optional(),
+            }),
+          )
+          .max(8)
+          .optional(),
         executionOutcome: z
           .enum([
             "PASS",
@@ -504,7 +516,14 @@ export const completionReportSchema = z.object({
   validation: z.array(
     z.object({
       label: text,
-      status: z.enum(["passed", "failed", "disabled", "not-run", "warning"]),
+      status: z.enum([
+        "passed",
+        "failed",
+        "disabled",
+        "not-run",
+        "not-applicable",
+        "warning",
+      ]),
       detail: z.string().optional(),
     }),
   ),

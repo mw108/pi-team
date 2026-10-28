@@ -534,6 +534,20 @@ export function renderProgress(
     );
   for (const role of visibleRoles(state))
     lines.push(...displayAgent(role, state, runtime, showIds));
+  const buildApplicability =
+    state.results.tester?.validationOutcomes?.filter(
+      (outcome) =>
+        outcome.validationType === "BUILD" && !!outcome.applicability,
+    ) ?? [];
+  for (const outcome of buildApplicability.slice(0, 3)) {
+    lines.push(`Build applicability: ${outcome.applicability}`);
+    if (outcome.applicabilityExplanation)
+      lines.push(`Reason: ${outcome.applicabilityExplanation}`);
+    const source = outcome.applicabilityEvidence?.find(
+      (evidence) => evidence.reference,
+    );
+    if (source) lines.push(`Source: ${source.reference}`);
+  }
   const gates = [
     ...(!state.config.qualityGates.pentest.enabled ? ["Pentest disabled"] : []),
     ...(

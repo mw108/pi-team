@@ -16,6 +16,8 @@ export interface ValidationCommandResult {
   exitCode: number;
   timedOut: boolean;
   durationMs?: number;
+  applicability?: "REQUIRED" | "OPTIONAL" | "NOT_APPLICABLE" | "AMBIGUOUS";
+  applicabilityReasonCode?: string;
 }
 export interface CompletionReportInput {
   workflowId: string;
@@ -155,6 +157,9 @@ export async function buildCompletionReportInput(
     const command = [...s.approvedCommands, ...s.config.commands].find(
       (c) => c.id === result.id,
     );
+    const outcome = tester?.validationOutcomes?.find(
+      (candidate) => candidate.id === result.id,
+    );
     validationCommands.push({
       id: result.id,
       ...(command
@@ -167,6 +172,12 @@ export async function buildCompletionReportInput(
       success: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode,
       timedOut: !!result.timedOut,
+      ...(outcome?.applicability
+        ? { applicability: outcome.applicability }
+        : {}),
+      ...(outcome?.applicabilityReasonCode
+        ? { applicabilityReasonCode: outcome.applicabilityReasonCode }
+        : {}),
       ...(typeof result.durationMs === "number"
         ? { durationMs: result.durationMs }
         : {}),
@@ -175,10 +186,31 @@ export async function buildCompletionReportInput(
       label: command
         ? [command.executable, ...command.args].join(" ")
         : `Command ${result.id}`,
-      status: result.exitCode === 0 && !result.timedOut ? "passed" : "failed",
-      detail: `exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}`,
+      status:
+        outcome?.applicability === "NOT_APPLICABLE"
+          ? "not-applicable"
+          : result.exitCode === 0 && !result.timedOut
+            ? "passed"
+            : "failed",
+      detail:
+        outcome?.applicability === "NOT_APPLICABLE"
+          ? `${outcome.applicabilityExplanation ?? outcome.reason} Recorded execution: exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}.`
+          : `exit ${result.exitCode}${result.timedOut ? "; timed out" : ""}`,
     });
   }
+  const reportedCommands = new Set(
+    (tester?.commands ?? []).map((result) => result.id),
+  );
+  for (const outcome of tester?.validationOutcomes ?? [])
+    if (
+      outcome.applicability === "NOT_APPLICABLE" &&
+      !reportedCommands.has(outcome.id)
+    )
+      validation.push({
+        label: `Build ${outcome.id}`,
+        status: "not-applicable",
+        detail: outcome.applicabilityExplanation ?? outcome.reason,
+      });
   const unresolvedIssues = unique([
     ...(review?.findings ?? []).map((f) => `${f.severity}: ${f.problem}`),
     ...(pentest?.findings ?? [])

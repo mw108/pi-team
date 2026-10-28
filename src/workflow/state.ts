@@ -339,6 +339,17 @@ export const stateSchema = z.object({
           applicability: z
             .enum(["REQUIRED", "OPTIONAL", "NOT_APPLICABLE", "AMBIGUOUS"])
             .optional(),
+          applicabilityReasonCode: z.string().max(120).optional(),
+          applicabilityEvidence: z
+            .array(
+              z.object({
+                source: z.string().max(120),
+                reference: z.string().max(500).optional(),
+                detail: z.string().max(1000).optional(),
+              }),
+            )
+            .max(8)
+            .optional(),
           failedAreas: z.array(z.string()).optional(),
         })
         .optional(),

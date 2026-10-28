@@ -1,5 +1,5 @@
 import { readFile, readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { Command, DiscoveredCommand } from "../config/schema.ts";
 import { commandKey } from "../agents/discovery.ts";
 import { contractSchema } from "../agents/schemas.ts";
@@ -15,15 +15,54 @@ export const validationApplicabilityStatuses = [
 export type ValidationApplicabilityStatus =
   (typeof validationApplicabilityStatuses)[number];
 
+export const validationScriptContexts = [
+  "SETUP",
+  "DEVELOPMENT",
+  "BUILD",
+  "TEST",
+  "CI",
+  "DEPLOYMENT",
+  "UNKNOWN",
+] as const;
+export type ValidationScriptContext = (typeof validationScriptContexts)[number];
+
+export interface ValidationApplicabilityEvidence {
+  source: string;
+  reference?: string;
+  detail?: string;
+}
+
 export interface ValidationApplicability {
   command: Command;
   discovery: "CONFIGURED" | "DISCOVERED";
   status: ValidationApplicabilityStatus;
-  reason: string;
-  evidence: string[];
+  reasonCode: string;
+  explanation: string;
+  evidence: ValidationApplicabilityEvidence[];
   source?: string;
   category?: DiscoveredCommand["category"];
 }
+
+interface ContractEvidence {
+  paths: string[];
+  statements: { reference: string; text: string; requiredField: boolean }[];
+  requiredTests: number;
+}
+
+interface ScriptReference {
+  context: ValidationScriptContext;
+  reference: string;
+  detail: string;
+}
+
+interface RuntimeAssetEvidence {
+  required?: ValidationApplicabilityEvidence;
+  ambiguous?: ValidationApplicabilityEvidence;
+  ignored: ValidationApplicabilityEvidence[];
+}
+
+const assetConsumerPattern =
+  /@vite\s*\(|Vite::asset\s*\(|mix\s*\(|(?:asset|public_path|base_path)\s*\([^)]*(?:manifest|build|dist)/i;
 
 async function readSmall(path: string): Promise<string | undefined> {
   try {
@@ -41,8 +80,16 @@ async function exists(path: string): Promise<boolean> {
     .catch(() => false);
 }
 
+function repositoryReference(cwd: string, path: string) {
+  return relative(cwd, path).replaceAll("\\", "/");
+}
+
 function renderedCommand(command: Pick<Command, "executable" | "args">) {
   return [command.executable, ...command.args].join(" ");
+}
+
+function escaped(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 async function ciReferencesCommand(
@@ -67,38 +114,79 @@ async function ciReferencesCommand(
   }
 }
 
-async function filesContaining(
+async function matchingFiles(
   root: string,
   pattern: RegExp,
-  limit = 512,
-): Promise<string | undefined> {
+  options: { limit?: number; excludeViews?: boolean } = {},
+): Promise<string[]> {
   const pending = [root];
+  const matches: string[] = [];
   let inspected = 0;
-  while (pending.length && inspected < limit) {
+  const limit = options.limit ?? 512;
+  while (pending.length && inspected < limit && matches.length < 20) {
     const directory = pending.shift()!;
     for (const entry of await readdir(directory, { withFileTypes: true }).catch(
       () => [],
     )) {
-      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      if (
+        entry.name.startsWith(".") ||
+        ["node_modules", "vendor", "storage"].includes(entry.name)
+      )
+        continue;
       const path = join(directory, entry.name);
-      if (entry.isDirectory()) pending.push(path);
-      else if (
-        entry.isFile() &&
-        /\.(?:php|blade\.php|html|twig)$/i.test(entry.name)
-      ) {
+      const normalized = path.replaceAll("\\", "/");
+      if (
+        entry.isDirectory() &&
+        !(options.excludeViews && /\/resources\/views$/i.test(normalized))
+      )
+        pending.push(path);
+      else if (entry.isFile() && /(?:\.blade)?\.php$/i.test(entry.name)) {
         inspected++;
         const text = await readSmall(path);
-        if (text && pattern.test(text)) return path;
+        pattern.lastIndex = 0;
+        if (text && pattern.test(text)) matches.push(path);
       }
     }
   }
+  return matches;
 }
 
-function contractEvidence(state: WorkflowState) {
+function contractEvidence(state: WorkflowState): ContractEvidence {
   const parsed = contractSchema.safeParse(state.results.reviewer);
-  if (!parsed.success)
-    return { paths: [] as string[], text: "", requiredTests: 0 };
+  if (!parsed.success) return { paths: [], statements: [], requiredTests: 0 };
   const contract = parsed.data;
+  const statements: ContractEvidence["statements"] = [];
+  const add = (reference: string, values: string[], requiredField = false) =>
+    values.forEach((text, index) =>
+      statements.push({
+        reference: `${reference}[${index}]`,
+        text,
+        requiredField,
+      }),
+    );
+  statements.push({
+    reference: "goal",
+    text: contract.goal,
+    requiredField: false,
+  });
+  add("requiredChanges", contract.requiredChanges, true);
+  add("technicalDecisions", contract.technicalDecisions);
+  add("constraints", contract.constraints);
+  add("acceptanceCriteria", contract.acceptanceCriteria, true);
+  contract.requiredTests.forEach((test, index) => {
+    statements.push({
+      reference: `requiredTests[${index}].description`,
+      text: test.description,
+      requiredField: true,
+    });
+    (test.acceptanceCriteria ?? []).forEach((text, criterion) =>
+      statements.push({
+        reference: `requiredTests[${index}].acceptanceCriteria[${criterion}]`,
+        text,
+        requiredField: true,
+      }),
+    );
+  });
   return {
     paths: [
       ...contract.filesToModify,
@@ -109,21 +197,158 @@ function contractEvidence(state: WorkflowState) {
       ),
       ...state.observedImplementorMutations.map((mutation) => mutation.path),
     ],
-    text: [
-      contract.goal,
-      ...contract.requiredChanges,
-      ...contract.technicalDecisions,
-      ...contract.constraints,
-      ...contract.acceptanceCriteria,
-      ...contract.requiredTests.flatMap((test) => [
-        test.description,
-        ...(test.acceptanceCriteria ?? []),
-      ]),
-    ]
-      .join("\n")
-      .toLowerCase(),
+    statements,
     requiredTests: contract.requiredTests.length,
   };
+}
+
+function isNegatedBuildStatement(text: string) {
+  return [
+    /\b(?:do|does|did|must|should|need)\s+not\b[^.\n]{0,100}\b(?:build|compile|bundle|npm\s+run\s+build)\b/i,
+    /\b(?:no|not)\b[^.\n]{0,60}\b(?:build|compile|bundle)\b[^.\n]{0,60}\b(?:required|needed|necessary|applicable)\b/i,
+    /\b(?:build|compile|bundle|npm\s+run\s+build)\b[^.\n]{0,60}\b(?:is|are)?\s*(?:not|optional|required\s+only\s+for)\b/i,
+    /\b(?:without|exclude|excluding|skip)\b[^.\n]{0,80}\b(?:build|compile|bundle|npm\s+run\s+build)\b/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+function contractBuildRequirement(
+  contract: ContractEvidence,
+  command: Command,
+): ValidationApplicabilityEvidence | undefined {
+  const exact = new RegExp(`\\b${escaped(renderedCommand(command))}\\b`, "i");
+  const build = /\b(?:build|compile|bundle)(?:ing)?\b/i;
+  const positive =
+    /\b(?:must|shall|required|require|verify|verification|validate|validation|pass|succeed)\b/i;
+  const imperative =
+    /^\s*(?:run|execute)\s+(?:the\s+)?(?:npm\s+run\s+build|build|compile|bundle)\b/i;
+  for (const statement of contract.statements) {
+    if (
+      (!exact.test(statement.text) && !build.test(statement.text)) ||
+      isNegatedBuildStatement(statement.text)
+    )
+      continue;
+    if (
+      statement.requiredField ||
+      positive.test(statement.text) ||
+      imperative.test(statement.text)
+    )
+      return {
+        source: "implementation_contract",
+        reference: statement.reference,
+        detail: exact.test(statement.text)
+          ? `Explicitly requires ${renderedCommand(command)}.`
+          : "Explicitly requires build verification.",
+      };
+  }
+}
+
+export function classifyValidationScriptContext(
+  name: string,
+): ValidationScriptContext {
+  const normalized = name.trim().toLowerCase();
+  if (
+    ["setup", "install", "bootstrap", "init", "initialize"].includes(normalized)
+  )
+    return "SETUP";
+  if (
+    ["dev", "develop", "development", "serve", "start", "watch"].includes(
+      normalized,
+    )
+  )
+    return "DEVELOPMENT";
+  if (["build", "compile", "bundle"].includes(normalized)) return "BUILD";
+  if (["test", "tests", "check", "verify", "validate"].includes(normalized))
+    return "TEST";
+  if (["ci", "continuous-integration"].includes(normalized)) return "CI";
+  if (["deploy", "deployment", "release", "publish"].includes(normalized))
+    return "DEPLOYMENT";
+  return "UNKNOWN";
+}
+
+function scriptLines(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  return Array.isArray(value)
+    ? value.filter((line): line is string => typeof line === "string")
+    : [];
+}
+
+function referencedLocalScripts(
+  manager: "npm" | "composer",
+  line: string,
+): string[] {
+  const names: string[] = [];
+  const pattern =
+    manager === "npm"
+      ? /\bnpm\s+run\s+([\w:-]+)/gi
+      : /(?:^|\s)@([\w:-]+)(?=\s|$)|\bcomposer\s+(?:run\s+)?([\w:-]+)/gi;
+  for (const match of line.matchAll(pattern)) names.push(match[1] ?? match[2]);
+  return names;
+}
+
+function lineInvokesCommand(line: string, command: Command) {
+  const expected = escaped(renderedCommand(command));
+  return new RegExp(
+    `(?:^|[;&|]\\s*|\\s)${expected}(?=\\s*(?:$|[;&|]))`,
+    "i",
+  ).test(line.trim());
+}
+
+async function projectScriptReferences(
+  cwd: string,
+  command: Command,
+): Promise<ScriptReference[]> {
+  const references: ScriptReference[] = [];
+  for (const [file, manager] of [
+    ["package.json", "npm"],
+    ["composer.json", "composer"],
+  ] as const) {
+    let scripts: Record<string, unknown>;
+    try {
+      const document = JSON.parse((await readSmall(join(cwd, file))) ?? "");
+      if (
+        !document.scripts ||
+        typeof document.scripts !== "object" ||
+        Array.isArray(document.scripts)
+      )
+        continue;
+      scripts = document.scripts;
+    } catch {
+      continue;
+    }
+    for (const root of Object.keys(scripts)) {
+      const context = classifyValidationScriptContext(root);
+      const pending = [root];
+      const visited = new Set<string>();
+      while (pending.length) {
+        const name = pending.shift()!;
+        if (visited.has(name)) continue;
+        visited.add(name);
+        for (const line of scriptLines(scripts[name])) {
+          if (lineInvokesCommand(line, command)) {
+            references.push({
+              context,
+              reference: `${file} scripts.${root}`,
+              detail:
+                name === root
+                  ? `${context} script invokes ${renderedCommand(command)}.`
+                  : `${context} script invokes ${renderedCommand(command)} transitively through scripts.${name}.`,
+            });
+          }
+          for (const child of referencedLocalScripts(manager, line))
+            if (Object.hasOwn(scripts, child)) pending.push(child);
+        }
+      }
+    }
+  }
+  return references.filter(
+    (reference, index, all) =>
+      all.findIndex(
+        (candidate) =>
+          candidate.context === reference.context &&
+          candidate.reference === reference.reference &&
+          candidate.detail === reference.detail,
+      ) === index,
+  );
 }
 
 function frontendScope(paths: string[]): string[] {
@@ -143,94 +368,139 @@ function phpScope(paths: string[]): boolean {
   return paths.some((path) => /\.(?:php|blade\.php)$/i.test(path));
 }
 
+function viewName(cwd: string, path: string) {
+  return repositoryReference(join(cwd, "resources", "views"), path)
+    .replace(/\.blade\.php$/i, "")
+    .replaceAll("/", ".");
+}
+
+async function runtimeAssetEvidence(
+  cwd: string,
+): Promise<RuntimeAssetEvidence> {
+  const viewsRoot = join(cwd, "resources", "views");
+  const assetViews = await matchingFiles(viewsRoot, assetConsumerPattern);
+  const ignored: ValidationApplicabilityEvidence[] = [];
+  let ambiguous: ValidationApplicabilityEvidence | undefined;
+  for (const path of assetViews) {
+    const name = viewName(cwd, path);
+    const usage = new RegExp(
+      `(?:view|View::make|Route::view)\\s*\\([^)]*['\"]${escaped(name)}['\"]`,
+      "i",
+    );
+    const consumers = await matchingFiles(cwd, usage, { excludeViews: true });
+    if (consumers.length)
+      return {
+        required: {
+          source: "runtime_asset_consumer",
+          reference: repositoryReference(cwd, path),
+          detail: `Referenced by ${repositoryReference(cwd, consumers[0])}.`,
+        },
+        ignored,
+      };
+    const reference = repositoryReference(cwd, path);
+    if (name === "welcome")
+      ignored.push({
+        source: "incidental_framework_scaffold",
+        reference,
+        detail:
+          "The default welcome view consumes assets but has no verified runtime reference.",
+      });
+    else
+      ambiguous ??= {
+        source: "unresolved_asset_consumer",
+        reference,
+        detail:
+          "The view consumes built assets, but its runtime usage could not be verified.",
+      };
+  }
+  const directConsumers = await matchingFiles(cwd, assetConsumerPattern, {
+    excludeViews: true,
+  });
+  if (directConsumers.length)
+    return {
+      required: {
+        source: "runtime_asset_consumer",
+        reference: repositoryReference(cwd, directConsumers[0]),
+        detail: "Runtime application code directly consumes generated assets.",
+      },
+      ignored,
+    };
+  return { ambiguous, ignored };
+}
+
+function decision(
+  discovered: DiscoveredCommand,
+  status: ValidationApplicabilityStatus,
+  reasonCode: string,
+  explanation: string,
+  evidence: ValidationApplicabilityEvidence[],
+): ValidationApplicability {
+  return {
+    command: discovered.command,
+    discovery: "DISCOVERED",
+    status,
+    reasonCode,
+    explanation,
+    evidence,
+    source: discovered.source,
+    category: discovered.category,
+  };
+}
+
 async function buildApplicability(
   state: WorkflowState,
   discovered: DiscoveredCommand,
 ): Promise<ValidationApplicability> {
   const { command } = discovered;
   const contract = contractEvidence(state);
-  const evidence: string[] = [];
-  const explicitCommand = renderedCommand(command).toLowerCase();
-  if (
-    contract.text.includes(explicitCommand) ||
-    /\b(?:run|require|required|verify|verification|validate)\b[^.\n]{0,80}\b(?:build|compile|bundle)(?:ing)?\b/i.test(
-      contract.text,
-    ) ||
-    /\b(?:build|compile|bundle)(?:ing)?\b[^.\n]{0,80}\b(?:require|required|verify|verification|validate)\b/i.test(
-      contract.text,
-    )
-  ) {
-    evidence.push("The Implementation Contract explicitly requires a build.");
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason: "The build is an explicit workflow requirement.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
+  const explicit = contractBuildRequirement(contract, command);
+  if (explicit)
+    return decision(
+      discovered,
+      "REQUIRED",
+      "EXPLICIT_CONTRACT_REQUIREMENT",
+      "The Implementation Contract explicitly requires this build.",
+      [explicit],
+    );
+
   const ciFile = await ciReferencesCommand(state.cwd, command);
-  if (ciFile) {
-    evidence.push(`Project CI invokes the exact command in ${ciFile}.`);
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason: "The project's checked-in CI configuration requires this build.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
-  const frontendPaths = frontendScope(contract.paths);
-  if (frontendPaths.length) {
-    evidence.push(
-      `The workflow scope includes frontend assets: ${frontendPaths.slice(0, 5).join(", ")}.`,
+  if (ciFile)
+    return decision(
+      discovered,
+      "REQUIRED",
+      "EXPLICIT_CI_REQUIREMENT",
+      "The checked-in CI pipeline explicitly requires this build.",
+      [{ source: "ci_configuration", reference: ciFile }],
     );
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason:
-        "Frontend files in the current workflow require build verification.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
-  if (await exists(join(state.cwd, "angular.json"))) {
-    evidence.push("angular.json establishes an Angular application workspace.");
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason:
-        "The discovered build is the native build gate for this Angular project.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
-  const runtimeReference = await filesContaining(
-    join(state.cwd, "resources", "views"),
-    /@vite\s*\(|Vite::asset\s*\(|mix\s*\(|(?:public_path|base_path)\s*\([^)]*(?:manifest|build)/i,
+
+  const scriptReferences = await projectScriptReferences(state.cwd, command);
+  const testScript = scriptReferences.find((reference) =>
+    ["TEST", "CI"].includes(reference.context),
   );
-  if (runtimeReference) {
-    evidence.push(
-      "A checked-in server-rendered entry point consumes built assets.",
+  if (testScript)
+    return decision(
+      discovered,
+      "REQUIRED",
+      "VERIFIED_QUALITY_SCRIPT_REQUIREMENT",
+      "A project test or CI script explicitly invokes this build.",
+      [
+        {
+          source: "project_script",
+          reference: testScript.reference,
+          detail: testScript.detail,
+        },
+      ],
     );
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason: "Runtime application code references the generated asset build.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
+
+  if (await exists(join(state.cwd, "angular.json")))
+    return decision(
+      discovered,
+      "REQUIRED",
+      "NATIVE_FRAMEWORK_BUILD",
+      "The discovered build is the native validation gate for this Angular workspace.",
+      [{ source: "framework_configuration", reference: "angular.json" }],
+    );
+
   const composer = await readSmall(join(state.cwd, "composer.json"));
   const laravel = Boolean(
     composer &&
@@ -243,51 +513,149 @@ async function buildApplicability(
     identity?.validationType === "BUILD" &&
     identity.tool === "TYPESCRIPT" &&
     (await exists(join(state.cwd, "tsconfig.json")))
-  ) {
-    evidence.push(
-      "The package build resolves to tsc and tsconfig.json is present.",
+  )
+    return decision(
+      discovered,
+      "REQUIRED",
+      "TYPESCRIPT_COMPILER_GATE",
+      "The package build resolves to the compiler gate for this TypeScript project.",
+      [
+        { source: "package_script", reference: discovered.source },
+        { source: "compiler_configuration", reference: "tsconfig.json" },
+      ],
     );
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "REQUIRED",
-      reason: "The TypeScript project build is its compiler validation gate.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
-  if (laravel && !runtimeReference && !frontendPaths.length) {
-    evidence.push(
-      "Laravel is present, but the current Contract changes no frontend files.",
+
+  const runtime = await runtimeAssetEvidence(state.cwd);
+  const frontendPaths = frontendScope(contract.paths);
+  if (runtime.required)
+    return decision(
+      discovered,
+      "REQUIRED",
+      frontendPaths.length
+        ? "ACTIVE_FRONTEND_TASK_SCOPE"
+        : "VERIFIED_RUNTIME_ASSET_DEPENDENCY",
+      frontendPaths.length
+        ? "The current task changes frontend assets consumed by verified runtime code."
+        : "Verified runtime application code consumes the generated asset build.",
+      [
+        runtime.required,
+        ...(frontendPaths.length
+          ? [
+              {
+                source: "implementation_contract",
+                reference: "file scope",
+                detail: `Frontend paths: ${frontendPaths.slice(0, 5).join(", ")}.`,
+              },
+            ]
+          : []),
+      ],
     );
-    evidence.push(
-      "No server-rendered runtime entry point references built assets.",
-    );
-    return {
-      command,
-      discovery: "DISCOVERED",
-      status: "NOT_APPLICABLE",
-      reason:
-        "The build was discovered from project metadata, but host evidence does not connect frontend asset compilation to this workflow.",
-      evidence,
-      source: discovered.source,
-      category: discovered.category,
-    };
-  }
-  evidence.push(
-    "A build script exists, but no decisive requirement or exclusion was found.",
+
+  const deployment = scriptReferences.find(
+    (reference) => reference.context === "DEPLOYMENT",
   );
-  return {
-    command,
-    discovery: "DISCOVERED",
-    status: "AMBIGUOUS",
-    reason:
-      "Build applicability is ambiguous; execution approval alone does not authorize omitting or requiring this quality gate.",
-    evidence,
-    source: discovered.source,
-    category: discovered.category,
-  };
+  if (deployment)
+    return decision(
+      discovered,
+      "AMBIGUOUS",
+      "UNRESOLVED_DEPLOYMENT_BUILD_REQUIREMENT",
+      "A deployment script invokes this build, but no Contract or CI policy establishes it as a Tester quality gate.",
+      [
+        {
+          source: "project_script",
+          reference: deployment.reference,
+          detail: deployment.detail,
+        },
+      ],
+    );
+
+  const unknownScript = scriptReferences.find(
+    (reference) => reference.context === "UNKNOWN",
+  );
+  if (unknownScript)
+    return decision(
+      discovered,
+      "AMBIGUOUS",
+      "UNKNOWN_SCRIPT_BUILD_CONTEXT",
+      "A project script invokes this build, but the script's intent is not established.",
+      [
+        {
+          source: "project_script",
+          reference: unknownScript.reference,
+          detail: unknownScript.detail,
+        },
+      ],
+    );
+
+  if (runtime.ambiguous)
+    return decision(
+      discovered,
+      "AMBIGUOUS",
+      "UNRESOLVED_RUNTIME_ASSET_DEPENDENCY",
+      "A view consumes built assets, but the available repository evidence does not establish whether that view is used at runtime.",
+      [runtime.ambiguous],
+    );
+
+  if (frontendPaths.length)
+    return decision(
+      discovered,
+      laravel ? "AMBIGUOUS" : "REQUIRED",
+      laravel ? "UNRESOLVED_FRONTEND_BUILD_REQUIREMENT" : "FRONTEND_TASK_SCOPE",
+      laravel
+        ? "The task changes frontend sources, but no active Laravel asset consumer was verified."
+        : "The current workflow changes frontend sources governed by the discovered build.",
+      [
+        {
+          source: "implementation_contract",
+          reference: "file scope",
+          detail: `Frontend paths: ${frontendPaths.slice(0, 5).join(", ")}.`,
+        },
+      ],
+    );
+
+  const setup = scriptReferences.filter((reference) =>
+    ["SETUP", "DEVELOPMENT", "BUILD"].includes(reference.context),
+  );
+  if (laravel)
+    return decision(
+      discovered,
+      "NOT_APPLICABLE",
+      "NO_FRONTEND_BUILD_REQUIREMENT",
+      "The task changes only backend or server-rendered files, and no required frontend asset consumer was identified.",
+      [
+        {
+          source: "implementation_contract",
+          reference: "file scope",
+          detail: "No JavaScript or CSS source changes are in scope.",
+        },
+        ...setup.slice(0, 3).map((reference) => ({
+          source: "project_script",
+          reference: reference.reference,
+          detail: `${reference.detail} This context does not establish a Tester quality gate.`,
+        })),
+        ...runtime.ignored.slice(0, 2),
+        {
+          source: "runtime_analysis",
+          detail:
+            "No verified runtime entry point requires generated frontend assets.",
+        },
+      ],
+    );
+
+  return decision(
+    discovered,
+    "AMBIGUOUS",
+    "UNRESOLVED_BUILD_DEPENDENCY",
+    "A build script exists, but no decisive quality-gate requirement or exclusion was found.",
+    [
+      { source: "package_script", reference: discovered.source },
+      ...setup.slice(0, 2).map((reference) => ({
+        source: "project_script",
+        reference: reference.reference,
+        detail: reference.detail,
+      })),
+    ],
+  );
 }
 
 async function discoveredApplicability(
@@ -323,19 +691,23 @@ async function discoveredApplicability(
     (discovered.category === "test"
       ? contract.requiredTests > 0
       : phpScope(contract.paths) || frontendScope(contract.paths).length > 0);
-  return {
-    command: discovered.command,
-    discovery: "DISCOVERED",
-    status: knownProjectGate ? "REQUIRED" : "OPTIONAL",
-    reason: knownProjectGate
+  return decision(
+    discovered,
+    knownProjectGate ? "REQUIRED" : "OPTIONAL",
+    knownProjectGate
+      ? "DISCOVERED_VALIDATION_MATCHES_SCOPE"
+      : "OPTIONAL_DISCOVERED_VALIDATION",
+    knownProjectGate
       ? "High-confidence project validation matches the current Contract scope."
-      : "The command is useful discovered evidence but is not established as a required gate.",
-    evidence: [
-      `${discovered.source} discovered this ${discovered.category} command with ${discovered.confidence} confidence.`,
+      : "The discovered command may provide useful evidence but is not established as a required gate.",
+    [
+      {
+        source: "command_discovery",
+        reference: discovered.source,
+        detail: `${discovered.category}; ${discovered.confidence} confidence.`,
+      },
     ],
-    source: discovered.source,
-    category: discovered.category,
-  };
+  );
 }
 
 export async function validationApplicability(
@@ -347,9 +719,15 @@ export async function validationApplicability(
       command,
       discovery: "CONFIGURED" as const,
       status: "REQUIRED" as const,
-      reason:
+      reasonCode: "EXPLICIT_WORKFLOW_CONFIGURATION",
+      explanation:
         "The command is explicitly configured as a workflow quality gate.",
-      evidence: ["workflow.commands explicitly configures this command."],
+      evidence: [
+        {
+          source: "workflow_configuration",
+          reference: "workflow.commands",
+        },
+      ],
     }));
   const seen = new Set(values.map((value) => commandKey(value.command)));
   for (const discovered of state.discoveredCommands) {

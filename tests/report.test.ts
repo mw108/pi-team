@@ -138,6 +138,50 @@ test("commit and review facts remain authoritative in finalized report", async (
   );
 });
 
+test("report preserves a non-applicable build decision without reporting its execution as a failed gate", async () => {
+  const cwd = await repository();
+  const s = newState(
+    cwd,
+    "backend localization",
+    noCommit(),
+    await baseline(cwd),
+  );
+  s.results.tester = {
+    status: "PASS",
+    commands: [{ id: "test", exitCode: 1, output: "vite unavailable" }],
+    failedAreas: [],
+    validationOutcomes: [
+      {
+        id: "test",
+        validationType: "BUILD",
+        validator: "VITE",
+        validatorSource: "package_script",
+        outcome: "NOT_APPLICABLE",
+        reason: "No frontend build is required.",
+        recoverable: false,
+        applicability: "NOT_APPLICABLE",
+        applicabilityReasonCode: "NO_FRONTEND_BUILD_REQUIREMENT",
+        applicabilityExplanation:
+          "The task changes only backend or server-rendered files.",
+        applicabilityEvidence: [
+          { source: "implementation_contract", reference: "file scope" },
+        ],
+        executionOutcome: "TOOL_UNAVAILABLE",
+      },
+    ],
+  };
+  const input = await buildCompletionReportInput(s);
+  assert.equal(input.validationCommands[0].success, false);
+  assert.equal(input.validationCommands[0].applicability, "NOT_APPLICABLE");
+  const build = input.validation.find((item) => item.label.includes("--test"));
+  assert.equal(build?.status, "not-applicable");
+  assert.match(build?.detail ?? "", /server-rendered files/);
+  assert.equal(
+    input.warnings.some((warning) => warning.includes("not-applicable")),
+    false,
+  );
+});
+
 test("report input preserves review findings, limitations, cycles, and failed command evidence", async () => {
   const cwd = await repository();
   const cfg = config();
