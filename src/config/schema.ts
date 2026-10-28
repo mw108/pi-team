@@ -98,6 +98,11 @@ export const commandSchema = z
     executable: z.string().min(1),
     args: z.array(z.string()),
     purpose: z.enum(commandCategories),
+    verificationId: z
+      .string()
+      .regex(/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/)
+      .max(160)
+      .optional(),
     timeoutMs: z.number().int().positive().max(600000).default(120000),
   })
   .strict()

@@ -1427,7 +1427,7 @@ test("PHPUnit pass plus purpose-mismatched Pint findings routes FIX_LOCAL", asyn
       outcome.outcome,
     ]),
     [
-      ["TEST", "UNKNOWN", "PASS"],
+      ["TEST", "PHPUNIT", "PASS"],
       ["STATIC", "LARAVEL_PINT", "STATIC_FORMAT_FAILURE"],
     ],
   );
@@ -1601,4 +1601,379 @@ test("a later exact rerun clears a genuine failure without deleting its record",
   transition(state);
   assert.equal(state.phase, "REPORT");
   assert.equal(state.localFixCycle, 0);
+});
+
+test("npm build scripts resolve trusted build tools and distinguish unavailable tools from build failures", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "package.json"),
+    JSON.stringify({ scripts: { build: "vite build" } }),
+  );
+  const state = newState(cwd, "build", config(), await baseline(cwd));
+  const command = {
+    id: "build",
+    executable: "npm",
+    args: ["run", "build"],
+    purpose: "static" as const,
+    timeoutMs: 1000,
+  };
+  for (const [output, expected] of [
+    ["vite v7 building for production\n✓ built in 1.2s", "PASS"],
+    [
+      "vite v7 building\nerror during build: Could not resolve ./missing",
+      "BUILD_FAILURE",
+    ],
+    [
+      "'vite' is not recognized as an internal or external command",
+      "TOOL_UNAVAILABLE",
+    ],
+    [
+      'Der Befehl "vite" ist entweder falsch geschrieben oder konnte nicht gefunden werden.',
+      "TOOL_UNAVAILABLE",
+    ],
+    ["sh: 1: vite: not found", "TOOL_UNAVAILABLE"],
+    ["spawn vite ENOENT", "TOOL_UNAVAILABLE"],
+  ] as const) {
+    const exitCode = expected === "PASS" ? 0 : 1;
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      {
+        id: command.id,
+        exitCode,
+        output,
+        processStarted: true,
+        platform: process.platform,
+        sandbox,
+      },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    assert.equal(result.effectiveValidationIdentity?.validationType, "BUILD");
+    assert.equal(result.effectiveValidationIdentity?.tool, "VITE");
+    assert.equal(classifyVerifiedCommand(result).category, expected);
+  }
+});
+
+test("build identity covers Webpack, Next, Angular and TypeScript script builds", async () => {
+  const cwd = await repository();
+  for (const [_name, script, tool] of [
+    ["vite", "vite build", "VITE"],
+    ["webpack", "webpack --mode production", "WEBPACK"],
+    ["next", "next build", "NEXT"],
+    ["angular", "ng build", "ANGULAR"],
+    ["typescript", "tsc -p tsconfig.json", "TYPESCRIPT"],
+  ] as const) {
+    await writeFile(
+      join(cwd, "package.json"),
+      JSON.stringify({ scripts: { build: script } }),
+    );
+    const identity = await resolveEffectiveValidationIdentity(
+      { executable: "npm", args: ["run", "build"], purpose: "static" },
+      cwd,
+    );
+    assert.equal(identity?.validationType, "BUILD");
+    assert.equal(identity?.tool, tool);
+  }
+});
+
+test("PHP evaluation parse errors are invocation errors, while source lint and invariant failures remain real failures", () => {
+  assert.equal(
+    classifyVerifiedCommand(
+      classifiedResult(
+        "npm",
+        ["run", "missing-build"],
+        "static",
+        1,
+        'npm error Missing script: "missing-build"',
+      ),
+    ).category,
+    "INVOCATION_ERROR",
+  );
+  for (const args of [
+    ["artisan", "tinker", "--execute", "echo json_encode([]));"],
+    ["-r", "echo json_encode([]));"],
+  ]) {
+    const outcome = classifyVerifiedCommand(
+      classifiedResult(
+        "php",
+        args,
+        "test",
+        1,
+        "PARSE ERROR\nPHP Parse error: Syntax error, unexpected ')', expecting ']'",
+      ),
+    );
+    assert.equal(outcome.validationType, "DIAGNOSTIC");
+    assert.equal(outcome.category, "INVOCATION_ERROR");
+  }
+  const lint = classifyVerifiedCommand(
+    classifiedResult(
+      "php",
+      ["-l", "app/Broken.php"],
+      "static",
+      255,
+      "PHP Parse error: syntax error, unexpected token in app/Broken.php\nErrors parsing app/Broken.php",
+    ),
+  );
+  assert.equal(lint.validationType, "STATIC");
+  assert.equal(lint.validatorIdentity.tool, "PHP_LINT");
+  assert.equal(lint.category, "STATIC_ANALYSIS_FAILURE");
+  const invariant = classifyVerifiedCommand(
+    classifiedResult(
+      "php",
+      ["artisan", "tinker", "--execute", "exit($ok ? 0 : 1);"],
+      "test",
+      1,
+      "Localization invariant failed",
+    ),
+  );
+  assert.equal(invariant.category, "DIAGNOSTIC_FAILURE");
+  assert.equal(invariant.recoverable, true);
+});
+
+test("structured diagnostic identity narrowly supersedes a corrected current invocation", async () => {
+  const cwd = await repository();
+  const state = newState(cwd, "diagnostic", config(), await baseline(cwd));
+  const make = async (
+    args: string[],
+    verificationId: string,
+    exitCode: number,
+    output: string,
+    completedAt: string,
+  ) => {
+    const command = normalizedRuntimeCommand(
+      {
+        executable: "php",
+        args,
+        purpose: "Verify localization",
+        category: "test",
+        verificationId,
+      },
+      "tester",
+    ).command;
+    const result = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id: command.id, exitCode, output, completedAt, sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(result);
+    return result;
+  };
+  const failed = await make(
+    ["artisan", "tinker", "--execute", "echo json_encode([]));"],
+    "localization.translation_resolution",
+    1,
+    "PARSE ERROR\nPHP Parse error: syntax error, unexpected ')'",
+    "2026-01-01T00:00:00Z",
+  );
+  const passed = await make(
+    ["artisan", "tinker", "--execute", "echo json_encode([]);"],
+    "localization.translation_resolution",
+    0,
+    '{"ok":true}',
+    "2026-01-01T00:00:01Z",
+  );
+  assert.equal(
+    (await supersedingInvocation(failed, [passed], cwd))?.executionId,
+    passed.executionId,
+  );
+  const unrelated = await make(
+    ["artisan", "tinker", "--execute", "echo app()->getLocale();"],
+    "localization.current_locale",
+    0,
+    "en",
+    "2026-01-01T00:00:02Z",
+  );
+  assert.equal(
+    await supersedingInvocation(failed, [unrelated], cwd),
+    undefined,
+  );
+  const older = { ...passed, completedAt: "2025-12-31T23:59:59Z" };
+  assert.equal(await supersedingInvocation(failed, [older], cwd), undefined);
+  const differentSnapshot = {
+    ...passed,
+    repoState: { ...passed.repoState, gateHashes: { changed: "hash" } },
+  };
+  assert.equal(
+    await supersedingInvocation(failed, [differentSnapshot], cwd),
+    undefined,
+  );
+  const suite = {
+    ...passed,
+    command: {
+      ...passed.command,
+      args: ["artisan", "test"],
+    },
+    effectiveValidationIdentity: {
+      validationType: "TEST" as const,
+      tool: "PHPUNIT" as const,
+      source: "interpreter" as const,
+    },
+    validatorIdentity: {
+      tool: "PHPUNIT" as const,
+      source: "interpreter" as const,
+    },
+  };
+  assert.equal(await supersedingInvocation(failed, [suite], cwd), undefined);
+});
+
+test("synthetic Laravel incident passes only when the unavailable Vite build is not applicable", async () => {
+  const cwd = await repository();
+  await writeFile(
+    join(cwd, "package.json"),
+    JSON.stringify({ scripts: { build: "vite build" } }),
+  );
+  await writeFile(
+    join(cwd, "composer.json"),
+    JSON.stringify({ require: { "laravel/framework": "^13" } }),
+  );
+  await writeFile(join(cwd, "artisan"), "<?php\n");
+  const cfg = config();
+  cfg.commands = [];
+  cfg.qualityGates.commit.enabled = false;
+  const state = newState(cwd, "localization", cfg, await baseline(cwd));
+  state.results.reviewer = {
+    ...contract,
+    goal: "Implement API localization behavior",
+    filesToModify: ["app/Http/Controllers/LocaleController.php"],
+  };
+  const { discoverCommands } = await import("../src/agents/discovery.ts");
+  state.discoveredCommands = await discoverCommands(cwd);
+  const build = state.discoveredCommands.find(
+    (candidate) => candidate.category === "build",
+  );
+  const tests = state.discoveredCommands.find(
+    (candidate) =>
+      candidate.command.executable === "php" &&
+      candidate.command.args[1] === "test",
+  );
+  assert.ok(build);
+  assert.ok(tests);
+  state.approvedCommands = [build.command, tests.command];
+  const commands = [
+    {
+      command: tests.command,
+      exitCode: 0,
+      output: "Tests: 73 passed (415 assertions)",
+    },
+    {
+      command: {
+        id: "pint",
+        executable: "php",
+        args: ["vendor/bin/pint", "--test"],
+        purpose: "static" as const,
+        timeoutMs: 1000,
+      },
+      exitCode: 0,
+      output: "PASS — 78 files",
+    },
+    {
+      command: {
+        id: "migration-status",
+        executable: "php",
+        args: ["artisan", "migrate:status"],
+        purpose: "test" as const,
+        verificationId: "database.migration_status",
+        timeoutMs: 1000,
+      },
+      exitCode: 0,
+      output: "All migrations ran",
+    },
+    {
+      command: build.command,
+      exitCode: 1,
+      output:
+        'Der Befehl "vite" ist entweder falsch geschrieben oder konnte nicht gefunden werden.',
+    },
+    {
+      command: {
+        id: "tinker-invalid",
+        executable: "php",
+        args: ["artisan", "tinker", "--execute", "echo json_encode([]));"],
+        purpose: "test" as const,
+        verificationId: "localization.translation_resolution",
+        timeoutMs: 1000,
+      },
+      exitCode: 1,
+      output: "PARSE ERROR\nPHP Parse error: syntax error, unexpected ')'",
+    },
+    {
+      command: {
+        id: "tinker-corrected",
+        executable: "php",
+        args: ["artisan", "tinker", "--execute", "echo json_encode([]);"],
+        purpose: "test" as const,
+        verificationId: "localization.translation_resolution",
+        timeoutMs: 1000,
+      },
+      exitCode: 0,
+      output: '{"translations":true,"mapping":true}',
+    },
+  ];
+  for (const [index, item] of commands.entries()) {
+    const verified = await recordVerifiedCommandResult(
+      state,
+      item.command,
+      {
+        id: item.command.id,
+        exitCode: item.exitCode,
+        output: item.output,
+        completedAt: `2026-01-01T00:00:0${index}Z`,
+        processStarted: true,
+        platform: "win32",
+        sandbox,
+      },
+      "tester",
+      1,
+    );
+    assert.ok(verified);
+    state.verifiedCommandResults.push(verified);
+  }
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async () => {},
+      getLastAssistantText: () =>
+        JSON.stringify({ status: "PASS", commands: [], failedAreas: [] }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const pass = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    1,
+  )) as any;
+  assert.equal(pass.status, "PASS", pass.reason);
+  const buildOutcome = pass.validationOutcomes.find(
+    (outcome: any) => outcome.id === build.command.id,
+  );
+  assert.equal(buildOutcome.outcome, "NOT_APPLICABLE");
+  assert.equal(buildOutcome.executionOutcome, "TOOL_UNAVAILABLE");
+  const invalid = pass.validationOutcomes.find(
+    (outcome: any) => outcome.id === "tinker-invalid",
+  );
+  assert.equal(invalid.outcome, "INVOCATION_ERROR");
+  assert.match(invalid.supersededBy, /^[0-9a-f-]{36}$/);
+  assert.equal(state.verifiedCommandResults.length, 6);
+
+  state.results.reviewer = {
+    ...state.results.reviewer,
+    constraints: ["The Vite build is required for this workflow"],
+  } as any;
+  const blocked = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    1,
+  )) as any;
+  assert.equal(blocked.status, "BLOCKED");
+  assert.match(blocked.reason, /vite executable could not be found/i);
 });

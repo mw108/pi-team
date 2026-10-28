@@ -194,6 +194,7 @@ function commandInvocation(input: unknown): "id" | "structured" {
     "args",
     "purpose",
     "category",
+    "verificationId",
   ].some((field) => Object.hasOwn(value, field));
   if (hasId && hasStructuredFields)
     throw new Error(
@@ -245,7 +246,7 @@ export function commandTool(
   return {
     name: "team_command",
     label: "Approved project command",
-    description: `Execute one concrete command using exactly one form. Form A: {"id":"detected-..."}. Form B: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run required tests"}; do not provide both forms. team_command({}) is invalid. This tool does not list or discover commands. An alternative suggested after EXECUTABLE_NOT_FOUND must be submitted as a new call and receives normal authorization. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
+    description: `Execute one concrete command using exactly one form. Form A: {"id":"detected-..."}. Form B: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run required tests"}; diagnostic retries should also provide the same stable verificationId (for example localization.translation_resolution); do not provide both forms. team_command({}) is invalid. This tool does not list or discover commands. An alternative suggested after EXECUTABLE_NOT_FOUND must be submitted as a new call and receives normal authorization. Available IDs: ${allowed.map((c) => c.id).join(", ") || "none"}. No shell interpolation.`,
     parameters: Type.Object(
       {
         id: Type.Optional(Type.String()),
@@ -253,6 +254,7 @@ export function commandTool(
         args: Type.Optional(Type.Array(Type.String())),
         purpose: Type.Optional(Type.String()),
         category: Type.Optional(Type.String({ enum: [...commandCategories] })),
+        verificationId: Type.Optional(Type.String()),
       },
       { additionalProperties: false },
     ),

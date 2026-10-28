@@ -26,6 +26,7 @@ test("effective team_command schema and provider request context stay flat", () 
     "executable",
     "id",
     "purpose",
+    "verificationId",
   ]);
   assert.equal(schema.properties.id.type, "string");
   assert.equal(schema.properties.executable.type, "string");

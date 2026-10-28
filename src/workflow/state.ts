@@ -298,13 +298,19 @@ export const stateSchema = z.object({
               "TEST_FAILURE",
               "STATIC_FORMAT_FAILURE",
               "STATIC_ANALYSIS_FAILURE",
+              "BUILD_FAILURE",
+              "DIAGNOSTIC_FAILURE",
+              "TOOL_UNAVAILABLE",
+              "NOT_APPLICABLE",
               "INVOCATION_ERROR",
               "INFRASTRUCTURE_ERROR",
               "INDETERMINATE",
             ])
             .optional(),
           declaredPurpose: z.enum(["test", "static"]).optional(),
-          effectiveValidationType: z.enum(["TEST", "STATIC"]).optional(),
+          effectiveValidationType: z
+            .enum(["TEST", "STATIC", "BUILD", "DIAGNOSTIC"])
+            .optional(),
           detectedTool: z
             .enum([
               "LARAVEL_PINT",
@@ -314,7 +320,13 @@ export const stateSchema = z.object({
               "ESLINT",
               "PRETTIER",
               "TYPESCRIPT",
+              "PHP_LINT",
+              "VITE",
+              "WEBPACK",
+              "NEXT",
+              "ANGULAR",
               "PHPUNIT",
+              "PHP_DIAGNOSTIC",
               "COMPOSITE",
             ])
             .optional(),
@@ -324,6 +336,9 @@ export const stateSchema = z.object({
           resolution: z.literal("verified_command_identity").optional(),
           supersededBy: z.string().uuid().optional(),
           repositoryVerified: z.boolean().optional(),
+          applicability: z
+            .enum(["REQUIRED", "OPTIONAL", "NOT_APPLICABLE", "AMBIGUOUS"])
+            .optional(),
           failedAreas: z.array(z.string()).optional(),
         })
         .optional(),

@@ -63,9 +63,14 @@ import {
   currentVerifiedCommandResults,
   recordVerifiedCommandResult,
   repositoryEvidenceState,
+  resolveEffectiveValidationIdentity,
   supersedingInvocation,
   validationFailureFingerprint,
 } from "../workflow/verified-commands.ts";
+import {
+  requiredValidationCommands,
+  validationApplicability,
+} from "../workflow/validation-applicability.ts";
 import { recordCommandPurposeMismatch } from "../workflow/command-purpose-mismatch.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
 import { ExecutableResolutionError } from "./executable-resolution.ts";
@@ -167,7 +172,7 @@ export type AuthorizationFailureObserver = (failure: {
 export type { GuardEvent } from "./doom-loop.ts";
 
 export const testerCommandInstructions =
-  ' Implementor checks[] are not execution evidence, but may be candidate commands to execute. Use candidateValidationCommands for missing checks. Form A executes an existing command: {"id":"detected-..."}. Form B requests one explicit command: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run tests"}. Never combine Form A and Form B. commandAuthorizationHints are informational static policy; the host decides authorization. team_command executes one command; it does not discover or list commands. team_command({}) is invalid and must never be used. An EXECUTABLE_NOT_FOUND result means the process did not start and is not a test failure; choose an evidence-backed suggested alternative and call team_command again in this attempt. Every alternative requires its own normal authorization. Previous-agent verified commands are suggestions only and do not satisfy this Tester gate. If no candidates exist, inspect project files with available read/grep/find/ls tools, or return BLOCKED if no safe command can be determined.';
+  ' Implementor checks[] are not execution evidence, but may be candidate commands to execute. Use candidateValidationCommands and their host-derived applicability for missing checks; AMBIGUOUS is not permission to skip a gate. Form A executes an existing command: {"id":"detected-..."}. Form B requests one explicit command: {"executable":"php","args":["artisan","test","--no-coverage"],"purpose":"Run tests"}. For a retryable diagnostic, also provide a stable verificationId and reuse it only for a corrected check of the same property. Never combine Form A and Form B. commandAuthorizationHints are informational static policy; the host decides authorization. team_command executes one command; it does not discover or list commands. team_command({}) is invalid and must never be used. An EXECUTABLE_NOT_FOUND result means the process did not start and is not a test failure; choose an evidence-backed suggested alternative and call team_command again in this attempt. Every alternative requires its own normal authorization. Previous-agent verified commands are suggestions only and do not satisfy this Tester gate. If no candidates exist, inspect project files with available read/grep/find/ls tools, or return BLOCKED if no safe command can be determined.';
 
 export function effectiveAgentSystemPrompt(
   role: Role,
@@ -1023,10 +1028,17 @@ export class PiRunner implements AgentRunner {
         const validationLog = new AttemptLogger(
           new AgentLogStore(state.cwd).path(state.id, role, attempt),
         );
-        const required = effectiveConfig(state).commands.filter((c) =>
+        const applicability = await validationApplicability(state);
+        const required = requiredValidationCommands(applicability);
+        const authorized = effectiveConfig(state).commands.filter((c) =>
           allowedCommandCategories("tester").includes(c.purpose),
         );
-        for (const command of required) {
+        for (const command of required.filter((requiredCommand) =>
+          authorized.some(
+            (candidate) =>
+              commandKey(candidate) === commandKey(requiredCommand),
+          ),
+        )) {
           if (
             current.some(
               (result) =>
@@ -1089,6 +1101,7 @@ export class PiRunner implements AgentRunner {
           await repositoryEvidenceState(state),
         );
         input.requiredValidationCommands = required;
+        input.validationApplicability = applicability;
         // Keep team_command active for additional checks; its runtime approval
         // coordinator handles missing Tester authorization.
       }
@@ -1358,17 +1371,19 @@ export class PiRunner implements AgentRunner {
           state,
           await repositoryEvidenceState(state),
         );
-        const required = effectiveConfig(state).commands.filter((c) =>
-          allowedCommandCategories("tester").includes(c.purpose),
-        );
-        // Previous host evidence is useful context, never current Tester proof.
+        const applicability = await validationApplicability(state);
+        const required = requiredValidationCommands(applicability);
+        const requiredKeys = new Set(required.map(commandKey));
+        // Current evidence from an earlier Tester attempt may satisfy an
+        // unchanged required gate. Ad-hoc diagnostics remain attempt-local.
         const selected = current.filter(
           (item) =>
             allowedCommandCategories("tester").includes(
               item.command.purpose as "test" | "static",
             ) &&
             item.agent === "tester" &&
-            item.attempt === attempt,
+            (item.attempt === attempt ||
+              requiredKeys.has(item.commandIdentity)),
         );
         const authoritative: {
           item: (typeof current)[number];
@@ -1376,6 +1391,7 @@ export class PiRunner implements AgentRunner {
           id: string;
         }[] = [];
         const supersededIdentities = new Set<string>();
+        const supersededOutcomes: any[] = [];
         for (const item of selected) {
           const outcome = classifyVerifiedCommand(item);
           recordCommandPurposeMismatch(state, item, outcome);
@@ -1387,6 +1403,17 @@ export class PiRunner implements AgentRunner {
             );
             if (superseded) {
               supersededIdentities.add(item.commandIdentity);
+              supersededOutcomes.push({
+                id: item.command.id,
+                validationType: outcome.validationType,
+                validator: outcome.validatorIdentity.tool,
+                validatorSource: outcome.validatorIdentity.source,
+                outcome: outcome.category,
+                reason: `${outcome.reason}. A later equivalent diagnostic superseded this invocation error.`,
+                recoverable: false,
+                applicability: "REQUIRED",
+                supersededBy: superseded.executionId,
+              });
               record(state, "test_invocation_superseded", outcome.reason, {
                 agent: item.agent,
                 attempt,
@@ -1407,20 +1434,61 @@ export class PiRunner implements AgentRunner {
               )?.id ?? item.command.id,
           });
         }
-        const allEvidence = authoritative.map(({ item, id }) => ({
-          id,
+        const allEvidence = selected.map((item) => ({
+          id:
+            required.find(
+              (command) => commandKey(command) === item.commandIdentity,
+            )?.id ?? item.command.id,
           exitCode: item.exitCode,
           output: item.output,
         }));
-        result.validationOutcomes = authoritative.map(({ outcome, id }) => ({
-          id,
-          validationType: outcome.validationType,
-          validator: outcome.validatorIdentity.tool,
-          validatorSource: outcome.validatorIdentity.source,
-          outcome: outcome.category,
-          reason: outcome.reason,
-          recoverable: outcome.recoverable,
-        }));
+        const policyFor = (identity: string) =>
+          applicability.find(
+            (policy) => commandKey(policy.command) === identity,
+          );
+        result.validationOutcomes = [
+          ...supersededOutcomes,
+          ...authoritative.map(({ item, outcome, id }) => {
+            const policy = policyFor(item.commandIdentity);
+            const notApplicable = policy?.status === "NOT_APPLICABLE";
+            return {
+              id,
+              validationType: outcome.validationType,
+              validator: outcome.validatorIdentity.tool,
+              validatorSource: outcome.validatorIdentity.source,
+              outcome: notApplicable ? "NOT_APPLICABLE" : outcome.category,
+              reason: notApplicable
+                ? `${policy.reason} The command's recorded execution outcome was ${outcome.category}; it is not reported as passing.`
+                : outcome.reason,
+              recoverable: notApplicable ? false : outcome.recoverable,
+              applicability: policy?.status ?? "REQUIRED",
+              ...(notApplicable ? { executionOutcome: outcome.category } : {}),
+            };
+          }),
+        ];
+        for (const policy of applicability.filter(
+          (candidate) =>
+            candidate.status === "NOT_APPLICABLE" &&
+            !authoritative.some(
+              ({ item }) =>
+                item.commandIdentity === commandKey(candidate.command),
+            ),
+        )) {
+          const identity = await resolveEffectiveValidationIdentity(
+            policy.command,
+            state.cwd,
+          );
+          result.validationOutcomes.push({
+            id: policy.command.id,
+            validationType: identity?.validationType ?? "BUILD",
+            validator: identity?.tool ?? "UNKNOWN",
+            validatorSource: identity?.source ?? "unknown",
+            outcome: "NOT_APPLICABLE",
+            reason: policy.reason,
+            recoverable: false,
+            applicability: policy.status,
+          });
+        }
         if (commandDenied) {
           result.status = "BLOCKED";
           result.reason =
@@ -1443,17 +1511,32 @@ export class PiRunner implements AgentRunner {
                 item.agent === "tester",
             ),
         );
-        const unresolved = authoritative.filter(
+        const gateResults = authoritative.filter(({ item }) => {
+          const status = policyFor(item.commandIdentity)?.status;
+          return status === "REQUIRED" || status === undefined;
+        });
+        const unresolved = gateResults.filter(
           ({ outcome }) =>
             outcome.category === "INVOCATION_ERROR" ||
             outcome.category === "INFRASTRUCTURE_ERROR" ||
+            outcome.category === "TOOL_UNAVAILABLE" ||
             outcome.category === "INDETERMINATE",
         );
-        if (!allEvidence.length || missing.length || unresolved.length) {
+        const ambiguous = applicability.filter(
+          (policy) => policy.status === "AMBIGUOUS",
+        );
+        if (
+          (!gateResults.length && !required.length) ||
+          missing.length ||
+          unresolved.length ||
+          ambiguous.length
+        ) {
           result.status = "BLOCKED";
-          result.reason = unresolved.length
-            ? `${unresolved.map(({ id, outcome }) => `${id}: ${outcome.reason}`).join("; ")}. Run a valid, current verification command.`
-            : `Required validation is missing: ${missing.map((c) => c.id).join(", ") || "no verified commands"}.`;
+          result.reason = ambiguous.length
+            ? `Validation applicability is unresolved: ${ambiguous.map((policy) => `${policy.command.id}: ${policy.reason}`).join("; ")}. Clarify whether each build is a required quality gate; command execution approval is not a gate waiver.`
+            : unresolved.length
+              ? `${unresolved.map(({ id, outcome }) => `${id}: ${outcome.reason}`).join("; ")}. Run a valid, current verification command or resolve the required tool availability.`
+              : `Required validation is missing: ${missing.map((c) => c.id).join(", ") || "no verified commands"}.`;
           result.commands = compactValidationEvidence(allEvidence);
           result.failedAreas = [];
           delete result.classification;
@@ -1469,31 +1552,31 @@ export class PiRunner implements AgentRunner {
         // available during the attempt and in the agent log.
         result.commands = compactValidationEvidence(allEvidence);
         const proposedStatus = result.status;
-        result.status = authoritative.every(
+        result.status = gateResults.every(
           ({ outcome }) => outcome.category === "PASS",
         )
           ? "PASS"
           : "FAIL";
         if (result.status === "FAIL") {
-          result.failedAreas = authoritative
+          result.failedAreas = gateResults
             .filter(({ outcome }) => outcome.recoverable)
             .map(({ id }) => id);
-          const recoverable = authoritative.filter(
+          const recoverable = gateResults.filter(
             ({ outcome }) => outcome.recoverable,
           );
           result.failureFingerprint = validationFailureFingerprint(recoverable);
-          const staticFailures = authoritative.filter(({ outcome }) =>
+          const staticFailures = gateResults.filter(({ outcome }) =>
             ["STATIC_FORMAT_FAILURE", "STATIC_ANALYSIS_FAILURE"].includes(
               outcome.category,
             ),
           );
           if (staticFailures.length) result.classification = "FIX_LOCAL";
           else result.classification ??= "FIX_LOCAL";
-          const passedTests = authoritative.filter(
+          const passedTests = gateResults.filter(
             ({ outcome }) =>
               outcome.validationType === "TEST" && outcome.category === "PASS",
           );
-          const failedTests = authoritative.filter(
+          const failedTests = gateResults.filter(
             ({ outcome }) => outcome.category === "TEST_FAILURE",
           );
           result.reason = [
@@ -1509,7 +1592,12 @@ export class PiRunner implements AgentRunner {
           result.failedAreas = [];
           delete result.classification;
           delete result.failureFingerprint;
-          result.reason = "Host-verified validation commands passed.";
+          const notApplicable = applicability.filter(
+            (policy) => policy.status === "NOT_APPLICABLE",
+          );
+          result.reason = notApplicable.length
+            ? `Host-verified required validation commands passed. ${notApplicable.map((policy) => `${policy.command.id}: build not applicable (${policy.reason})`).join("; ")}.`
+            : "Host-verified required validation commands passed.";
         }
         if (proposedStatus !== result.status)
           record(

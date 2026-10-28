@@ -401,7 +401,7 @@ export const persistedTestSchema = z.object({
     .array(
       z.object({
         id: text,
-        validationType: z.enum(["TEST", "STATIC"]),
+        validationType: z.enum(["TEST", "STATIC", "BUILD", "DIAGNOSTIC"]),
         validator: z.enum([
           "LARAVEL_PINT",
           "PHP_CS_FIXER",
@@ -410,6 +410,13 @@ export const persistedTestSchema = z.object({
           "ESLINT",
           "PRETTIER",
           "TYPESCRIPT",
+          "PHP_LINT",
+          "VITE",
+          "WEBPACK",
+          "NEXT",
+          "ANGULAR",
+          "PHPUNIT",
+          "PHP_DIAGNOSTIC",
           "UNKNOWN",
           "COMPOSITE",
         ]),
@@ -424,12 +431,34 @@ export const persistedTestSchema = z.object({
           "TEST_FAILURE",
           "STATIC_FORMAT_FAILURE",
           "STATIC_ANALYSIS_FAILURE",
+          "BUILD_FAILURE",
+          "DIAGNOSTIC_FAILURE",
+          "TOOL_UNAVAILABLE",
+          "NOT_APPLICABLE",
           "INVOCATION_ERROR",
           "INFRASTRUCTURE_ERROR",
           "INDETERMINATE",
         ]),
         reason: text,
         recoverable: z.boolean(),
+        applicability: z
+          .enum(["REQUIRED", "OPTIONAL", "NOT_APPLICABLE", "AMBIGUOUS"])
+          .optional(),
+        executionOutcome: z
+          .enum([
+            "PASS",
+            "TEST_FAILURE",
+            "STATIC_FORMAT_FAILURE",
+            "STATIC_ANALYSIS_FAILURE",
+            "BUILD_FAILURE",
+            "DIAGNOSTIC_FAILURE",
+            "TOOL_UNAVAILABLE",
+            "INVOCATION_ERROR",
+            "INFRASTRUCTURE_ERROR",
+            "INDETERMINATE",
+          ])
+          .optional(),
+        supersededBy: z.string().uuid().optional(),
       }),
     )
     .optional(),

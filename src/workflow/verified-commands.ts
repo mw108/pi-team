@@ -18,32 +18,53 @@ export const staticValidatorTools = [
   "ESLINT",
   "PRETTIER",
   "TYPESCRIPT",
+  "PHP_LINT",
 ] as const;
 export type StaticValidatorTool = (typeof staticValidatorTools)[number];
+export const buildValidatorTools = [
+  "VITE",
+  "WEBPACK",
+  "NEXT",
+  "ANGULAR",
+] as const;
+export type BuildValidatorTool = (typeof buildValidatorTools)[number];
+export const validationTools = [
+  ...staticValidatorTools,
+  ...buildValidatorTools,
+  "PHPUNIT",
+  "PHP_DIAGNOSTIC",
+] as const;
+export type ValidationTool = (typeof validationTools)[number];
 export const validatorIdentitySchema = z.object({
-  tool: z.enum([...staticValidatorTools, "UNKNOWN", "COMPOSITE"]),
+  tool: z.enum([...validationTools, "UNKNOWN", "COMPOSITE"]),
   source: z.enum(["direct", "interpreter", "package_script", "unknown"]),
   scriptName: z.string().optional(),
-  underlyingTools: z.array(z.enum(staticValidatorTools)).optional(),
+  underlyingTools: z.array(z.enum(validationTools)).optional(),
 });
 export type ValidatorIdentity = z.infer<typeof validatorIdentitySchema>;
 
 export const effectiveValidationIdentitySchema = z
   .object({
-    validationType: z.enum(["TEST", "STATIC"]),
-    tool: z.enum([...staticValidatorTools, "PHPUNIT", "COMPOSITE"]),
+    validationType: z.enum(["TEST", "STATIC", "BUILD", "DIAGNOSTIC"]),
+    tool: z.enum([...validationTools, "COMPOSITE"]),
     source: z.enum(["direct", "interpreter", "package_script"]),
     scriptName: z.string().optional(),
-    underlyingTools: z
-      .array(z.enum([...staticValidatorTools, "PHPUNIT"]))
-      .optional(),
+    underlyingTools: z.array(z.enum(validationTools)).optional(),
   })
   .superRefine((identity, ctx) => {
     if (
-      (identity.validationType === "STATIC" && identity.tool === "PHPUNIT") ||
+      (identity.validationType === "STATIC" &&
+        ![...staticValidatorTools, "COMPOSITE"].includes(
+          identity.tool as any,
+        )) ||
+      (identity.validationType === "BUILD" &&
+        ![...buildValidatorTools, "TYPESCRIPT", "COMPOSITE"].includes(
+          identity.tool as any,
+        )) ||
       (identity.validationType === "TEST" &&
-        identity.tool !== "PHPUNIT" &&
-        identity.tool !== "COMPOSITE")
+        !["PHPUNIT", "COMPOSITE"].includes(identity.tool)) ||
+      (identity.validationType === "DIAGNOSTIC" &&
+        !["PHP_DIAGNOSTIC", "COMPOSITE"].includes(identity.tool))
     )
       ctx.addIssue({
         code: "custom",
@@ -52,8 +73,12 @@ export const effectiveValidationIdentitySchema = z
     if (
       identity.underlyingTools?.some((tool) =>
         identity.validationType === "STATIC"
-          ? tool === "PHPUNIT"
-          : tool !== "PHPUNIT",
+          ? !staticValidatorTools.includes(tool as StaticValidatorTool)
+          : identity.validationType === "BUILD"
+            ? ![...buildValidatorTools, "TYPESCRIPT"].includes(tool as any)
+            : identity.validationType === "TEST"
+              ? tool !== "PHPUNIT"
+              : tool !== "PHP_DIAGNOSTIC",
       )
     )
       ctx.addIssue({
@@ -72,6 +97,7 @@ export const verifiedCommandResultSchema = z.object({
     executable: z.string(),
     args: z.array(z.string()),
     purpose: z.string(),
+    verificationId: z.string().optional(),
   }),
   commandIdentity: z.string(),
   validatorIdentity: validatorIdentitySchema.optional(),
@@ -89,6 +115,14 @@ export const verifiedCommandResultSchema = z.object({
     packageJsonHash: z.string().optional(),
     composerJsonHash: z.string().optional(),
   }),
+  execution: z
+    .object({
+      processStarted: z.boolean().optional(),
+      platform: z.string().optional(),
+      requestedExecutable: z.string().optional(),
+      resolvedExecutable: z.string().optional(),
+    })
+    .optional(),
 });
 export type VerifiedCommandResult = z.infer<typeof verifiedCommandResultSchema>;
 
@@ -151,6 +185,8 @@ export function directStaticValidatorIdentity(
 ): ValidatorIdentity | undefined {
   const executable = executableName(command.executable);
   const args = command.args.map(interpreterTarget);
+  if (executable === "php" && args[0] === "-l")
+    return { tool: "PHP_LINT", source: "interpreter" };
   const direct = toolForExecutable(executable);
   if (direct) return { tool: direct, source: "direct" };
   if (executable === "npx") {
@@ -175,6 +211,62 @@ export function directStaticValidatorIdentity(
     )
       return { tool: "TYPESCRIPT", source: "interpreter" };
   }
+}
+
+export function directBuildValidatorIdentity(
+  command: Pick<Command, "executable" | "args">,
+  preferTypescriptBuild = false,
+): EffectiveValidationIdentity | undefined {
+  const executable = executableName(command.executable);
+  const args = command.args.map(interpreterTarget);
+  const invocation =
+    executable === "npx" && args.length
+      ? { executable: executableName(args[0]), args: args.slice(1) }
+      : { executable, args };
+  const tool: BuildValidatorTool | "TYPESCRIPT" | undefined =
+    invocation.executable === "vite" && invocation.args[0] === "build"
+      ? "VITE"
+      : invocation.executable === "webpack"
+        ? "WEBPACK"
+        : invocation.executable === "next" && invocation.args[0] === "build"
+          ? "NEXT"
+          : ["ng", "angular"].includes(invocation.executable) &&
+              invocation.args[0] === "build"
+            ? "ANGULAR"
+            : invocation.executable === "tsc" &&
+                (preferTypescriptBuild ||
+                  invocation.args.some((arg) =>
+                    ["-b", "--build"].includes(arg),
+                  ))
+              ? "TYPESCRIPT"
+              : undefined;
+  return tool
+    ? {
+        validationType: "BUILD",
+        tool,
+        source: executable === invocation.executable ? "direct" : "interpreter",
+      }
+    : undefined;
+}
+
+export function directDiagnosticIdentity(
+  command: Pick<Command, "executable" | "args">,
+): EffectiveValidationIdentity | undefined {
+  const executable = executableName(command.executable);
+  const args = command.args.map(interpreterTarget);
+  const phpDiagnostic =
+    executable === "php" &&
+    (args[0] === "-r" ||
+      (/(?:^|\/)artisan$/.test(args[0] ?? "") &&
+        (args[1] === "tinker" ||
+          args[1] === "config:show" ||
+          args[1] === "migrate:status")));
+  if (phpDiagnostic)
+    return {
+      validationType: "DIAGNOSTIC",
+      tool: "PHP_DIAGNOSTIC",
+      source: "interpreter",
+    };
 }
 
 export function directTestRunnerIdentity(
@@ -206,6 +298,8 @@ export function directTestRunnerIdentity(
 function directEffectiveValidationIdentity(
   command: Pick<Command, "executable" | "args">,
 ): EffectiveValidationIdentity | undefined {
+  const build = directBuildValidatorIdentity(command);
+  if (build) return build;
   const validator = directStaticValidatorIdentity(command);
   if (
     validator &&
@@ -217,7 +311,7 @@ function directEffectiveValidationIdentity(
       tool: validator.tool,
       source: validator.source as "direct" | "interpreter",
     };
-  return directTestRunnerIdentity(command);
+  return directTestRunnerIdentity(command) ?? directDiagnosticIdentity(command);
 }
 
 function packageScriptRequest(command: Pick<Command, "executable" | "args">) {
@@ -247,10 +341,16 @@ function scriptCommandIdentity(value: string): ValidatorIdentity | undefined {
 
 function scriptEffectiveValidationIdentity(
   value: string,
+  scriptName: string,
 ): EffectiveValidationIdentity | undefined {
   const text = value.trim().replace(/^@php\s+/, "php ");
   if (!text || /[`$<>\r\n'"\\]/.test(text)) return;
   const [executable, ...args] = text.split(/\s+/);
+  const build = directBuildValidatorIdentity(
+    { executable, args },
+    /^(?:build|compile)(?:[:_-]|$)/.test(scriptName),
+  );
+  if (build) return build;
   return directEffectiveValidationIdentity({ executable, args });
 }
 
@@ -305,7 +405,9 @@ function packageScriptEffectiveValidationIdentity(
         ? definition
         : [];
   if (!commands.length) return;
-  const identities = commands.map(scriptEffectiveValidationIdentity);
+  const identities = commands.map((command) =>
+    scriptEffectiveValidationIdentity(command, scriptName),
+  );
   if (identities.some((identity) => !identity)) return;
   const recognized = identities as EffectiveValidationIdentity[];
   const validationTypes = [
@@ -407,21 +509,15 @@ export async function recordVerifiedCommandResult(
     state.cwd,
   );
   const validatorIdentity: ValidatorIdentity | undefined =
-    effectiveValidationIdentity?.validationType === "STATIC"
+    effectiveValidationIdentity
       ? {
-          tool: effectiveValidationIdentity.tool as
-            StaticValidatorTool | "COMPOSITE",
+          tool: effectiveValidationIdentity.tool,
           source: effectiveValidationIdentity.source,
           ...(effectiveValidationIdentity.scriptName
             ? { scriptName: effectiveValidationIdentity.scriptName }
             : {}),
           ...(effectiveValidationIdentity.underlyingTools
-            ? {
-                underlyingTools:
-                  effectiveValidationIdentity.underlyingTools.filter(
-                    (tool): tool is StaticValidatorTool => tool !== "PHPUNIT",
-                  ),
-              }
+            ? { underlyingTools: effectiveValidationIdentity.underlyingTools }
             : {}),
         }
       : undefined;
@@ -432,6 +528,9 @@ export async function recordVerifiedCommandResult(
       executable: command.executable,
       args: [...command.args],
       purpose: command.purpose,
+      ...(command.verificationId
+        ? { verificationId: command.verificationId }
+        : {}),
     },
     commandIdentity: commandKey(command),
     ...(validatorIdentity ? { validatorIdentity } : {}),
@@ -448,6 +547,12 @@ export async function recordVerifiedCommandResult(
       : undefined,
     completedAt: evidence.completedAt ?? new Date().toISOString(),
     repoState,
+    execution: {
+      processStarted: evidence.processStarted,
+      platform: evidence.platform,
+      requestedExecutable: evidence.requestedExecutable,
+      resolvedExecutable: evidence.resolvedExecutable,
+    },
   };
 }
 
@@ -490,11 +595,15 @@ export type CommandOutcomeCategory =
   | "TEST_FAILURE"
   | "STATIC_FORMAT_FAILURE"
   | "STATIC_ANALYSIS_FAILURE"
+  | "BUILD_FAILURE"
+  | "DIAGNOSTIC_FAILURE"
+  | "TOOL_UNAVAILABLE"
+  | "NOT_APPLICABLE"
   | "INVOCATION_ERROR"
   | "INFRASTRUCTURE_ERROR"
   | "INDETERMINATE";
 
-export type CommandValidationType = "TEST" | "STATIC";
+export type CommandValidationType = "TEST" | "STATIC" | "BUILD" | "DIAGNOSTIC";
 
 export type ClassifiedCommandOutcome = {
   category: CommandOutcomeCategory;
@@ -522,14 +631,31 @@ export function classifyVerifiedCommand(
 ): ClassifiedCommandOutcome {
   const storedValidator = result.validatorIdentity;
   const directValidator = directStaticValidatorIdentity(result.command);
+  const directEffective = directEffectiveValidationIdentity(result.command);
+  const storedValidationType: CommandValidationType | undefined =
+    storedValidator?.tool === "PHPUNIT"
+      ? "TEST"
+      : storedValidator?.tool === "PHP_DIAGNOSTIC"
+        ? "DIAGNOSTIC"
+        : storedValidator &&
+            ([...buildValidatorTools] as readonly string[]).includes(
+              storedValidator.tool,
+            )
+          ? "BUILD"
+          : storedValidator &&
+              ([...staticValidatorTools] as readonly string[]).includes(
+                storedValidator.tool,
+              )
+            ? "STATIC"
+            : undefined;
   const effectiveValidationIdentity: EffectiveValidationIdentity | undefined =
     result.effectiveValidationIdentity ??
     (storedValidator &&
-    storedValidator.tool !== "UNKNOWN" &&
+    storedValidationType &&
     storedValidator.source !== "unknown"
       ? {
-          validationType: "STATIC",
-          tool: storedValidator.tool,
+          validationType: storedValidationType,
+          tool: storedValidator.tool as EffectiveValidationIdentity["tool"],
           source: storedValidator.source,
           ...(storedValidator.scriptName
             ? { scriptName: storedValidator.scriptName }
@@ -538,41 +664,26 @@ export function classifyVerifiedCommand(
             ? { underlyingTools: storedValidator.underlyingTools }
             : {}),
         }
-      : directValidator
-        ? {
-            validationType: "STATIC",
-            tool: directValidator.tool as StaticValidatorTool,
-            source: directValidator.source as "direct" | "interpreter",
-          }
-        : directTestRunnerIdentity(result.command));
+      : directEffective);
   const declaredValidationType: CommandValidationType =
     result.command.purpose === "static" ? "STATIC" : "TEST";
   const validationType =
     effectiveValidationIdentity?.validationType ?? declaredValidationType;
   const validatorIdentity: ValidatorIdentity =
-    validationType === "STATIC"
-      ? (storedValidator ??
-        directValidator ??
-        (effectiveValidationIdentity
-          ? {
-              tool: effectiveValidationIdentity.tool as
-                StaticValidatorTool | "COMPOSITE",
-              source: effectiveValidationIdentity.source,
-              ...(effectiveValidationIdentity.scriptName
-                ? { scriptName: effectiveValidationIdentity.scriptName }
-                : {}),
-              ...(effectiveValidationIdentity.underlyingTools
-                ? {
-                    underlyingTools:
-                      effectiveValidationIdentity.underlyingTools.filter(
-                        (tool): tool is StaticValidatorTool =>
-                          tool !== "PHPUNIT",
-                      ),
-                  }
-                : {}),
-            }
-          : { tool: "UNKNOWN", source: "unknown" }))
-      : { tool: "UNKNOWN", source: "unknown" };
+    storedValidator ??
+    directValidator ??
+    (effectiveValidationIdentity
+      ? {
+          tool: effectiveValidationIdentity.tool,
+          source: effectiveValidationIdentity.source,
+          ...(effectiveValidationIdentity.scriptName
+            ? { scriptName: effectiveValidationIdentity.scriptName }
+            : {}),
+          ...(effectiveValidationIdentity.underlyingTools
+            ? { underlyingTools: effectiveValidationIdentity.underlyingTools }
+            : {}),
+        }
+      : { tool: "UNKNOWN", source: "unknown" });
   const purposeMismatch =
     ["test", "static"].includes(result.command.purpose) &&
     Boolean(effectiveValidationIdentity) &&
@@ -602,13 +713,54 @@ export function classifyVerifiedCommand(
     [result.output, result.stdoutTail, result.stderrTail].join("\n"),
   );
   if (
-    /no tests found matching|unknown option:?|invalid cli argument|unknown argument:?|option .* does not exist/i.test(
+    validationType === "DIAGNOSTIC" &&
+    /(?:^|\n)\s*(?:PARSE ERROR|PHP Parse error:)|syntax error,\s*unexpected/i.test(
+      output,
+    )
+  )
+    return outcome(
+      "INVOCATION_ERROR",
+      "The PHP diagnostic expression contains a syntax error; this does not establish an application test failure",
+      false,
+    );
+  if (
+    /no tests found matching|unknown option:?|invalid cli argument|unknown argument:?|option .* does not exist|missing script:\s*["']|unknown command:?/i.test(
       output,
     )
   )
     return outcome(
       "INVOCATION_ERROR",
       "Validator rejected the invocation before producing a result",
+      false,
+    );
+  const toolNames: Partial<Record<ValidationTool, string[]>> = {
+    VITE: ["vite"],
+    WEBPACK: ["webpack"],
+    NEXT: ["next"],
+    ANGULAR: ["ng", "angular"],
+    TYPESCRIPT: ["tsc"],
+    ESLINT: ["eslint"],
+    PRETTIER: ["prettier"],
+  };
+  const expectedTools =
+    validatorIdentity.tool === "COMPOSITE"
+      ? (validatorIdentity.underlyingTools ?? []).flatMap(
+          (tool) => toolNames[tool] ?? [],
+        )
+      : validatorIdentity.tool === "UNKNOWN"
+        ? []
+        : (toolNames[validatorIdentity.tool] ?? []);
+  const missingTool = expectedTools.find((tool) => {
+    const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(
+      `(?:['\"]?${escaped}['\"]?\\s+is not recognized as an internal or external command|Der Befehl [\"']${escaped}[\"'] ist entweder falsch geschrieben|(?:^|\\n)\\s*(?:sh:\\s*\\d+:\\s*)?${escaped}:\\s*(?:command )?not found|spawn\\s+${escaped}\\s+ENOENT|Cannot find module[^\\n]*${escaped})`,
+      "i",
+    ).test(output);
+  });
+  if (missingTool)
+    return outcome(
+      "TOOL_UNAVAILABLE",
+      `The required ${missingTool} executable could not be found; validation did not run`,
       false,
     );
   if (
@@ -691,6 +843,17 @@ export function classifyVerifiedCommand(
         true,
       );
     if (
+      tool === "PHP_LINT" &&
+      /(?:PHP Parse error:|Errors parsing\s+\S+|syntax error,\s*unexpected)/i.test(
+        output,
+      )
+    )
+      return outcome(
+        "STATIC_ANALYSIS_FAILURE",
+        "PHP lint reported a source-file syntax error",
+        true,
+      );
+    if (
       tool === "PHPSTAN" &&
       /(?:\[ERROR\]\s*Found\s+[1-9]\d*\s+errors?|Found\s+[1-9]\d*\s+errors?)/i.test(
         output,
@@ -711,11 +874,23 @@ export function classifyVerifiedCommand(
         true,
       );
   }
+  if (validationType === "BUILD" && validatorIdentity.tool !== "UNKNOWN")
+    return outcome(
+      "BUILD_FAILURE",
+      `${validatorIdentity.tool === "COMPOSITE" ? "The build toolchain" : validatorIdentity.tool} reported a build failure`,
+      true,
+    );
+  if (validationType === "DIAGNOSTIC")
+    return outcome(
+      "DIAGNOSTIC_FAILURE",
+      "The valid diagnostic invocation reported that its checked invariant was not satisfied",
+      true,
+    );
   return outcome(
     "INDETERMINATE",
-    validationType === "STATIC" &&
+    ["STATIC", "BUILD"].includes(validationType) &&
       ["UNKNOWN", "COMPOSITE"].includes(validatorIdentity.tool)
-      ? `Static validator identity is ${validatorIdentity.tool.toLowerCase()}; nonzero exit cannot be attributed from output alone`
+      ? `${validationType === "BUILD" ? "Build tool" : "Static validator"} identity is ${validatorIdentity.tool.toLowerCase()}; nonzero exit cannot be attributed from output alone`
       : "Nonzero exit without a recognized validation outcome",
     false,
   );
@@ -803,7 +978,35 @@ export async function supersedingInvocation(
   candidates: VerifiedCommandResult[],
   cwd: string,
 ): Promise<VerifiedCommandResult | undefined> {
-  if (classifyVerifiedCommand(failed).category !== "INVOCATION_ERROR") return;
+  const failedOutcome = classifyVerifiedCommand(failed);
+  if (failedOutcome.category !== "INVOCATION_ERROR") return;
+  const sameSnapshot = (candidate: VerifiedCommandResult) =>
+    candidate.repoState.head === failed.repoState.head &&
+    candidate.repoState.packageJsonHash === failed.repoState.packageJsonHash &&
+    candidate.repoState.composerJsonHash ===
+      failed.repoState.composerJsonHash &&
+    JSON.stringify(candidate.repoState.gateHashes) ===
+      JSON.stringify(failed.repoState.gateHashes);
+  if (
+    failed.command.verificationId &&
+    failedOutcome.validationType === "DIAGNOSTIC"
+  )
+    for (const candidate of candidates) {
+      const candidateOutcome = classifyVerifiedCommand(candidate);
+      if (
+        candidate.executionId !== failed.executionId &&
+        candidate.agent === failed.agent &&
+        candidate.attempt === failed.attempt &&
+        candidate.completedAt > failed.completedAt &&
+        sameSnapshot(candidate) &&
+        candidate.command.verificationId === failed.command.verificationId &&
+        candidateOutcome.validationType === "DIAGNOSTIC" &&
+        candidateOutcome.validatorIdentity.tool ===
+          failedOutcome.validatorIdentity.tool &&
+        candidateOutcome.category === "PASS"
+      )
+        return candidate;
+    }
   const scope = await testScope(failed, cwd);
   if (
     !scope?.files.length ||
@@ -829,9 +1032,7 @@ export async function supersedingInvocation(
       candidate.agent !== "tester" ||
       candidate.exitCode !== 0 ||
       candidate.completedAt < failed.completedAt ||
-      candidate.repoState.head !== failed.repoState.head ||
-      JSON.stringify(candidate.repoState.gateHashes) !==
-        JSON.stringify(failed.repoState.gateHashes)
+      !sameSnapshot(candidate)
     )
       continue;
     const coverage = await testScope(candidate, cwd);

@@ -13,6 +13,11 @@ export const runtimeCommandRequestSchema = z
     args: z.array(z.string()),
     purpose: z.string().trim().min(1).max(500),
     category: z.enum(commandCategories).optional(),
+    verificationId: z
+      .string()
+      .regex(/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/)
+      .max(160)
+      .optional(),
   })
   .strict();
 export type RuntimeCommandRequest = z.infer<typeof runtimeCommandRequestSchema>;
@@ -76,6 +81,9 @@ export function normalizedRuntimeCommand(
     executable: request.executable,
     args: request.args,
     purpose: category,
+    ...(request.verificationId
+      ? { verificationId: request.verificationId }
+      : {}),
     timeoutMs: 120000,
   });
   return { command, request };

@@ -6,6 +6,7 @@ import {
 } from "./command-policy.ts";
 import { commandKey, detectedCommandId, effectiveConfig } from "./discovery.ts";
 import type { VerifiedCommandResult } from "../workflow/verified-commands.ts";
+import type { ValidationApplicability } from "../workflow/validation-applicability.ts";
 
 export interface CandidateValidationCommand {
   executable: string;
@@ -17,6 +18,9 @@ export interface CandidateValidationCommand {
   requiresShell?: boolean;
   interpreter?: string;
   equivalentOf?: string;
+  applicability?: ValidationApplicability["status"];
+  applicabilityReason?: string;
+  applicabilityEvidence?: string[];
 }
 
 function validationHintPurpose(command: {
@@ -80,6 +84,7 @@ export function parseValidationHint(value: string) {
 export function testerValidationContext(
   state: WorkflowState,
   verified: VerifiedCommandResult[] = [],
+  applicability: ValidationApplicability[] = [],
 ) {
   const candidates: CandidateValidationCommand[] = [];
   const seen = new Set<string>();
@@ -171,6 +176,17 @@ export function testerValidationContext(
   }
   for (const command of configured)
     add(command, `Run ${command.purpose} check`, "approved.commands");
+  for (const candidate of candidates) {
+    const policy = applicability.find(
+      (item) => commandKey(item.command) === commandKey(candidate),
+    );
+    if (policy)
+      Object.assign(candidate, {
+        applicability: policy.status,
+        applicabilityReason: policy.reason,
+        applicabilityEvidence: policy.evidence,
+      });
+  }
   return {
     candidateValidationCommands: candidates,
     approvedCommandIds: configured.map((command) => command.id),

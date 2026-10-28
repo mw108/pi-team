@@ -13,6 +13,7 @@ import {
   currentVerifiedCommandResults,
   repositoryEvidenceState,
 } from "../workflow/verified-commands.ts";
+import { validationApplicability } from "../workflow/validation-applicability.ts";
 export async function contextFor(
   role: Role,
   s: WorkflowState,
@@ -160,6 +161,7 @@ export async function contextFor(
       testerValidationContext(
         s,
         currentVerifiedCommandResults(s, await repositoryEvidenceState(s)),
+        await validationApplicability(s),
       ),
     );
     context.candidateValidationCommandList = (

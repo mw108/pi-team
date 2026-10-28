@@ -1,5 +1,49 @@
 # Investigation and implementation choices
 
+## Context-aware validation and diagnostic evidence (2026-10-28)
+
+The incident was caused by four independent boundary errors in the validation
+pipeline. First, discovered commands were correctly stored separately, but an
+approved discovered command was added to `effectiveConfig().commands` and the
+Tester treated every command in that merged list as required. Execution
+authorization therefore became an accidental quality-gate requirement. The
+Tester also aggregated every command executed in its current attempt as an
+authoritative gate result, without a host-side applicability or requirement
+decision. A failing optional or irrelevant probe could consequently block the
+gate even when every required validation had passed.
+
+Second, package-script identity resolution recognized test runners and a small
+set of static analyzers only. `npm run build` resolving to `vite build` had no
+effective validator identity. Its nonzero exit and localized Windows
+command-not-found text therefore reached the generic `INDETERMINATE` branch.
+The execution record did preserve argv, output, repository hashes, and time,
+but did not preserve enough process metadata or a build-tool identity to
+distinguish tool unavailability from compilation failure safely.
+
+Third, effective validation identity did not model diagnostic invocations.
+`php artisan tinker --execute` and `php -r` inherited their declared Tester
+purpose and were evaluated as tests. A parse error in the throwaway expression
+could not be separated from a real PHPUnit failure or a PHP source-lint error.
+
+Finally, evidence supersession was intentionally limited to an invalid focused
+Angular/Vitest include followed by a current full-suite run. Runtime commands
+had no structured verification objective, so two corrected diagnostic argv
+forms could not establish narrow equivalence. The earlier malformed command
+therefore remained unresolved. Exact reruns already retained history while the
+latest current result won, and repository freshness already used Git HEAD,
+gate hashes, and package/composer hashes; the new design must extend those
+mechanisms rather than create a parallel freshness system.
+
+The implementation below separates discovery, applicability, requirement, and
+execution authorization. Configured commands remain required. Discovered
+builds require reproducible Contract, CI, changed-file, ecosystem, or runtime
+asset-consumption evidence; demonstrably unused Laravel scaffold builds are
+not applicable, while ambiguous builds remain blocking. Command results retain
+their raw execution outcome, and only required current evidence controls the
+gate. Diagnostic supersession requires an explicit stable verification ID, a
+matching diagnostic family, a later successful result, and the same repository
+snapshot.
+
 ## Agent execution timeout and human-input waits (2026-10-20)
 
 Before this change, `PiRunner.run()` owned one agent execution timer. It stored
