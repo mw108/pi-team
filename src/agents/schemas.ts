@@ -456,6 +456,53 @@ export const persistedTestSchema = z.object({
           )
           .max(8)
           .optional(),
+        buildAssessment: z
+          .object({
+            runtimeDependency: z.object({
+              status: z.enum(["DETECTED", "NOT_DETECTED", "AMBIGUOUS"]),
+              evidence: z
+                .array(
+                  z.object({
+                    source: z.string().max(120),
+                    reference: z.string().max(500).optional(),
+                    detail: z.string().max(1000).optional(),
+                  }),
+                )
+                .max(8),
+            }),
+            taskRelevance: z.object({
+              status: z.enum(["RELEVANT", "UNRELATED", "AMBIGUOUS"]),
+              evidence: z
+                .array(
+                  z.object({
+                    source: z.string().max(120),
+                    reference: z.string().max(500).optional(),
+                    detail: z.string().max(1000).optional(),
+                  }),
+                )
+                .max(8),
+            }),
+            gateRequirement: z.object({
+              status: z.enum([
+                "REQUIRED",
+                "OPTIONAL",
+                "NOT_APPLICABLE",
+                "AMBIGUOUS",
+              ]),
+              reasonCode: z.string().max(120),
+              explanation: z.string().max(2000),
+              evidence: z
+                .array(
+                  z.object({
+                    source: z.string().max(120),
+                    reference: z.string().max(500).optional(),
+                    detail: z.string().max(1000).optional(),
+                  }),
+                )
+                .max(8),
+            }),
+          })
+          .optional(),
         executionOutcome: z
           .enum([
             "PASS",

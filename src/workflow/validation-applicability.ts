@@ -32,6 +32,31 @@ export interface ValidationApplicabilityEvidence {
   detail?: string;
 }
 
+export const buildTaskRelevanceStatuses = [
+  "RELEVANT",
+  "UNRELATED",
+  "AMBIGUOUS",
+] as const;
+export type BuildTaskRelevanceStatus =
+  (typeof buildTaskRelevanceStatuses)[number];
+
+export interface BuildRequirementAssessment {
+  runtimeDependency: {
+    status: "DETECTED" | "NOT_DETECTED" | "AMBIGUOUS";
+    evidence: ValidationApplicabilityEvidence[];
+  };
+  taskRelevance: {
+    status: BuildTaskRelevanceStatus;
+    evidence: ValidationApplicabilityEvidence[];
+  };
+  gateRequirement: {
+    status: ValidationApplicabilityStatus;
+    reasonCode: string;
+    explanation: string;
+    evidence: ValidationApplicabilityEvidence[];
+  };
+}
+
 export interface ValidationApplicability {
   command: Command;
   discovery: "CONFIGURED" | "DISCOVERED";
@@ -41,6 +66,7 @@ export interface ValidationApplicability {
   evidence: ValidationApplicabilityEvidence[];
   source?: string;
   category?: DiscoveredCommand["category"];
+  buildAssessment?: BuildRequirementAssessment;
 }
 
 interface ContractEvidence {
@@ -56,7 +82,7 @@ interface ScriptReference {
 }
 
 interface RuntimeAssetEvidence {
-  required?: ValidationApplicabilityEvidence;
+  detected?: ValidationApplicabilityEvidence[];
   ambiguous?: ValidationApplicabilityEvidence;
   ignored: ValidationApplicabilityEvidence[];
 }
@@ -380,6 +406,7 @@ async function runtimeAssetEvidence(
   const viewsRoot = join(cwd, "resources", "views");
   const assetViews = await matchingFiles(viewsRoot, assetConsumerPattern);
   const ignored: ValidationApplicabilityEvidence[] = [];
+  const detected: ValidationApplicabilityEvidence[] = [];
   let ambiguous: ValidationApplicabilityEvidence | undefined;
   for (const path of assetViews) {
     const name = viewName(cwd, path);
@@ -388,15 +415,21 @@ async function runtimeAssetEvidence(
       "i",
     );
     const consumers = await matchingFiles(cwd, usage, { excludeViews: true });
-    if (consumers.length)
-      return {
-        required: {
+    if (consumers.length) {
+      detected.push(
+        {
           source: "runtime_asset_consumer",
           reference: repositoryReference(cwd, path),
           detail: `Referenced by ${repositoryReference(cwd, consumers[0])}.`,
         },
-        ignored,
-      };
+        {
+          source: "runtime_entry_point",
+          reference: repositoryReference(cwd, consumers[0]),
+          detail: `Renders ${repositoryReference(cwd, path)}.`,
+        },
+      );
+      continue;
+    }
     const reference = repositoryReference(cwd, path);
     if (name === "welcome")
       ignored.push({
@@ -416,15 +449,13 @@ async function runtimeAssetEvidence(
   const directConsumers = await matchingFiles(cwd, assetConsumerPattern, {
     excludeViews: true,
   });
-  if (directConsumers.length)
-    return {
-      required: {
-        source: "runtime_asset_consumer",
-        reference: repositoryReference(cwd, directConsumers[0]),
-        detail: "Runtime application code directly consumes generated assets.",
-      },
-      ignored,
-    };
+  for (const path of directConsumers)
+    detected.push({
+      source: "runtime_asset_consumer",
+      reference: repositoryReference(cwd, path),
+      detail: "Runtime application code directly consumes generated assets.",
+    });
+  if (detected.length) return { detected, ignored };
   return { ambiguous, ignored };
 }
 
@@ -434,16 +465,103 @@ function decision(
   reasonCode: string,
   explanation: string,
   evidence: ValidationApplicabilityEvidence[],
+  context?: Omit<BuildRequirementAssessment, "gateRequirement">,
 ): ValidationApplicability {
+  const boundedEvidence = evidence.slice(0, 8);
   return {
     command: discovered.command,
     discovery: "DISCOVERED",
     status,
     reasonCode,
     explanation,
-    evidence,
+    evidence: boundedEvidence,
     source: discovered.source,
     category: discovered.category,
+    ...(context
+      ? {
+          buildAssessment: {
+            ...context,
+            gateRequirement: {
+              status,
+              reasonCode,
+              explanation,
+              evidence: boundedEvidence,
+            },
+          },
+        }
+      : {}),
+  };
+}
+
+function normalizedScopePath(path: string) {
+  return path.replaceAll("\\", "/").replace(/^\.\//, "").toLowerCase();
+}
+
+function buildContext(
+  contract: ContractEvidence,
+  runtime: RuntimeAssetEvidence,
+): Omit<BuildRequirementAssessment, "gateRequirement"> {
+  const scoped = new Set(contract.paths.map(normalizedScopePath));
+  const frontendPaths = frontendScope(contract.paths);
+  const changedRuntimePaths = (runtime.detected ?? [])
+    .map((evidence) => evidence.reference)
+    .filter((reference): reference is string => Boolean(reference))
+    .filter((reference) => scoped.has(normalizedScopePath(reference)));
+  const buildConfigurationPaths = contract.paths.filter((path) =>
+    /^(?:package(?:-lock)?\.json|vite\.config\.[^/]+|webpack\.[^/]+|angular\.json|tsconfig(?:\.[^/]+)?\.json)$/i.test(
+      path.replaceAll("\\", "/"),
+    ),
+  );
+  const relevant = [
+    ...frontendPaths,
+    ...changedRuntimePaths,
+    ...buildConfigurationPaths,
+  ].filter((path, index, all) => all.indexOf(path) === index);
+  const taskRelevance: BuildRequirementAssessment["taskRelevance"] =
+    relevant.length
+      ? {
+          status: "RELEVANT",
+          evidence: [
+            {
+              source: "implementation_contract",
+              reference: "file scope",
+              detail: `Build-relevant paths: ${relevant.slice(0, 5).join(", ")}.`,
+            },
+          ],
+        }
+      : runtime.ambiguous
+        ? {
+            status: "AMBIGUOUS",
+            evidence: [runtime.ambiguous],
+          }
+        : {
+            status: "UNRELATED",
+            evidence: [
+              {
+                source: "implementation_contract",
+                reference: "file scope",
+                detail:
+                  "No frontend source, build configuration, or detected runtime asset consumer is changed by this task.",
+              },
+            ],
+          };
+  return {
+    runtimeDependency: runtime.detected
+      ? { status: "DETECTED", evidence: runtime.detected.slice(0, 8) }
+      : runtime.ambiguous
+        ? { status: "AMBIGUOUS", evidence: [runtime.ambiguous] }
+        : {
+            status: "NOT_DETECTED",
+            evidence: [
+              ...runtime.ignored.slice(0, 7),
+              {
+                source: "runtime_analysis",
+                detail:
+                  "No verified runtime entry point requires generated frontend assets.",
+              },
+            ],
+          },
+    taskRelevance,
   };
 }
 
@@ -453,6 +571,8 @@ async function buildApplicability(
 ): Promise<ValidationApplicability> {
   const { command } = discovered;
   const contract = contractEvidence(state);
+  const runtime = await runtimeAssetEvidence(state.cwd);
+  const context = buildContext(contract, runtime);
   const explicit = contractBuildRequirement(contract, command);
   if (explicit)
     return decision(
@@ -461,6 +581,7 @@ async function buildApplicability(
       "EXPLICIT_CONTRACT_REQUIREMENT",
       "The Implementation Contract explicitly requires this build.",
       [explicit],
+      context,
     );
 
   const ciFile = await ciReferencesCommand(state.cwd, command);
@@ -471,9 +592,20 @@ async function buildApplicability(
       "EXPLICIT_CI_REQUIREMENT",
       "The checked-in CI pipeline explicitly requires this build.",
       [{ source: "ci_configuration", reference: ciFile }],
+      context,
     );
 
   const scriptReferences = await projectScriptReferences(state.cwd, command);
+  const nonGateScriptEvidence = scriptReferences
+    .filter((reference) =>
+      ["SETUP", "DEVELOPMENT", "BUILD"].includes(reference.context),
+    )
+    .slice(0, 3)
+    .map((reference) => ({
+      source: "project_script",
+      reference: reference.reference,
+      detail: `${reference.detail} This context does not establish a Tester quality gate.`,
+    }));
   const testScript = scriptReferences.find((reference) =>
     ["TEST", "CI"].includes(reference.context),
   );
@@ -490,6 +622,7 @@ async function buildApplicability(
           detail: testScript.detail,
         },
       ],
+      context,
     );
 
   if (await exists(join(state.cwd, "angular.json")))
@@ -499,6 +632,7 @@ async function buildApplicability(
       "NATIVE_FRAMEWORK_BUILD",
       "The discovered build is the native validation gate for this Angular workspace.",
       [{ source: "framework_configuration", reference: "angular.json" }],
+      context,
     );
 
   const composer = await readSmall(join(state.cwd, "composer.json"));
@@ -523,32 +657,31 @@ async function buildApplicability(
         { source: "package_script", reference: discovered.source },
         { source: "compiler_configuration", reference: "tsconfig.json" },
       ],
+      context,
     );
 
-  const runtime = await runtimeAssetEvidence(state.cwd);
-  const frontendPaths = frontendScope(contract.paths);
-  if (runtime.required)
+  if (runtime.detected && context.taskRelevance.status === "RELEVANT")
     return decision(
       discovered,
       "REQUIRED",
-      frontendPaths.length
-        ? "ACTIVE_FRONTEND_TASK_SCOPE"
-        : "VERIFIED_RUNTIME_ASSET_DEPENDENCY",
-      frontendPaths.length
-        ? "The current task changes frontend assets consumed by verified runtime code."
-        : "Verified runtime application code consumes the generated asset build.",
+      "ACTIVE_FRONTEND_TASK_SCOPE",
+      "The current task changes build inputs, configuration, or a runtime path that consumes generated assets.",
+      [...runtime.detected, ...context.taskRelevance.evidence],
+      context,
+    );
+
+  if (runtime.detected && context.taskRelevance.status === "UNRELATED")
+    return decision(
+      discovered,
+      "NOT_APPLICABLE",
+      "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY",
+      "The application has a runtime asset dependency, but the existing consumer is outside the current task scope and no explicit build quality gate requires it.",
       [
-        runtime.required,
-        ...(frontendPaths.length
-          ? [
-              {
-                source: "implementation_contract",
-                reference: "file scope",
-                detail: `Frontend paths: ${frontendPaths.slice(0, 5).join(", ")}.`,
-              },
-            ]
-          : []),
+        ...runtime.detected,
+        ...context.taskRelevance.evidence,
+        ...nonGateScriptEvidence,
       ],
+      context,
     );
 
   const deployment = scriptReferences.find(
@@ -567,6 +700,7 @@ async function buildApplicability(
           detail: deployment.detail,
         },
       ],
+      context,
     );
 
   const unknownScript = scriptReferences.find(
@@ -585,6 +719,7 @@ async function buildApplicability(
           detail: unknownScript.detail,
         },
       ],
+      context,
     );
 
   if (runtime.ambiguous)
@@ -594,8 +729,10 @@ async function buildApplicability(
       "UNRESOLVED_RUNTIME_ASSET_DEPENDENCY",
       "A view consumes built assets, but the available repository evidence does not establish whether that view is used at runtime.",
       [runtime.ambiguous],
+      context,
     );
 
+  const frontendPaths = frontendScope(contract.paths);
   if (frontendPaths.length)
     return decision(
       discovered,
@@ -611,6 +748,7 @@ async function buildApplicability(
           detail: `Frontend paths: ${frontendPaths.slice(0, 5).join(", ")}.`,
         },
       ],
+      context,
     );
 
   const setup = scriptReferences.filter((reference) =>
@@ -640,6 +778,7 @@ async function buildApplicability(
             "No verified runtime entry point requires generated frontend assets.",
         },
       ],
+      context,
     );
 
   return decision(
@@ -655,6 +794,7 @@ async function buildApplicability(
         detail: reference.detail,
       })),
     ],
+    context,
   );
 }
 
@@ -713,22 +853,45 @@ async function discoveredApplicability(
 export async function validationApplicability(
   state: WorkflowState,
 ): Promise<ValidationApplicability[]> {
-  const values: ValidationApplicability[] = state.config.commands
-    .filter((command) => ["test", "static"].includes(command.purpose))
-    .map((command) => ({
+  const values: ValidationApplicability[] = [];
+  for (const command of state.config.commands.filter((command) =>
+    ["test", "static"].includes(command.purpose),
+  )) {
+    const identity = await resolveEffectiveValidationIdentity(
+      command,
+      state.cwd,
+    );
+    const evidence = [
+      {
+        source: "workflow_configuration",
+        reference: "workflow.commands",
+      },
+    ];
+    const status = "REQUIRED" as const;
+    const reasonCode = "EXPLICIT_WORKFLOW_CONFIGURATION";
+    const explanation =
+      "The command is explicitly configured as a workflow quality gate.";
+    let buildAssessment: BuildRequirementAssessment | undefined;
+    if (identity?.validationType === "BUILD") {
+      const context = buildContext(
+        contractEvidence(state),
+        await runtimeAssetEvidence(state.cwd),
+      );
+      buildAssessment = {
+        ...context,
+        gateRequirement: { status, reasonCode, explanation, evidence },
+      };
+    }
+    values.push({
       command,
       discovery: "CONFIGURED" as const,
-      status: "REQUIRED" as const,
-      reasonCode: "EXPLICIT_WORKFLOW_CONFIGURATION",
-      explanation:
-        "The command is explicitly configured as a workflow quality gate.",
-      evidence: [
-        {
-          source: "workflow_configuration",
-          reference: "workflow.commands",
-        },
-      ],
-    }));
+      status,
+      reasonCode,
+      explanation,
+      evidence,
+      ...(buildAssessment ? { buildAssessment } : {}),
+    });
+  }
   const seen = new Set(values.map((value) => commandKey(value.command)));
   for (const discovered of state.discoveredCommands) {
     if (

@@ -541,12 +541,24 @@ export function renderProgress(
     ) ?? [];
   for (const outcome of buildApplicability.slice(0, 3)) {
     lines.push(`Build applicability: ${outcome.applicability}`);
+    if (outcome.buildAssessment) {
+      lines.push(
+        `Runtime asset dependency: ${outcome.buildAssessment.runtimeDependency.status}`,
+      );
+      lines.push(
+        `Task relevance: ${outcome.buildAssessment.taskRelevance.status}`,
+      );
+    }
     if (outcome.applicabilityExplanation)
       lines.push(`Reason: ${outcome.applicabilityExplanation}`);
-    const source = outcome.applicabilityEvidence?.find(
-      (evidence) => evidence.reference,
-    );
-    if (source) lines.push(`Source: ${source.reference}`);
+    const source = (
+      outcome.buildAssessment?.runtimeDependency.evidence ??
+      outcome.applicabilityEvidence
+    )?.find((evidence) => evidence.reference);
+    if (source) {
+      lines.push(`Source: ${source.reference}`);
+      if (source.detail) lines.push(source.detail);
+    }
   }
   const gates = [
     ...(!state.config.qualityGates.pentest.enabled ? ["Pentest disabled"] : []),

@@ -22,6 +22,7 @@ export interface CandidateValidationCommand {
   applicabilityReasonCode?: string;
   applicabilityExplanation?: string;
   applicabilityEvidence?: ValidationApplicability["evidence"];
+  buildAssessment?: ValidationApplicability["buildAssessment"];
 }
 
 function validationHintPurpose(command: {
@@ -127,8 +128,8 @@ export function testerValidationContext(
         "reviewer.acceptanceCriteria",
       );
   }
-  const configured = effectiveConfig(state, "tester").commands.filter(
-    (command) => allowedCommandCategories("tester").includes(command.purpose),
+  const approved = effectiveConfig(state, "tester").commands.filter((command) =>
+    allowedCommandCategories("tester").includes(command.purpose),
   );
   for (const command of state.config.commands.filter((item) =>
     allowedCommandCategories("tester").includes(item.purpose),
@@ -175,8 +176,13 @@ export function testerValidationContext(
       `verified:${result.agent}:attempt-${result.attempt}`,
     );
   }
-  for (const command of configured)
-    add(command, `Run ${command.purpose} check`, "approved.commands");
+  // Approval authorizes execution but does not create a verification
+  // obligation. Approved commands only belong to the current plan when an
+  // independent source above (workflow configuration, Contract, discovery,
+  // or current evidence) already selected the same argv.
+  const plannedApprovals = approved.filter((command) =>
+    seen.has(commandKey(command)),
+  );
   for (const candidate of candidates) {
     const policy = applicability.find(
       (item) => commandKey(item.command) === commandKey(candidate),
@@ -187,11 +193,14 @@ export function testerValidationContext(
         applicabilityReasonCode: policy.reasonCode,
         applicabilityExplanation: policy.explanation,
         applicabilityEvidence: policy.evidence,
+        ...(policy.buildAssessment
+          ? { buildAssessment: policy.buildAssessment }
+          : {}),
       });
   }
   return {
     candidateValidationCommands: candidates,
-    approvedCommandIds: configured.map((command) => command.id),
+    approvedCommandIds: plannedApprovals.map((command) => command.id),
     commandAuthorizationHints: state.config.permissions.commands.allow
       .filter((rule) =>
         candidates.some((candidate) => staticCommandMatches(rule, candidate)),

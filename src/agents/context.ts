@@ -153,17 +153,22 @@ export async function contextFor(
         "The user accepted only the listed unavailable test methods. Do not retry them. Continue other applicable checks, preserve every existing finding and completed check, and keep each accepted limitation explicitly unverified. Do not claim it passed. Return COMPLETED_WITH_LIMITATIONS when all feasible checks are complete. Return PENTEST_UNAVAILABLE again only for materially different evidence or scope.",
     };
   if (role === "tester") {
-    context.approvedCommands = effectiveConfig(s, role).commands.filter((c) =>
-      allowedCommandCategories(role).includes(c.purpose),
+    const plan = testerValidationContext(
+      s,
+      currentVerifiedCommandResults(s, await repositoryEvidenceState(s)),
+      await validationApplicability(s),
     );
-    Object.assign(
-      context,
-      testerValidationContext(
-        s,
-        currentVerifiedCommandResults(s, await repositoryEvidenceState(s)),
-        await validationApplicability(s),
+    const planned = new Set(
+      plan.candidateValidationCommands.map((command) =>
+        JSON.stringify([command.executable, command.args]),
       ),
     );
+    context.approvedCommands = effectiveConfig(s, role).commands.filter(
+      (command) =>
+        allowedCommandCategories(role).includes(command.purpose) &&
+        planned.has(JSON.stringify([command.executable, command.args])),
+    );
+    Object.assign(context, plan);
     context.candidateValidationCommandList = (
       context.candidateValidationCommands as {
         executable: string;

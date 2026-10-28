@@ -9,6 +9,7 @@ import {
   testerValidationContext,
 } from "../src/agents/validation-context.ts";
 import { commandTool, execute } from "../src/agents/commands.ts";
+import { normalizedRuntimeCommand } from "../src/agents/runtime-commands.ts";
 import { testerCommandInstructions } from "../src/agents/runner.ts";
 import { recordVerifiedCommandResult } from "../src/workflow/verified-commands.ts";
 import { config, contract, repository } from "./helpers.ts";
@@ -177,4 +178,47 @@ test("Tester instructions and tool description rule out empty discovery", async 
   assert.match(tool.description, /team_command\(\{\}\) is invalid/);
   assert.match(tool.description, /Form A/);
   assert.match(tool.description, /Form B/);
+});
+
+test("historical diagnostic approval survives but does not enter a retry verification plan", async () => {
+  const cwd = await repository();
+  const state = newState(
+    cwd,
+    "localization retry",
+    config(),
+    await baseline(cwd),
+  );
+  state.config.commands = [];
+  const malformed = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: ["artisan", "tinker", "--execute", "echo json_encode([]));"],
+      purpose: "Explore localization",
+      category: "test",
+    },
+    "tester",
+  ).command;
+  state.runtimeCommandApprovals.push({ role: "tester", command: malformed });
+
+  const plan = testerValidationContext(state);
+  assert.equal(
+    plan.candidateValidationCommands.some(
+      (candidate) =>
+        candidate.executable === malformed.executable &&
+        JSON.stringify(candidate.args) === JSON.stringify(malformed.args),
+    ),
+    false,
+  );
+  assert.equal(plan.approvedCommandIds.includes(malformed.id), false);
+  assert.deepEqual(state.runtimeCommandApprovals, [
+    { role: "tester", command: malformed },
+  ]);
+
+  const context = await contextFor("tester", state);
+  assert.equal(
+    context.approvedCommands.some(
+      (command: { id: string }) => command.id === malformed.id,
+    ),
+    false,
+  );
 });

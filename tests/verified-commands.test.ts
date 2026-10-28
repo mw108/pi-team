@@ -1732,6 +1732,76 @@ test("PHP evaluation parse errors are invocation errors, while source lint and i
   assert.equal(invariant.recoverable, true);
 });
 
+test("an optional diagnostic application failure remains blocking evidence", async () => {
+  const cwd = await repository();
+  const required = {
+    id: "required-tests",
+    executable: process.execPath,
+    args: ["-e", "process.exit(0)"],
+    purpose: "test" as const,
+    timeoutMs: 1000,
+  };
+  const cfg = config();
+  cfg.commands = [required];
+  cfg.qualityGates.commit.enabled = false;
+  const state = newState(cwd, "diagnostic failure", cfg, await baseline(cwd));
+  const diagnostic = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: [
+        "artisan",
+        "tinker",
+        "--execute",
+        "exit($translationsAreWrong ? 1 : 0);",
+      ],
+      purpose: "Check localization invariant",
+      category: "test",
+      verificationId: "localization.translation_resolution",
+    },
+    "tester",
+  ).command;
+  for (const [command, exitCode, output] of [
+    [required, 0, "Tests: 73 passed (415 assertions)"],
+    [diagnostic, 1, "Localization invariant failed"],
+  ] as const) {
+    const verified = await recordVerifiedCommandResult(
+      state,
+      command,
+      { id: command.id, exitCode, output, sandbox },
+      "tester",
+      1,
+    );
+    assert.ok(verified);
+    state.verifiedCommandResults.push(verified);
+  }
+  const runner = new PiRunner();
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async () => {},
+      getLastAssistantText: () =>
+        JSON.stringify({ status: "PASS", commands: [], failedAreas: [] }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+
+  const result = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    1,
+  )) as any;
+  assert.equal(result.status, "FAIL");
+  const outcome = result.validationOutcomes.find(
+    (item: any) => item.id === diagnostic.id,
+  );
+  assert.equal(outcome.applicability, "OPTIONAL");
+  assert.equal(outcome.outcome, "DIAGNOSTIC_FAILURE");
+  assert.deepEqual(result.failedAreas, [diagnostic.id]);
+});
+
 test("structured diagnostic identity narrowly supersedes a corrected current invocation", async () => {
   const cwd = await repository();
   const state = newState(cwd, "diagnostic", config(), await baseline(cwd));
@@ -1853,6 +1923,19 @@ test("synthetic Laravel incident passes only when the unavailable Vite build is 
   assert.ok(build);
   assert.ok(tests);
   state.approvedCommands = [build.command, tests.command];
+  const malformedDiagnostic = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: ["artisan", "tinker", "--execute", "echo json_encode([]));"],
+      purpose: "Explore localization",
+      category: "test",
+    },
+    "tester",
+  ).command;
+  state.runtimeCommandApprovals.push({
+    role: "tester",
+    command: malformedDiagnostic,
+  });
   const commands = [
     {
       command: tests.command,
@@ -1889,14 +1972,7 @@ test("synthetic Laravel incident passes only when the unavailable Vite build is 
         'Der Befehl "vite" ist entweder falsch geschrieben oder konnte nicht gefunden werden.',
     },
     {
-      command: {
-        id: "tinker-invalid",
-        executable: "php",
-        args: ["artisan", "tinker", "--execute", "echo json_encode([]));"],
-        purpose: "test" as const,
-        verificationId: "localization.translation_resolution",
-        timeoutMs: 1000,
-      },
+      command: malformedDiagnostic,
       exitCode: 1,
       output: "PARSE ERROR\nPHP Parse error: syntax error, unexpected ')'",
     },
@@ -1957,11 +2033,50 @@ test("synthetic Laravel incident passes only when the unavailable Vite build is 
   assert.equal(buildOutcome.outcome, "NOT_APPLICABLE");
   assert.equal(buildOutcome.executionOutcome, "TOOL_UNAVAILABLE");
   const invalid = pass.validationOutcomes.find(
-    (outcome: any) => outcome.id === "tinker-invalid",
+    (outcome: any) => outcome.id === malformedDiagnostic.id,
   );
   assert.equal(invalid.outcome, "INVOCATION_ERROR");
-  assert.match(invalid.supersededBy, /^[0-9a-f-]{36}$/);
+  assert.equal(invalid.applicability, "OPTIONAL");
+  assert.equal(invalid.applicabilityReasonCode, "EXECUTED_OPTIONAL_DIAGNOSTIC");
+  assert.equal(invalid.supersededBy, undefined);
   assert.equal(state.verifiedCommandResults.length, 6);
+
+  let retryInput: any;
+  runner.createSession = async () =>
+    ({
+      messages: [],
+      prompt: async (input: string) => {
+        retryInput = JSON.parse(input);
+      },
+      getLastAssistantText: () =>
+        JSON.stringify({ status: "PASS", commands: [], failedAreas: [] }),
+      extensionRunner: { emit: async () => {} },
+      dispose: () => {},
+      abort: async () => {},
+    }) as any;
+  const retry = (await runner.run(
+    "tester",
+    state,
+    undefined,
+    undefined,
+    2,
+  )) as any;
+  assert.equal(retry.status, "PASS", retry.reason);
+  assert.equal(
+    retryInput.verifiedCommandResults.some(
+      (item: any) => item.command.id === malformedDiagnostic.id,
+    ),
+    false,
+  );
+  assert.equal(
+    retryInput.candidateValidationCommands.some(
+      (item: any) => item.executable === "php" && item.args[1] === "tinker",
+    ),
+    false,
+  );
+  assert.deepEqual(state.runtimeCommandApprovals, [
+    { role: "tester", command: malformedDiagnostic },
+  ]);
 
   state.results.reviewer = {
     ...state.results.reviewer,

@@ -142,6 +142,7 @@ test("HAPAK-like API localization ignores setup-only Vite scaffold evidence", as
       "resources/views/welcome.blade.php",
       "@vite(['resources/css/app.css', 'resources/js/app.js'])\n",
     ],
+    ["routes/web.php", "<?php\nRoute::view('/', 'welcome');\n"],
     [
       "resources/views/mail/verification.blade.php",
       "{{ __('messages.mail.verification.subject') }}\n",
@@ -157,8 +158,9 @@ test("HAPAK-like API localization ignores setup-only Vite scaffold evidence", as
   state.discoveredCommands = await discoverCommands(cwd);
   const policy = buildPolicy(await validationApplicability(state));
   assert.equal(policy.status, "NOT_APPLICABLE");
-  assert.equal(policy.reasonCode, "NO_FRONTEND_BUILD_REQUIREMENT");
-  assert.match(policy.explanation, /backend or server-rendered files/i);
+  assert.equal(policy.reasonCode, "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY");
+  assert.equal(policy.buildAssessment?.runtimeDependency.status, "DETECTED");
+  assert.equal(policy.buildAssessment?.taskRelevance.status, "UNRELATED");
   assert.ok(
     policy.evidence.some(
       (item) =>
@@ -207,9 +209,11 @@ test("script contexts are structural and preserve setup, quality, deployment, tr
     (item) => item.category === "build",
   )!.command;
   configured.state.config.commands = [configuredBuild];
+  const configuredPolicy = (await validationApplicability(configured.state))[0];
+  assert.equal(configuredPolicy.reasonCode, "EXPLICIT_WORKFLOW_CONFIGURATION");
   assert.equal(
-    (await validationApplicability(configured.state))[0].reasonCode,
-    "EXPLICIT_WORKFLOW_CONFIGURATION",
+    configuredPolicy.buildAssessment?.gateRequirement.status,
+    "REQUIRED",
   );
 
   const deployment = await project({
@@ -246,16 +250,17 @@ test("script contexts are structural and preserve setup, quality, deployment, tr
   );
 });
 
-test("Laravel runtime asset use makes Vite required", async () => {
+test("changing a Laravel runtime asset consumer makes Vite required", async () => {
   const { state } = await project({
     laravel: true,
     view: "<html><head>@vite(['resources/css/app.css'])</head></html>\n",
     runtimeView: "app",
+    files: ["resources/views/app.blade.php"],
   });
-  assert.equal(
-    buildPolicy(await validationApplicability(state)).status,
-    "REQUIRED",
-  );
+  const policy = buildPolicy(await validationApplicability(state));
+  assert.equal(policy.status, "REQUIRED");
+  assert.equal(policy.buildAssessment?.runtimeDependency.status, "DETECTED");
+  assert.equal(policy.buildAssessment?.taskRelevance.status, "RELEVANT");
 });
 
 test("Blade localization is server-side while verified, unresolved, and incidental asset consumers remain distinct", async () => {
@@ -278,7 +283,7 @@ test("Blade localization is server-side while verified, unresolved, and incident
   });
   assert.equal(
     buildPolicy(await validationApplicability(compiled.state)).reasonCode,
-    "VERIFIED_RUNTIME_ASSET_DEPENDENCY",
+    "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY",
   );
 
   const unresolved = await project({
@@ -333,14 +338,20 @@ test("frontend scope, explicit Contract requirements, and exact CI usage require
     laravel: true,
     contractText: "Run npm run build to verify the localization assets",
   });
+  const explicitPolicy = buildPolicy(
+    await validationApplicability(explicit.state),
+  );
+  assert.equal(explicitPolicy.status, "REQUIRED");
   assert.equal(
-    buildPolicy(await validationApplicability(explicit.state)).status,
-    "REQUIRED",
+    explicitPolicy.buildAssessment?.gateRequirement.reasonCode,
+    "EXPLICIT_CONTRACT_REQUIREMENT",
   );
   const ci = await project({ ci: true });
+  const ciPolicy = buildPolicy(await validationApplicability(ci.state));
+  assert.equal(ciPolicy.status, "REQUIRED");
   assert.equal(
-    buildPolicy(await validationApplicability(ci.state)).status,
-    "REQUIRED",
+    ciPolicy.buildAssessment?.gateRequirement.reasonCode,
+    "EXPLICIT_CI_REQUIREMENT",
   );
 
   const negated = await project({
@@ -469,7 +480,12 @@ test("every applicability status has deterministic structured provenance", async
 });
 
 test("Tester results, history, state recovery, and team status retain applicability provenance", async () => {
-  const { state } = await project({ laravel: true });
+  const { state } = await project({
+    laravel: true,
+    view: "@vite(['resources/css/app.css'])\n",
+    runtimeView: "app",
+    files: ["app/Http/Controllers/LocaleController.php"],
+  });
   state.results.reviewer = {
     ...(state.results.reviewer as typeof contract),
     requiredTests: [],
@@ -499,14 +515,19 @@ test("Tester results, history, state recovery, and team status retain applicabil
     (outcome: any) => outcome.validationType === "BUILD",
   );
   assert.equal(build.applicability, "NOT_APPLICABLE");
-  assert.equal(build.applicabilityReasonCode, "NO_FRONTEND_BUILD_REQUIREMENT");
-  assert.match(build.applicabilityExplanation, /server-rendered files/i);
+  assert.equal(
+    build.applicabilityReasonCode,
+    "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY",
+  );
+  assert.equal(build.buildAssessment.runtimeDependency.status, "DETECTED");
+  assert.equal(build.buildAssessment.taskRelevance.status, "UNRELATED");
   assert.ok(build.applicabilityEvidence.length > 0);
   assert.ok(
     state.history.some(
       (entry) =>
         entry.event === "validation_applicability_decided" &&
-        entry.meta?.applicabilityReasonCode === "NO_FRONTEND_BUILD_REQUIREMENT",
+        entry.meta?.applicabilityReasonCode ===
+          "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY",
     ),
   );
 
@@ -516,11 +537,13 @@ test("Tester results, history, state recovery, and team status retain applicabil
     recovered.results.tester?.validationOutcomes?.find(
       (outcome) => outcome.validationType === "BUILD",
     )?.applicabilityReasonCode,
-    "NO_FRONTEND_BUILD_REQUIREMENT",
+    "TASK_UNRELATED_RUNTIME_ASSET_DEPENDENCY",
   );
   const status = renderProgress(recovered, undefined, true).join("\n");
   assert.match(status, /Build applicability: NOT_APPLICABLE/);
-  assert.match(status, /Reason: .*server-rendered files/i);
+  assert.match(status, /Runtime asset dependency: DETECTED/);
+  assert.match(status, /Task relevance: UNRELATED/);
+  assert.match(status, /Referenced by routes\/web\.php/);
 
   assert.doesNotThrow(() =>
     persistedTestSchema.parse({

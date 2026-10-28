@@ -70,6 +70,7 @@ import {
 import {
   requiredValidationCommands,
   validationApplicability,
+  type ValidationApplicability,
 } from "../workflow/validation-applicability.ts";
 import { recordCommandPurposeMismatch } from "../workflow/command-purpose-mismatch.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
@@ -1096,9 +1097,16 @@ export class PiRunner implements AgentRunner {
           }
         }
         await validationLog.flush();
-        input.verifiedCommandResults = currentVerifiedCommandResults(
+        const refreshed = currentVerifiedCommandResults(
           state,
           await repositoryEvidenceState(state),
+        );
+        const requiredIdentities = new Set(required.map(commandKey));
+        input.verifiedCommandResults = refreshed.filter(
+          (item) =>
+            item.agent !== "tester" ||
+            item.attempt === attempt ||
+            requiredIdentities.has(item.commandIdentity),
         );
         input.requiredValidationCommands = required;
         input.validationApplicability = applicability;
@@ -1378,6 +1386,39 @@ export class PiRunner implements AgentRunner {
           applicability.find(
             (policy) => commandKey(policy.command) === identity,
           );
+        const policyForEvidence = (
+          item: (typeof current)[number],
+          outcome: ReturnType<typeof classifyVerifiedCommand>,
+        ): ValidationApplicability | undefined => {
+          const policy = policyFor(item.commandIdentity);
+          if (policy || outcome.validationType !== "DIAGNOSTIC") return policy;
+          return {
+            command: {
+              ...item.command,
+              purpose:
+                item.command.purpose === "static"
+                  ? ("static" as const)
+                  : ("test" as const),
+              timeoutMs: 120000,
+            },
+            discovery: "DISCOVERED" as const,
+            status: "OPTIONAL" as const,
+            reasonCode: "EXECUTED_OPTIONAL_DIAGNOSTIC",
+            explanation: item.command.verificationId
+              ? "The Tester executed this diagnostic, but no current Contract, workflow configuration, or verification plan makes it a mandatory gate."
+              : "The Tester executed this diagnostic without a structured verification identity; the invocation remains audit evidence but does not create a mandatory retry obligation.",
+            evidence: [
+              {
+                source: "tester_execution",
+                reference: `attempt-${item.attempt}`,
+                detail: item.command.verificationId
+                  ? `Verification identity: ${item.command.verificationId}.`
+                  : "No structured verification identity was recorded.",
+              },
+            ],
+            buildAssessment: undefined,
+          };
+        };
         for (const policy of applicability)
           record(
             state,
@@ -1420,7 +1461,7 @@ export class PiRunner implements AgentRunner {
               state.cwd,
             );
             if (superseded) {
-              const policy = policyFor(item.commandIdentity);
+              const policy = policyForEvidence(item, outcome);
               supersededIdentities.add(item.commandIdentity);
               supersededOutcomes.push({
                 id: item.command.id,
@@ -1437,6 +1478,9 @@ export class PiRunner implements AgentRunner {
                   policy?.explanation ??
                   "The Tester executed this validation during the current attempt.",
                 applicabilityEvidence: policy?.evidence ?? [],
+                ...(policy?.buildAssessment
+                  ? { buildAssessment: policy.buildAssessment }
+                  : {}),
                 supersededBy: superseded.executionId,
               });
               record(state, "test_invocation_superseded", outcome.reason, {
@@ -1470,7 +1514,7 @@ export class PiRunner implements AgentRunner {
         result.validationOutcomes = [
           ...supersededOutcomes,
           ...authoritative.map(({ item, outcome, id }) => {
-            const policy = policyFor(item.commandIdentity);
+            const policy = policyForEvidence(item, outcome);
             const notApplicable = policy?.status === "NOT_APPLICABLE";
             return {
               id,
@@ -1489,6 +1533,9 @@ export class PiRunner implements AgentRunner {
                 policy?.explanation ??
                 "The Tester executed this validation during the current attempt.",
               applicabilityEvidence: policy?.evidence ?? [],
+              ...(policy?.buildAssessment
+                ? { buildAssessment: policy.buildAssessment }
+                : {}),
               ...(notApplicable ? { executionOutcome: outcome.category } : {}),
             };
           }),
@@ -1517,6 +1564,9 @@ export class PiRunner implements AgentRunner {
             applicabilityReasonCode: policy.reasonCode,
             applicabilityExplanation: policy.explanation,
             applicabilityEvidence: policy.evidence,
+            ...(policy.buildAssessment
+              ? { buildAssessment: policy.buildAssessment }
+              : {}),
           });
         }
         if (commandDenied) {
@@ -1541,9 +1591,14 @@ export class PiRunner implements AgentRunner {
                 item.agent === "tester",
             ),
         );
-        const gateResults = authoritative.filter(({ item }) => {
-          const status = policyFor(item.commandIdentity)?.status;
-          return status === "REQUIRED" || status === undefined;
+        const gateResults = authoritative.filter(({ item, outcome }) => {
+          const status = policyForEvidence(item, outcome)?.status;
+          return (
+            status === "REQUIRED" ||
+            status === undefined ||
+            (outcome.validationType === "DIAGNOSTIC" &&
+              outcome.category === "DIAGNOSTIC_FAILURE")
+          );
         });
         const unresolved = gateResults.filter(
           ({ outcome }) =>
