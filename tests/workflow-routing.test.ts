@@ -44,6 +44,47 @@ function state() {
     cachedDiff: "",
   });
 }
+function verifiedOutcome(
+  id: string,
+  validationType: "TEST" | "STATIC" | "BUILD" | "DIAGNOSTIC",
+  outcome:
+    | "PASS"
+    | "TEST_FAILURE"
+    | "STATIC_FORMAT_FAILURE"
+    | "STATIC_ANALYSIS_FAILURE"
+    | "BUILD_FAILURE"
+    | "DIAGNOSTIC_FAILURE"
+    | "TOOL_UNAVAILABLE"
+    | "NOT_APPLICABLE"
+    | "INVOCATION_ERROR"
+    | "INFRASTRUCTURE_ERROR"
+    | "INDETERMINATE",
+  applicability: "REQUIRED" | "OPTIONAL" | "NOT_APPLICABLE" | "AMBIGUOUS",
+) {
+  return {
+    id,
+    validationType,
+    validator:
+      validationType === "TEST"
+        ? ("PHPUNIT" as const)
+        : validationType === "STATIC"
+          ? ("PHPSTAN" as const)
+          : validationType === "BUILD"
+            ? ("VITE" as const)
+            : ("PHP_DIAGNOSTIC" as const),
+    validatorSource: "direct" as const,
+    outcome,
+    reason: `${outcome} fixture`,
+    recoverable: [
+      "TEST_FAILURE",
+      "STATIC_FORMAT_FAILURE",
+      "STATIC_ANALYSIS_FAILURE",
+      "BUILD_FAILURE",
+      "DIAGNOSTIC_FAILURE",
+    ].includes(outcome),
+    applicability,
+  };
+}
 test("APPROVED advances through configured quality gates", () => {
   const s = state();
   s.phase = "CODE_REVIEW";
@@ -438,6 +479,153 @@ test("failed tests never route to commit", () => {
   };
   transition(t);
   assert.notEqual(t.phase, "COMMIT");
+});
+test("host-verified PASS advances with an auditable optional invocation error", () => {
+  const s = state();
+  s.phase = "TEST";
+  s.results.tester = {
+    status: "PASS",
+    reason: "Host-verified required validation obligations passed.",
+    commands: [
+      { id: "composer-test", exitCode: 0, output: "PASS" },
+      { id: "laravel-test", exitCode: 0, output: "73 tests passed" },
+      { id: "pint", exitCode: 0, output: "PASS" },
+      {
+        id: "detected-8ed057d5f441",
+        exitCode: 0,
+        output: "OK (73 tests, 415 assertions)",
+      },
+      { id: "migration", exitCode: 0, output: "PASS" },
+      { id: "localization", exitCode: 0, output: "PASS" },
+      {
+        id: "detected-982ac5089003",
+        exitCode: 1,
+        output: "PHP Parse error: syntax error",
+      },
+    ],
+    failedAreas: [],
+    validationOutcomes: [
+      verifiedOutcome("composer-test", "TEST", "PASS", "REQUIRED"),
+      verifiedOutcome("laravel-test", "TEST", "PASS", "REQUIRED"),
+      verifiedOutcome("pint", "STATIC", "PASS", "REQUIRED"),
+      {
+        ...verifiedOutcome("detected-80a27dc5b522", "TEST", "PASS", "REQUIRED"),
+        requiredCommandId: "detected-80a27dc5b522",
+        satisfiedByCommandId: "detected-8ed057d5f441",
+        matchType: "VERIFIED_EQUIVALENT",
+        matchReasonCode: "PHPUNIT_OUTPUT_ONLY_ARGUMENT_DIFFERENCE",
+      },
+      verifiedOutcome("vite", "BUILD", "NOT_APPLICABLE", "NOT_APPLICABLE"),
+      verifiedOutcome("migration", "DIAGNOSTIC", "PASS", "OPTIONAL"),
+      verifiedOutcome("localization", "DIAGNOSTIC", "PASS", "OPTIONAL"),
+      verifiedOutcome(
+        "detected-982ac5089003",
+        "DIAGNOSTIC",
+        "INVOCATION_ERROR",
+        "OPTIONAL",
+      ),
+      {
+        ...verifiedOutcome(
+          "superseded-required-invocation",
+          "TEST",
+          "INVOCATION_ERROR",
+          "REQUIRED",
+        ),
+        supersededBy: "00000000-0000-4000-8000-000000000001",
+      },
+    ],
+  } as any;
+  transition(s);
+  assert.equal(s.phase, "COMMIT", s.blocker);
+  assert.equal(s.blocker, undefined);
+  assert.equal(
+    s.results.tester?.validationOutcomes?.find(
+      (outcome) => outcome.id === "detected-982ac5089003",
+    )?.outcome,
+    "INVOCATION_ERROR",
+  );
+});
+
+test("Tester PASS conflicts remain blocked with actionable host evidence", () => {
+  const conflicts = [
+    ["phpunit", "TEST", "TEST_FAILURE", "Required test validation"],
+    [
+      "phpstan",
+      "STATIC",
+      "STATIC_ANALYSIS_FAILURE",
+      "Required static validation",
+    ],
+    ["vite", "BUILD", "BUILD_FAILURE", "Required build validation"],
+    ["tool", "STATIC", "TOOL_UNAVAILABLE", "Required static validation"],
+    [
+      "diagnostic",
+      "DIAGNOSTIC",
+      "INVOCATION_ERROR",
+      "Required diagnostic validation",
+    ],
+    [
+      "optional-defect",
+      "DIAGNOSTIC",
+      "DIAGNOSTIC_FAILURE",
+      "Verified diagnostic failure",
+      "OPTIONAL",
+    ],
+  ] as const;
+  for (const [
+    id,
+    type,
+    outcome,
+    source,
+    applicability = "REQUIRED",
+  ] of conflicts) {
+    const s = state();
+    s.phase = "TEST";
+    s.results.tester = {
+      status: "PASS",
+      commands: [{ id, exitCode: 1, output: "failure" }],
+      failedAreas: [],
+      validationOutcomes: [verifiedOutcome(id, type, outcome, applicability)],
+    } as any;
+    transition(s);
+    assert.equal(s.phase, "BLOCKED", `${id} advanced unexpectedly`);
+    assert.match(s.blocker ?? "", new RegExp(source, "i"));
+    assert.match(s.blocker ?? "", new RegExp(outcome));
+  }
+});
+
+test("Tester FAIL requires exact current remediation identities", () => {
+  const unsupported = state();
+  unsupported.phase = "TEST";
+  unsupported.results.tester = {
+    status: "FAIL",
+    commands: [{ id: "phpunit", exitCode: 1, output: "failure" }],
+    failedAreas: ["older-phpunit"],
+    classification: "FIX_LOCAL",
+    validationOutcomes: [
+      verifiedOutcome("phpunit", "TEST", "TEST_FAILURE", "REQUIRED"),
+    ],
+  } as any;
+  transition(unsupported);
+  assert.equal(unsupported.phase, "BLOCKED");
+  assert.match(unsupported.blocker ?? "", /unsupported/i);
+  assert.match(unsupported.blocker ?? "", /older-phpunit/);
+
+  const malformed = state();
+  malformed.phase = "TEST";
+  malformed.results.tester = {
+    status: "PASS",
+    commands: [{ id: "required", exitCode: 0, output: "PASS" }],
+    failedAreas: [],
+    validationOutcomes: [
+      {
+        ...verifiedOutcome("required", "TEST", "PASS", "REQUIRED"),
+        satisfiedByCommandId: "equivalent",
+      },
+    ],
+  } as any;
+  transition(malformed);
+  assert.equal(malformed.phase, "BLOCKED");
+  assert.match(malformed.blocker ?? "", /malformed validation evidence/i);
 });
 test("full cycle and local fix limits are hard global counters", () => {
   for (const route of ["FIX_LOCAL", "FIX_DESIGN"] as const) {

@@ -145,6 +145,71 @@ test("legacy completed Tester blocker is inferred only from matching lifecycle",
   assert.equal(await restarted.retryAgent(loaded, "tester"), "prepared");
 });
 
+test("legacy post-Tester consistency blocker retries only Tester after a persisted PASS", async () => {
+  const { cwd, state, engine } = await blockedTester();
+  const upstream = {
+    implementor: structuredClone(state.results.implementor),
+    codeReviewer: structuredClone(state.results.codeReviewer),
+    pentester: structuredClone(state.results.pentester),
+    securityReviewer: structuredClone(state.results.securityReviewer),
+  };
+  state.results.tester = {
+    status: "PASS",
+    reason: "Host-verified required validation obligations passed.",
+    commands: [
+      { id: "required", exitCode: 0, output: "PASS" },
+      { id: "optional-diagnostic", exitCode: 1, output: "syntax error" },
+    ],
+    failedAreas: [],
+    validationOutcomes: [
+      {
+        id: "required",
+        validationType: "TEST",
+        validator: "PHPUNIT",
+        validatorSource: "direct",
+        outcome: "PASS",
+        reason: "Command completed successfully",
+        recoverable: false,
+        applicability: "REQUIRED",
+      },
+      {
+        id: "optional-diagnostic",
+        validationType: "DIAGNOSTIC",
+        validator: "PHP_DIAGNOSTIC",
+        validatorSource: "interpreter",
+        outcome: "INVOCATION_ERROR",
+        reason: "Diagnostic syntax error",
+        recoverable: false,
+        applicability: "OPTIONAL",
+      },
+    ],
+  };
+  state.blocker =
+    "Testing blocked: Tester result lacks consistent, verified remediation evidence";
+  delete state.blockerMeta;
+  const blocked = state.history.findLast((event) => event.event === "blocked");
+  assert.ok(blocked);
+  blocked.detail = state.blocker;
+  await engine.store.save(state);
+
+  const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const loaded = await restarted.store.load(state.id);
+  assert.deepEqual(classifyQualityGateBlocker(loaded), {
+    kind: "owned",
+    agent: "tester",
+    phase: "TEST",
+    attempt: 1,
+  });
+  assert.equal(await restarted.retryAgent(loaded, "tester"), "prepared");
+  assert.equal(loaded.phase, "TEST");
+  assert.equal(loaded.results.tester, undefined);
+  assert.equal(loaded.results.previous_tester?.status, "PASS");
+  assert.deepEqual(loaded.results.implementor, upstream.implementor);
+  assert.deepEqual(loaded.results.codeReviewer, upstream.codeReviewer);
+  assert.deepEqual(loaded.results.pentester, upstream.pentester);
+  assert.deepEqual(loaded.results.securityReviewer, upstream.securityReviewer);
+});
+
 test("structured gate provenance remains usable when display reason changes", async () => {
   const { state, engine } = await blockedTester();
   state.results.tester!.reason = "Updated diagnostic wording";

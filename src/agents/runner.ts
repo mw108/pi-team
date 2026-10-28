@@ -69,6 +69,7 @@ import {
   supersedingInvocation,
   validationFailureFingerprint,
 } from "../workflow/verified-commands.ts";
+import { validationOutcomeParticipatesInGate } from "../workflow/validation-obligations.ts";
 import {
   requiredValidationCommands,
   validationApplicability,
@@ -1673,12 +1674,11 @@ export class PiRunner implements AgentRunner {
           )
             return false;
           const status = policyForEvidence(item, outcome)?.status;
-          return (
-            status === "REQUIRED" ||
-            status === undefined ||
-            (outcome.validationType === "DIAGNOSTIC" &&
-              outcome.category === "DIAGNOSTIC_FAILURE")
-          );
+          return validationOutcomeParticipatesInGate({
+            outcome: outcome.category,
+            validationType: outcome.validationType,
+            applicability: status,
+          });
         });
         const unresolved = gateResults.filter(
           ({ outcome }) =>

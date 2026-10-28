@@ -291,8 +291,20 @@ export function classifyQualityGateBlocker(
   state: WorkflowState,
 ): QualityGateBlocker | undefined {
   if (state.phase !== "BLOCKED" || !state.blocker) return undefined;
+  const meta = state.blockerMeta;
+  const legacyTesterConsistencyBlock =
+    !meta &&
+    state.results.tester !== undefined &&
+    state.results.tester.status !== "BLOCKED" &&
+    state.blocker ===
+      "Testing blocked: Tester result lacks consistent, verified remediation evidence";
   const candidates = (["tester", "pentester"] as const).filter(
-    (agent) => state.results[agent]?.status === "BLOCKED",
+    (agent) =>
+      state.results[agent]?.status === "BLOCKED" ||
+      (meta?.kind === "quality_gate_blocked" &&
+        meta.sourceAgent === agent &&
+        meta.sourcePhase === (agent === "tester" ? "TEST" : "PENTEST")) ||
+      (agent === "tester" && legacyTesterConsistencyBlock),
   );
   if (!candidates.length) return undefined;
   if (candidates.length !== 1)
@@ -306,12 +318,11 @@ export function classifyQualityGateBlocker(
     agent === "tester"
       ? `Testing blocked: ${state.results.tester?.reason ?? "Required validation could not run"}`
       : `Pentest blocked: ${state.results.pentester?.blocker?.message ?? ""}`;
-  const meta = state.blockerMeta;
   const ambiguous = (reason: string): QualityGateBlocker => ({
     kind: "ambiguous",
     reason,
   });
-  if (!meta && state.blocker !== expected)
+  if (!meta && !legacyTesterConsistencyBlock && state.blocker !== expected)
     return ambiguous("Current blocker does not match the blocked gate result.");
   const blockedIndex = state.history.findLastIndex(
     (event) => event.event === "blocked",
@@ -729,7 +740,7 @@ async function planWorkflowRecovery(
     return {
       kind: "completed-quality-gate-blocked",
       agentId: gateBlocker.agent,
-      reason: `${gateBlocker.agent} run ${gateBlocker.attempt} completed with a BLOCKED gate result. Retry the gate; upstream results remain valid.`,
+      reason: `${gateBlocker.agent} run ${gateBlocker.attempt} completed, but its gate transition was blocked. Retry the gate; upstream results remain valid.`,
     };
   }
   if (

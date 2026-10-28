@@ -2042,6 +2042,11 @@ test("synthetic Laravel incident passes only when the unavailable Vite build is 
   assert.equal(invalid.applicabilityReasonCode, "EXECUTED_OPTIONAL_DIAGNOSTIC");
   assert.equal(invalid.supersededBy, undefined);
   assert.equal(state.verifiedCommandResults.length, 6);
+  const transitionState = validateState(structuredClone(state));
+  transitionState.phase = "TEST";
+  transitionState.results.tester = pass;
+  transition(transitionState);
+  assert.equal(transitionState.phase, "REPORT", transitionState.blocker);
 
   let retryInput: any;
   runner.createSession = async () =>

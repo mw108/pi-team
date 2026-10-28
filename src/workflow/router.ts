@@ -15,6 +15,66 @@ import {
   matchingSecurityRiskReview,
   requestSecurityRiskReview,
 } from "./security-risk-review.ts";
+import {
+  assessTesterEvidence,
+  type ValidationOutcome,
+} from "./validation-obligations.ts";
+
+function validationConflictMessage(
+  status: "PASS" | "FAIL",
+  outcome: ValidationOutcome,
+  kind: "remediation" | "blocked",
+): string {
+  const requirement =
+    outcome.applicability === "OPTIONAL"
+      ? `Verified ${outcome.validationType.toLowerCase()} failure`
+      : `Required ${outcome.validationType.toLowerCase()} validation`;
+  const consequence =
+    kind === "remediation"
+      ? "This verified failure requires remediation before testing can pass."
+      : "The required validation has not been successfully reverified.";
+  return [
+    "Tester result conflicts with verified validation evidence.",
+    "",
+    "Source:",
+    requirement,
+    "",
+    "Command:",
+    outcome.id,
+    "",
+    "Outcome:",
+    outcome.outcome,
+    "",
+    `The Tester reported ${status}. ${consequence}`,
+  ].join("\n");
+}
+
+function missingRemediationMessage(outcome: ValidationOutcome): string {
+  return [
+    "Required remediation evidence is missing.",
+    "",
+    "Source:",
+    `${outcome.applicability === "OPTIONAL" ? "Verified" : "Required"} ${outcome.validationType} failure`,
+    "",
+    "Command:",
+    outcome.id,
+    "",
+    "Expected:",
+    "The Tester result must identify this current verified failure and route it for remediation.",
+  ].join("\n");
+}
+
+function unsupportedRemediationMessage(id: string): string {
+  return [
+    "Tester remediation evidence is unsupported.",
+    "",
+    "Command:",
+    id,
+    "",
+    "Expected:",
+    "failedAreas must reference current verified failures that require remediation.",
+  ].join("\n");
+}
 export const phaseRoles: Partial<Record<Phase, Role[]>> = {
   ORCHESTRATE: ["orchestrator"],
   RESEARCH: ["researcher"],
@@ -400,15 +460,15 @@ export function transition(s: WorkflowState) {
     case "TEST": {
       const r = s.results.tester;
       if (!r) throw new Error("Missing Tester result");
-      if (r.status === "BLOCKED") {
-        const attempt = s.history.findLast(
-          (event) =>
-            event.event === "agent_attempt_started" &&
-            event.meta?.agent === "tester",
-        )?.meta?.attempt;
+      const attempt = s.history.findLast(
+        (event) =>
+          event.event === "agent_attempt_started" &&
+          event.meta?.agent === "tester",
+      )?.meta?.attempt;
+      const blockTester = (reason: string) =>
         block(
           s,
-          `Testing blocked: ${r.reason ?? "Required validation could not run"}`,
+          reason,
           attempt
             ? {
                 kind: "quality_gate_blocked",
@@ -418,17 +478,123 @@ export function transition(s: WorkflowState) {
               }
             : undefined,
         );
+      if (r.status === "BLOCKED") {
+        blockTester(
+          `Testing blocked: ${r.reason ?? "Required validation could not run"}`,
+        );
+        break;
+      }
+      const outcomes = r.validationOutcomes;
+      const assessment = outcomes?.length
+        ? assessTesterEvidence(outcomes)
+        : undefined;
+      if (outcomes && !outcomes.length) {
+        blockTester(
+          "Tester result contains no host-verified validation outcomes. Run the required validations again on the current repository state.",
+        );
+        break;
+      }
+      if (assessment?.malformed.length) {
+        const malformed = assessment.malformed[0];
+        blockTester(
+          [
+            "Tester result contains malformed validation evidence.",
+            "",
+            "Command:",
+            malformed.id,
+            "",
+            "Problem:",
+            malformed.reason,
+          ].join("\n"),
+        );
+        break;
+      }
+      if (r.status === "PASS") {
+        const blocked = assessment?.blocked[0];
+        if (blocked) {
+          blockTester(validationConflictMessage("PASS", blocked, "blocked"));
+          break;
+        }
+        const remediation = assessment?.remediation[0];
+        if (remediation) {
+          blockTester(
+            validationConflictMessage("PASS", remediation, "remediation"),
+          );
+          break;
+        }
+        const legacyPass =
+          !assessment &&
+          r.commands.length > 0 &&
+          r.commands.every((command) => command.exitCode === 0);
+        if (
+          (assessment || legacyPass) &&
+          !r.failedAreas.length &&
+          !r.classification
+        ) {
+          s.phase = afterTests(s);
+          break;
+        }
+        blockTester(
+          r.failedAreas[0]
+            ? unsupportedRemediationMessage(r.failedAreas[0])
+            : "Tester PASS is missing current successful host-verified validation evidence.",
+        );
+        break;
+      }
+      if (r.status === "FAIL" && assessment) {
+        const blocked = assessment.blocked[0];
+        if (blocked) {
+          blockTester(validationConflictMessage("FAIL", blocked, "blocked"));
+          break;
+        }
+        const remediationIds = new Set(
+          assessment.remediation.map((outcome) => outcome.id),
+        );
+        const unsupported = r.failedAreas.find((id) => !remediationIds.has(id));
+        if (unsupported) {
+          blockTester(unsupportedRemediationMessage(unsupported));
+          break;
+        }
+        const missing = assessment.remediation.find(
+          (outcome) => !r.failedAreas.includes(outcome.id),
+        );
+        if (missing) {
+          blockTester(missingRemediationMessage(missing));
+          break;
+        }
+        if (!r.classification || !r.failedAreas.length) {
+          const source = assessment.remediation[0];
+          blockTester(
+            source
+              ? missingRemediationMessage(source)
+              : "Tester reported FAIL without a current verified failure that requires remediation.",
+          );
+          break;
+        }
+        const previous = s.results.previous_tester;
+        const unchangedRecoverableFailure =
+          r.classification === "FIX_LOCAL" &&
+          r.validationOutcomes?.some((outcome) =>
+            ["STATIC_FORMAT_FAILURE", "STATIC_ANALYSIS_FAILURE"].includes(
+              outcome.outcome,
+            ),
+          ) &&
+          r.failureFingerprint !== undefined &&
+          previous?.status === "FAIL" &&
+          previous.failureFingerprint === r.failureFingerprint;
+        if (unchangedRecoverableFailure) {
+          record(
+            s,
+            "tester_static_failure_unchanged",
+            "Static validation reported the same findings on the same repository state after local remediation",
+          );
+          blockTester(
+            "Testing blocked: static validation reported the same findings after a local fix attempt, and the repository state did not change. Inspect the prior Implementor result, any denied path approvals, and the validator diagnostics before retrying.",
+          );
+        } else fix(s, r.classification);
         break;
       }
       if (
-        r.status === "PASS" &&
-        r.commands.length &&
-        r.commands.every((c) => c.exitCode === 0) &&
-        !r.failedAreas.length &&
-        !r.classification
-      )
-        s.phase = afterTests(s);
-      else if (
         r.status === "FAIL" &&
         r.classification &&
         r.failedAreas.length &&
@@ -453,15 +619,13 @@ export function transition(s: WorkflowState) {
             "tester_static_failure_unchanged",
             "Static validation reported the same findings on the same repository state after local remediation",
           );
-          block(
-            s,
+          blockTester(
             "Testing blocked: static validation reported the same findings after a local fix attempt, and the repository state did not change. Inspect the prior Implementor result, any denied path approvals, and the validator diagnostics before retrying.",
           );
         } else fix(s, r.classification);
       } else
-        block(
-          s,
-          "Testing blocked: Tester result lacks consistent, verified remediation evidence",
+        blockTester(
+          "Tester result is inconsistent with its current host-verified validation evidence.",
         );
       break;
     }

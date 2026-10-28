@@ -723,9 +723,8 @@ export class WorkflowEngine {
     if (pendingFixRequirements(state)) return undefined;
     if (role === "reporter" && state.reportFailure) return undefined;
     if (
-      classifyQualityGateBlocker(state)?.kind === "owned" &&
       (role === "pentester" || role === "tester") &&
-      state.results[role]?.status === "BLOCKED"
+      classifyQualityGateBlocker(state)?.kind === "owned"
     )
       return undefined;
     const settled = this.activeAttempts.get(role);
@@ -1061,19 +1060,17 @@ export class WorkflowEngine {
         `A ${getAgentDisplayName(state.config, state.manualRetry.agent)} retry is pending. Use /team-retry ${state.manualRetry.agent} or /team-continue.`,
       );
     if (state.phase === "BLOCKED") {
-      if (
+      const gateOwnership = classifyQualityGateBlocker(state);
+      const qualityGateRetryCandidate =
         (role === "tester" || role === "pentester") &&
-        state.results[role]?.status === "BLOCKED" &&
-        this.sessions.list(state.id).length
-      )
+        (state.results[role]?.status === "BLOCKED" ||
+          (gateOwnership?.kind === "owned" && gateOwnership.agent === role));
+      if (qualityGateRetryCandidate && this.sessions.list(state.id).length)
         throw new Error(
           `Agent ${role} is already active; wait for it to settle.`,
         );
       const plan = await getWorkflowRecoveryPlan(state, this.cwd);
-      if (
-        (role === "tester" || role === "pentester") &&
-        state.results[role]?.status === "BLOCKED"
-      ) {
+      if (qualityGateRetryCandidate) {
         if (
           plan.kind !== "completed-quality-gate-blocked" ||
           plan.agentId !== role
