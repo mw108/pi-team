@@ -66,6 +66,220 @@ export async function dirtyPaths(cwd: string) {
   }
   return [...new Set(paths.filter(Boolean))];
 }
+
+export interface RepositorySnapshotEntry {
+  path: string;
+  hash: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  untracked: boolean;
+  renamedFrom?: string;
+}
+export interface RepositorySnapshot {
+  id: string;
+  head: string | null;
+  capturedAt: string;
+  entries: RepositorySnapshotEntry[];
+}
+export interface RepositoryDriftReport {
+  previousSnapshotId: string;
+  currentSnapshotId: string;
+  added: string[];
+  modified: string[];
+  deleted: string[];
+  renamed: { from: string; to: string }[];
+  staged: string[];
+  unstaged: string[];
+  untracked: string[];
+  overflow: number;
+}
+
+function safeDisplayPath(path: string) {
+  if (isSensitiveReadPath(path)) return "[sensitive path]";
+  return redactVisibleText(path.replace(/[\0\r\n\t]/g, "�").slice(0, 500));
+}
+
+async function snapshotPathHash(cwd: string, path: string) {
+  assertRelative(path);
+  await assertWithin(cwd, path);
+  try {
+    const stat = await lstat(join(cwd, path));
+    if (stat.isSymbolicLink()) return "SYMLINK";
+    if (!stat.isFile()) return `NON_FILE:${stat.mode}`;
+    return createHash("sha256")
+      .update(await readFile(join(cwd, path)))
+      .digest("hex");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "DELETED";
+    throw error;
+  }
+}
+
+/** Snapshot all non-ignored working-tree differences without persisting content. */
+export async function repositorySnapshot(
+  cwd: string,
+): Promise<RepositorySnapshot> {
+  const output = await git(cwd, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+  ]);
+  const raw = output.split("\0");
+  const entries: RepositorySnapshotEntry[] = [];
+  for (let index = 0; index < raw.length; index++) {
+    const item = raw[index];
+    if (!item) continue;
+    const indexStatus = item[0] ?? " ";
+    const worktreeStatus = item[1] ?? " ";
+    const path = item.slice(3).replaceAll("\\", "/");
+    if (!path || path.startsWith(".pi/team/")) {
+      if (/[RC]/.test(item.slice(0, 2))) index++;
+      continue;
+    }
+    let renamedFrom: string | undefined;
+    if (/[RC]/.test(item.slice(0, 2)))
+      renamedFrom = raw[++index]?.replaceAll("\\", "/");
+    entries.push({
+      path,
+      hash: await snapshotPathHash(cwd, path),
+      indexStatus,
+      worktreeStatus,
+      untracked: item.slice(0, 2) === "??",
+      ...(renamedFrom ? { renamedFrom } : {}),
+    });
+  }
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+  const snapshotIdentity = {
+    head: await head(cwd),
+    entries,
+  };
+  return {
+    ...snapshotIdentity,
+    id: createHash("sha256")
+      .update(JSON.stringify(snapshotIdentity))
+      .digest("hex"),
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+export function compareRepositorySnapshots(
+  previous: RepositorySnapshot,
+  current: RepositorySnapshot,
+  limit = 40,
+): RepositoryDriftReport {
+  const before = new Map(
+    previous.entries.map((entry) => [policyPath(entry.path), entry]),
+  );
+  const after = new Map(
+    current.entries.map((entry) => [policyPath(entry.path), entry]),
+  );
+  const added: string[] = [];
+  const modified: string[] = [];
+  const deleted: string[] = [];
+  const renamed: { from: string; to: string }[] = [];
+  const staged: string[] = [];
+  const unstaged: string[] = [];
+  const untracked: string[] = [];
+  for (const [identity, entry] of after) {
+    const old = before.get(identity);
+    let changed = false;
+    if (!old) {
+      changed = true;
+      if (entry.hash === "DELETED") deleted.push(entry.path);
+      else added.push(entry.path);
+    } else if (
+      old.hash !== entry.hash ||
+      old.indexStatus !== entry.indexStatus ||
+      old.worktreeStatus !== entry.worktreeStatus ||
+      old.renamedFrom !== entry.renamedFrom
+    ) {
+      changed = true;
+      modified.push(entry.path);
+    }
+    if (changed && entry.renamedFrom)
+      renamed.push({ from: entry.renamedFrom, to: entry.path });
+    if (changed) {
+      if (entry.untracked) untracked.push(entry.path);
+      else {
+        if (entry.indexStatus !== " ") staged.push(entry.path);
+        if (entry.worktreeStatus !== " ") unstaged.push(entry.path);
+      }
+    }
+  }
+  for (const [identity, entry] of before)
+    if (!after.has(identity))
+      (entry.untracked ? deleted : modified).push(entry.path);
+  const unique = (paths: string[]) => [...new Set(paths)].sort();
+  const all = [added, modified, deleted, staged, unstaged, untracked].map(
+    unique,
+  );
+  const total =
+    all.reduce((count, paths) => count + paths.length, 0) + renamed.length;
+  let remaining = Math.max(0, limit);
+  const bounded = (paths: string[]) => {
+    const selected = paths.slice(0, remaining);
+    remaining -= selected.length;
+    return selected;
+  };
+  const resultLists = all.map(bounded);
+  const boundedRenames = renamed.slice(0, remaining);
+  const displayed =
+    resultLists.reduce((count, paths) => count + paths.length, 0) +
+    boundedRenames.length;
+  return {
+    previousSnapshotId: previous.id,
+    currentSnapshotId: current.id,
+    added: resultLists[0],
+    modified: resultLists[1],
+    deleted: resultLists[2],
+    renamed: boundedRenames,
+    staged: resultLists[3],
+    unstaged: resultLists[4],
+    untracked: resultLists[5],
+    overflow: Math.max(0, total - displayed),
+  };
+}
+
+export function formatRepositoryDrift(
+  report: RepositoryDriftReport,
+  phase?: string,
+) {
+  const lines = [
+    `Repository drift detected${phase ? ` after ${phase}` : ""}.`,
+    "",
+  ];
+  const section = (name: string, paths: string[]) => {
+    lines.push(`${name}:`);
+    lines.push(
+      ...(paths.length
+        ? paths.map((path) => `  ${safeDisplayPath(path)}`)
+        : ["  none"]),
+    );
+  };
+  section("Added", report.added);
+  section("Modified", report.modified);
+  section("Deleted", report.deleted);
+  if (report.renamed.length) {
+    lines.push("Renamed:");
+    lines.push(
+      ...report.renamed.map(
+        (item) =>
+          `  ${safeDisplayPath(item.from)} -> ${safeDisplayPath(item.to)}`,
+      ),
+    );
+  }
+  section("Staged", report.staged);
+  section("Unstaged", report.unstaged);
+  section("Untracked", report.untracked);
+  if (report.overflow)
+    lines.push(`Additional entries omitted: ${report.overflow}`);
+  lines.push(
+    `Previous snapshot: ${report.previousSnapshotId}`,
+    `Current snapshot: ${report.currentSnapshotId}`,
+  );
+  return lines.join("\n");
+}
 export async function baseline(cwd: string) {
   const canonical = await realpath(cwd);
   await git(cwd, ["rev-parse", "--show-toplevel"]).then(async (root) => {

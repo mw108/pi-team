@@ -561,7 +561,7 @@ export async function recordVerifiedCommandResult(
         }
       : undefined;
   return {
-    executionId: randomUUID(),
+    executionId: evidence.executionId ?? randomUUID(),
     command: {
       id: command.id,
       executable: command.executable,

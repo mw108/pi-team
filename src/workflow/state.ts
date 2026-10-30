@@ -199,6 +199,21 @@ export const baselineSchema = z.object({
   diff: z.string(),
   cachedDiff: z.string(),
 });
+const repositorySnapshotSchema = z.object({
+  id: z.string().regex(/^[a-f0-9]{64}$/),
+  head: z.string().nullable(),
+  capturedAt: z.string().datetime(),
+  entries: z.array(
+    z.object({
+      path: exactPath,
+      hash: z.string(),
+      indexStatus: z.string().length(1),
+      worktreeStatus: z.string().length(1),
+      untracked: z.boolean(),
+      renamedFrom: exactPath.optional(),
+    }),
+  ),
+});
 export const stateSchema = z.object({
   version: z.literal(3),
   id: z.string().uuid(),
@@ -387,6 +402,16 @@ export const stateSchema = z.object({
           requestId: z.string().uuid(),
           command: commandSchema,
           purpose: z.string().max(500),
+          mutationRisk: z
+            .enum([
+              "READ_ONLY",
+              "GENERATED_OUTPUT",
+              "DEPENDENCY_MUTATION",
+              "SOURCE_MUTATION",
+              "UNKNOWN",
+            ])
+            .optional(),
+          potentialRepositoryChanges: z.array(z.string().max(500)).optional(),
         })
         .strict(),
     )
@@ -508,6 +533,36 @@ export const stateSchema = z.object({
     })
     .optional(),
   gateHashes: z.record(z.string()).optional(),
+  gateRepositorySnapshot: repositorySnapshotSchema.optional(),
+  commandMutationEvidence: z
+    .array(
+      z.object({
+        executionId: z.string().uuid(),
+        commandId: z.string(),
+        executable: z.string(),
+        args: z.array(z.string()),
+        purpose: z.enum(["development", "test", "static", "pentest"]),
+        agent: z.enum(roles),
+        phase: z.enum(phases),
+        attempt: z.number().int().positive(),
+        risk: z.enum([
+          "READ_ONLY",
+          "GENERATED_OUTPUT",
+          "DEPENDENCY_MUTATION",
+          "SOURCE_MUTATION",
+          "UNKNOWN",
+        ]),
+        beforeSnapshotId: z.string().regex(/^[a-f0-9]{64}$/),
+        afterSnapshotId: z.string().regex(/^[a-f0-9]{64}$/),
+        addedPaths: z.array(exactPath),
+        modifiedPaths: z.array(exactPath),
+        deletedPaths: z.array(exactPath),
+        attribution: z.enum(["OBSERVED", "AMBIGUOUS"]),
+        authorizedDependencyMutation: z.boolean().optional(),
+        observedAt: z.string().datetime(),
+      }),
+    )
+    .default([]),
   testMutationCycles: z.number().int().min(0).default(0),
   priorImplementation: z
     .object({
@@ -878,6 +933,7 @@ export function newState(
     commandApprovalComplete: false,
     testMutationCycles: 0,
     observedImplementorMutations: [],
+    commandMutationEvidence: [],
   };
 }
 export function record(

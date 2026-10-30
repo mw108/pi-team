@@ -844,8 +844,16 @@ export class PiRunner implements AgentRunner {
           command: Parameters<RuntimeCommandApprover>[0],
           request: Parameters<RuntimeCommandApprover>[1],
           approvalSignal?: AbortSignal,
+          _waitForHumanInput?: AgentHumanInputWait,
+          context?: Parameters<RuntimeCommandApprover>[4],
         ) =>
-          runtimeApproval(command, request, approvalSignal, waitForHumanInput)
+          runtimeApproval(
+            command,
+            request,
+            approvalSignal,
+            waitForHumanInput,
+            context,
+          )
       : undefined;
     const pausableFileApproval = fileApproval
       ? (

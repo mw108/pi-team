@@ -240,7 +240,7 @@ export default function teamExtension(pi: ExtensionAPI) {
   });
   pi.registerCommand("team-retry", {
     description:
-      "Retry an agent: /team-retry <agent-id> [keep|discard|override]",
+      "Retry an agent: /team-retry <agent-id> [keep|discard|override|revalidate]",
     handler: async (args, ctx) => {
       let ownedRuntime: ProgressRuntime | undefined;
       try {
@@ -252,13 +252,15 @@ export default function teamExtension(pi: ExtensionAPI) {
           (parts[1] !== undefined &&
             parts[1] !== "keep" &&
             parts[1] !== "discard" &&
-            parts[1] !== "override")
+            parts[1] !== "override" &&
+            parts[1] !== "revalidate")
         )
           throw new Error(
-            "Usage: /team-retry <agent-id> [keep|discard|override]",
+            "Usage: /team-retry <agent-id> [keep|discard|override] or /team-retry <tester|pentester> revalidate",
           );
         const role = parts[0] as Role;
-        const mode = parts[1] as "keep" | "discard" | "override" | undefined;
+        const mode = parts[1] as
+          "keep" | "discard" | "override" | "revalidate" | undefined;
         if (continuationPending)
           throw new Error("Workflow continuation is in progress.");
         if (active && !active.state)
@@ -315,7 +317,9 @@ export default function teamExtension(pi: ExtensionAPI) {
         }
         const result = await engine.retryAgent(state, role, confirmed, mode);
         ctx.ui.notify(
-          `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
+          mode === "revalidate" && result === "prepared"
+            ? "Repository changes preserved; stale quality gates invalidated. Revalidation is starting at Code Review."
+            : `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
           "info",
         );
         if (result !== "prepared") return;
@@ -454,7 +458,7 @@ export default function teamExtension(pi: ExtensionAPI) {
                         : ""
                     }`
                   : ""
-              }\nCommands: /team-steer <agent-id> <message> · /team-abort [agent-id] · /team-retry <agent-id> [keep|discard|override] · /team-continue`,
+              }\nCommands: /team-steer <agent-id> <message> · /team-abort [agent-id] · /team-retry <agent-id> [keep|discard|override|revalidate] · /team-continue`,
             ),
             "info",
           );

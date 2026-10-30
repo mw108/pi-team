@@ -92,6 +92,9 @@ import {
   prepareCommit,
   determineAuthoritativeCommitSelection,
   createCommit,
+  repositorySnapshot,
+  compareRepositorySnapshots,
+  formatRepositoryDrift,
 } from "./git.ts";
 import {
   record,
@@ -148,8 +151,12 @@ import {
   commandSummary,
   sanitizeCommandForLog,
   commandOutcomeForLog,
+  formatCommandLine,
 } from "../agents/command-observability.ts";
-import { approvedCommandsForRole } from "../agents/commands.ts";
+import {
+  approvedCommandsForRole,
+  type HostCommandApprovalContext,
+} from "../agents/commands.ts";
 import type { AgentEvent } from "../ui/runtime.ts";
 import {
   AgentAbortedByUserError,
@@ -443,6 +450,7 @@ export class WorkflowEngine {
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
     waitForHumanInput?: AgentHumanInputWait,
+    context?: HostCommandApprovalContext,
   ) {
     return this.commandApprovals.approve(
       s,
@@ -454,6 +462,7 @@ export class WorkflowEngine {
       signal,
       log,
       waitForHumanInput,
+      context,
     );
   }
   private async persistAttempt(
@@ -742,15 +751,18 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed = false,
-    mode?: "keep" | "discard" | "override",
+    mode?: "keep" | "discard" | "override" | "revalidate",
   ) {
     if (
       mode !== undefined &&
       mode !== "keep" &&
       mode !== "discard" &&
-      mode !== "override"
+      mode !== "override" &&
+      mode !== "revalidate"
     )
-      throw new Error("Usage: /team-retry <agent-id> [keep|discard|override]");
+      throw new Error(
+        "Usage: /team-retry <agent-id> [keep|discard|override] or /team-retry <tester|pentester> revalidate",
+      );
     // An active run already owns the workflow lock. Detached retries take it
     // here and refresh state so a second process cannot replay a stale retry.
     if (mode && this.running)
@@ -777,7 +789,7 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed: boolean,
-    mode?: "keep" | "discard" | "override",
+    mode?: "keep" | "discard" | "override" | "revalidate",
   ) {
     this.assertActiveAgent(state, role);
     const instructionDrift = await projectInstructionsDrift(
@@ -874,6 +886,63 @@ export class WorkflowEngine {
       throw new Error(
         `${label} has a recoverable answered FIX_REQUIREMENTS rewind. Use /team-retry ${role} override to keep the existing Contract and retry ${answeredLegacyRequirement.sourcePhase}.`,
       );
+    if (mode === "revalidate") {
+      if (state.phase !== "BLOCKED")
+        throw new Error(
+          "Quality-gate drift recovery requires a blocked workflow.",
+        );
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length ||
+        this.retryRequests.size
+      )
+        throw new Error("Workflow or agent is already active.");
+      if (
+        state.pendingApproval ||
+        state.pendingQuestion ||
+        state.pendingRuntimeCommands.length ||
+        state.pendingRuntimeFiles.length ||
+        state.pendingContractPaths.length ||
+        state.pendingContractExtensions.length ||
+        state.driftCandidate
+      )
+        throw new Error(
+          "A separate user decision or configuration review is pending.",
+        );
+      const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        plan.kind !== "attributable-quality-gate-drift" ||
+        plan.agentId !== role
+      )
+        throw new Error(
+          `${plan.reason} Next safe action: ${plan.actions.map((action) => action.command).join(" · ")}`,
+        );
+      if (state.results.codeReviewer)
+        state.results.previous_codeReviewer = state.results.codeReviewer;
+      delete state.results.codeReviewer;
+      this.invalidateDependents(state, "codeReviewer");
+      delete state.gateRepositorySnapshot;
+      delete state.gateHashes;
+      delete state.blocker;
+      delete state.blockerMeta;
+      delete state.inFlight;
+      delete state.manualRetry;
+      state.phase = plan.earliestPhase;
+      record(
+        state,
+        "quality_gate_drift_recovery_authorized",
+        `Preserved repository changes and invalidated stale gates after ${plan.executionId}`,
+        {
+          agent: role,
+          attempt: Math.max(1, this.nextAttempt(state, role) - 1),
+          executionId: plan.executionId,
+          sourcePhase: role === "tester" ? "TEST" : "PENTEST",
+        },
+      );
+      await this.store.save(state);
+      return "prepared";
+    }
     const recovery = interruptedMutationRecovery(state);
     if (mode || (recovery && recovery.agent === role)) {
       if (!mode)
@@ -1384,6 +1453,7 @@ export class WorkflowEngine {
     }
     if (role !== "commitAgent") {
       delete state.gateHashes;
+      delete state.gateRepositorySnapshot;
       delete state.commitSelection;
     }
     delete state.commitIntent;
@@ -2170,7 +2240,7 @@ export class WorkflowEngine {
                   update,
                 });
             },
-            (command, request, commandSignal, waitForHumanInput) =>
+            (command, request, commandSignal, waitForHumanInput, context) =>
               this.runtimeCommandApproval(
                 authoritative,
                 s,
@@ -2181,6 +2251,7 @@ export class WorkflowEngine {
                 commandSignal,
                 (event) => logged?.logger.append(event),
                 waitForHumanInput,
+                context,
               ),
             (recovery) =>
               logged?.logger.append({
@@ -2190,6 +2261,44 @@ export class WorkflowEngine {
                 ...recovery,
               }),
             async (command, commandEvidence) => {
+              if (commandEvidence.executionId && commandEvidence.mutation) {
+                const mutation = commandEvidence.mutation;
+                authoritative.commandMutationEvidence.push({
+                  executionId: commandEvidence.executionId,
+                  commandId: command.id,
+                  executable: command.executable,
+                  args: [...command.args],
+                  purpose: command.purpose,
+                  agent: role,
+                  phase: authoritative.phase,
+                  attempt: attemptNumber,
+                  risk: mutation.risk,
+                  beforeSnapshotId: mutation.beforeSnapshotId,
+                  afterSnapshotId: mutation.afterSnapshotId,
+                  addedPaths: mutation.drift.added,
+                  modifiedPaths: mutation.drift.modified,
+                  deletedPaths: mutation.drift.deleted,
+                  attribution: mutation.attribution,
+                  ...(role === "tester" &&
+                  mutation.risk === "DEPENDENCY_MUTATION"
+                    ? { authorizedDependencyMutation: true }
+                    : {}),
+                  observedAt:
+                    commandEvidence.completedAt ?? new Date().toISOString(),
+                });
+                record(
+                  authoritative,
+                  "command_repository_mutation_observed",
+                  `${role} ${command.id}: ${mutation.risk}; ${mutation.drift.added.length} added, ${mutation.drift.modified.length} modified, ${mutation.drift.deleted.length} deleted`,
+                  {
+                    agent: role,
+                    attempt: attemptNumber,
+                    commandId: command.id,
+                    executionId: commandEvidence.executionId,
+                    reason: mutation.risk,
+                  },
+                );
+              }
               const verified = await recordVerifiedCommandResult(
                 s,
                 command,
@@ -3430,6 +3539,7 @@ export class WorkflowEngine {
                 delete s.results[role];
               }
               delete s.gateHashes;
+              delete s.gateRepositorySnapshot;
               delete s.securityRiskReview;
               delete s.commitSelection;
               delete s.reportInput;
@@ -4061,6 +4171,7 @@ export class WorkflowEngine {
                     classification.discardable.join(", "),
                   );
                 delete s.gateHashes;
+                delete s.gateRepositorySnapshot;
                 if (classification.ambiguous.length)
                   block(
                     s,
@@ -4127,6 +4238,7 @@ export class WorkflowEngine {
                   delete s.securityRiskReview;
                   delete s.resumePhase;
                   delete s.gateHashes;
+                  delete s.gateRepositorySnapshot;
                   record(
                     s,
                     "configuration_refresh",
@@ -4250,14 +4362,41 @@ export class WorkflowEngine {
           if (!(await this.queueContractExtensionApproval(s))) continue;
           if (!(await this.ensureSensitivePathApproval(s))) continue;
           const snapshot = await gateSnapshot(s);
+          const repositoryState = await repositorySnapshot(s.cwd);
           if (
-            s.gateHashes &&
-            JSON.stringify(snapshot) !== JSON.stringify(s.gateHashes)
+            (s.gateHashes &&
+              JSON.stringify(snapshot) !== JSON.stringify(s.gateHashes)) ||
+            (s.gateRepositorySnapshot &&
+              repositoryState.id !== s.gateRepositorySnapshot.id)
           ) {
-            block(s, "Repository changed after a quality gate; rerun review");
+            const report = s.gateRepositorySnapshot
+              ? compareRepositorySnapshots(
+                  s.gateRepositorySnapshot,
+                  repositoryState,
+                )
+              : undefined;
+            const evidence = report
+              ? s.commandMutationEvidence.findLast(
+                  (item) =>
+                    item.beforeSnapshotId === s.gateRepositorySnapshot?.id &&
+                    item.afterSnapshotId === repositoryState.id &&
+                    item.attribution === "OBSERVED",
+                )
+              : undefined;
+            block(
+              s,
+              report
+                ? `${formatRepositoryDrift(report, s.phase)}${
+                    evidence
+                      ? `\nPossible source: ${evidence.agent}\nCommand: ${formatCommandLine({ ...evidence, id: evidence.commandId })}\nExecution: ${evidence.executionId}`
+                      : "\nPossible source: ambiguous or external modification"
+                  }\nRecovery: review repository changes before retrying. Mandatory quality gates cannot be bypassed.`
+                : "Repository changed after a quality gate; rerun review",
+            );
             break;
           }
           s.gateHashes = snapshot;
+          s.gateRepositorySnapshot = repositoryState;
         }
         if (s.phase === "COMMIT") {
           const overlap = workflowScopePaths(s).filter(
@@ -4744,6 +4883,7 @@ export class WorkflowEngine {
             ])
               delete s.results[role];
             delete s.gateHashes;
+            delete s.gateRepositorySnapshot;
             record(s, "test_source_changed", changed.join(", "));
             s.phase = "CODE_REVIEW";
             await this.store.save(s);

@@ -20,6 +20,7 @@ import type { AgentEvent } from "../ui/runtime.ts";
 import type { WorkflowState, ApprovalRequest } from "./state.ts";
 import { policyPath } from "../agents/path-policy.ts";
 import type { AgentHumanInputWait } from "../agents/agent-timeout.ts";
+import type { HostCommandApprovalContext } from "../agents/commands.ts";
 
 export type AttemptControl = {
   workflowId: string;
@@ -395,6 +396,7 @@ export class RuntimeCommandApprovalCoordinator {
     role: Role,
     command: Command,
     purpose: string,
+    context?: HostCommandApprovalContext,
   ): ApprovalRequest {
     const rule = proposeSimilarRule(command, role);
     const line = formatCommandLine(command);
@@ -406,22 +408,34 @@ export class RuntimeCommandApprovalCoordinator {
     const metadata = discovered
       ? `\nSource: ${redactVisibleText(discovered.source)}\nConfidence: ${discovered.confidence}`
       : "";
+    const dependencyMutation = context?.requiresDependencyMutationApproval;
+    const explicitMutation = context?.requiresExplicitMutationApproval;
+    const potentialChanges = context?.mutation.potentialRepositoryChanges ?? [];
     return {
       kind: "runtimeCommand",
-      title: `${label} requests command approval`,
-      prompt: `Agent: ${label} (${role})\nCategory: ${command.purpose}\n\nCommand: ${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}\n\nThis command may modify project files, generated artifacts, or local development state.\n\nScope: exact command for ${label} in this workflow.${rule ? `\n\nAllow similar for ${label}: ${ruleLine}` : ""}`,
+      title: dependencyMutation
+        ? `${label} requests dependency installation authorization`
+        : `${label} requests command approval`,
+      prompt: dependencyMutation
+        ? `Tester requests a dependency installation or update.\n\nCommand: ${line}\n\nReason:\n${redactVisibleText(purpose)}\n\nHost classification: ${context.mutation.reason}\n\nPotential repository changes:\n${potentialChanges.map((path) => `- ${redactVisibleText(path)}`).join("\n") || "- dependency and local tool state"}\n\nThis command may alter dependency state. A prior generic command approval does not authorize this mutation. Scope: this exact executable and argv, once, in the current workflow attempt.`
+        : `Agent: ${label} (${role})\nCategory: ${command.purpose}\n\nCommand: ${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}\n\nThis command may modify project files, generated artifacts, or local development state.\n\nScope: exact command for ${label}${explicitMutation ? " once in this workflow attempt" : " in this workflow"}.${!explicitMutation && rule ? `\n\nAllow similar for ${label}: ${ruleLine}` : ""}`,
       options: [
         {
           value: "allow_once",
           label: "Allow once",
           description: "Execute this exact command one time",
         },
-        {
-          value: "allow_workflow",
-          label: `Allow exact for ${label} in this workflow`,
-          description: "Approve this exact argv for this role and workflow",
-        },
-        ...(rule
+        ...(!explicitMutation
+          ? [
+              {
+                value: "allow_workflow",
+                label: `Allow exact for ${label} in this workflow`,
+                description:
+                  "Approve this exact argv for this role and workflow",
+              },
+            ]
+          : []),
+        ...(!explicitMutation && rule
           ? [
               {
                 value: "allow_similar",
@@ -476,6 +490,7 @@ export class RuntimeCommandApprovalCoordinator {
     signal: AbortSignal | undefined,
     log: (event: { type: string; [key: string]: unknown }) => void,
     waitForHumanInput?: AgentHumanInputWait,
+    context?: HostCommandApprovalContext,
   ): Promise<"allow" | "deny" | "pending"> {
     const current = () =>
       control.workflowId === s.id &&
@@ -485,10 +500,11 @@ export class RuntimeCommandApprovalCoordinator {
       !signal?.aborted;
     if (!current()) return "pending";
     const approved = () =>
-      approvedCommandsForRole(role, effectiveConfig(s, role)).some(
+      !context?.requiresExplicitMutationApproval &&
+      (approvedCommandsForRole(role, effectiveConfig(s, role)).some(
         (item) => commandKey(item) === commandKey(command),
       ) ||
-      s.similarCommandRules.some((rule) => ruleMatches(rule, command, role));
+        s.similarCommandRules.some((rule) => ruleMatches(rule, command, role)));
     if (approved()) {
       agentState.approvedCommands = structuredClone(s.approvedCommands);
       agentState.runtimeCommandApprovals = structuredClone(
@@ -509,6 +525,13 @@ export class RuntimeCommandApprovalCoordinator {
       requestId: randomUUID(),
       command,
       purpose: request.purpose,
+      ...(context
+        ? {
+            mutationRisk: context.mutation.risk,
+            potentialRepositoryChanges:
+              context.mutation.potentialRepositoryChanges,
+          }
+        : {}),
     };
     s.pendingRuntimeCommands.push(pending);
     const safe = commandSummary(command.id, command);
@@ -523,6 +546,7 @@ export class RuntimeCommandApprovalCoordinator {
       ...safe,
       command: { executable: safe.executable, args: safe.args },
       authorization: { decision: "pending", source: "runtime" },
+      mutationRisk: context?.mutation.risk,
       purpose: redactVisibleText(request.purpose),
     });
     await this.deps.persistAttempt(
@@ -556,6 +580,7 @@ export class RuntimeCommandApprovalCoordinator {
         role,
         command,
         request.purpose,
+        context,
       );
       const selected = await this.requestDecision(approval, signal);
       if (
@@ -572,13 +597,16 @@ export class RuntimeCommandApprovalCoordinator {
       const choice = selected?.length === 1 ? selected[0] : undefined;
       if (!choice) return "pending";
       if (
-        !["allow_once", "allow_workflow", "allow_similar", "deny"].includes(
-          choice,
-        ) ||
+        !(
+          context?.requiresExplicitMutationApproval
+            ? ["allow_once", "deny"]
+            : ["allow_once", "allow_workflow", "allow_similar", "deny"]
+        ).includes(choice) ||
         (choice === "allow_similar" && !proposeSimilarRule(command, role))
       )
         return "pending";
-      this.saveRuntimeApproval(s, role, command, choice);
+      if (!context?.requiresExplicitMutationApproval)
+        this.saveRuntimeApproval(s, role, command, choice);
       agentState.approvedCommands = structuredClone(s.approvedCommands);
       agentState.runtimeCommandApprovals = structuredClone(
         s.runtimeCommandApprovals,
@@ -613,6 +641,7 @@ export class RuntimeCommandApprovalCoordinator {
         run: control.attempt,
         requestId: pending.requestId,
         decision: choice,
+        mutationRisk: context?.mutation.risk,
         ...(choice === "allow_similar"
           ? { rule: proposeSimilarRule(command, role) }
           : {}),

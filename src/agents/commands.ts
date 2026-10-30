@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { CommandOutputCollector } from "./command-output.ts";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -27,17 +28,33 @@ import {
   type SandboxDetails,
 } from "./sandbox.ts";
 import type { AgentHumanInputWait } from "./agent-timeout.ts";
+import {
+  classifyCommandMutation,
+  type CommandMutationClassification,
+} from "./command-mutation-policy.ts";
+import {
+  compareRepositorySnapshots,
+  repositorySnapshot,
+  type RepositoryDriftReport,
+} from "../workflow/git.ts";
+export interface HostCommandApprovalContext {
+  mutation: CommandMutationClassification;
+  requiresExplicitMutationApproval: boolean;
+  requiresDependencyMutationApproval: boolean;
+}
 export type RuntimeCommandApprover = (
   command: Command,
   request: RuntimeCommandRequest,
   signal?: AbortSignal,
   waitForHumanInput?: AgentHumanInputWait,
+  context?: HostCommandApprovalContext,
 ) => Promise<"allow" | "deny" | "pending">;
 export type CommandResultObserver = (
   command: Command,
   evidence: CommandEvidence,
 ) => Promise<void>;
 export interface CommandEvidence {
+  executionId?: string;
   id: string;
   exitCode: number;
   output: string;
@@ -53,6 +70,12 @@ export interface CommandEvidence {
   resolvedExecutable?: string;
   resolution?: ExecutableResolution;
   sandbox: SandboxDetails;
+  mutation?: CommandMutationClassification & {
+    beforeSnapshotId: string;
+    afterSnapshotId: string;
+    drift: RepositoryDriftReport;
+    attribution: "OBSERVED" | "AMBIGUOUS";
+  };
 }
 export interface CommandAlternative {
   command: Command;
@@ -263,6 +286,7 @@ export function commandTool(
       const approvedNow = currentCommands?.() ?? allowed;
       let command: Command | undefined;
       let authorizationSource: "static" | "runtime" | undefined;
+      let mutation: CommandMutationClassification | undefined;
       if (invocation === "id") {
         command = approvedNow.find(
           (c) => c.id === (params as { id: string }).id,
@@ -280,9 +304,16 @@ export function commandTool(
             'Invalid team_command arguments. Supply either id=<known command ID>, or executable, args (array of strings), and purpose. Example: executable=php, args=["artisan","test","tests/Unit/ConfigTest.php"], purpose=run tests. The command category must be allowed for this role.',
           );
         }
-        command = approvedNow.find(
-          (c) => commandKey(c) === commandKey(normalized.command),
-        );
+        mutation = await classifyCommandMutation(normalized.command, cwd);
+        const requiresExplicitMutationApproval =
+          role === "tester" &&
+          (mutation.risk === "DEPENDENCY_MUTATION" ||
+            (mutation.risk === "UNKNOWN" && mutation.packageManager));
+        command = requiresExplicitMutationApproval
+          ? normalized.command
+          : approvedNow.find(
+              (c) => commandKey(c) === commandKey(normalized.command),
+            );
         if (
           !command &&
           config.permissions.commands.allow.some((rule) =>
@@ -323,7 +354,71 @@ export function commandTool(
           authorizationSource = "runtime";
         }
       }
+      mutation ??= await classifyCommandMutation(command, cwd);
+      const dependencyMutationApproval =
+        role === "tester" && mutation.risk === "DEPENDENCY_MUTATION";
+      const explicitMutationApproval =
+        dependencyMutationApproval ||
+        (role === "tester" &&
+          mutation.risk === "UNKNOWN" &&
+          Boolean(mutation.packageManager));
+      if (explicitMutationApproval) {
+        if (!runtimeApproval)
+          throw new Error(
+            "Dependency mutation approval is unavailable; the Tester command was not executed",
+          );
+        const decision = await runtimeApproval(
+          command,
+          invocation === "structured"
+            ? normalizedRuntimeCommand(params, role).request
+            : {
+                executable: command.executable,
+                args: command.args,
+                purpose: command.purpose,
+                category: command.purpose,
+                ...(command.verificationId
+                  ? { verificationId: command.verificationId }
+                  : {}),
+              },
+          signal,
+          undefined,
+          {
+            mutation,
+            requiresExplicitMutationApproval: true,
+            requiresDependencyMutationApproval: dependencyMutationApproval,
+          },
+        );
+        if (decision !== "allow" || signal?.aborted) {
+          onDenial?.(decision === "deny" ? "denied" : "pending");
+          const denied = {
+            status: decision === "deny" ? "denied" : "pending",
+            code:
+              decision === "deny"
+                ? dependencyMutationApproval
+                  ? "DEPENDENCY_MUTATION_DENIED"
+                  : "UNKNOWN_MUTATION_DENIED"
+                : dependencyMutationApproval
+                  ? "DEPENDENCY_MUTATION_APPROVAL_PENDING"
+                  : "UNKNOWN_MUTATION_APPROVAL_PENDING",
+            commandId: command.id,
+            message:
+              decision === "deny"
+                ? `${dependencyMutationApproval ? "Dependency" : "Unknown"} mutation approval denied`
+                : `${dependencyMutationApproval ? "Dependency" : "Unknown"} mutation approval pending`,
+          };
+          return {
+            content: [{ type: "text", text: JSON.stringify(denied) }],
+            details: denied,
+          };
+        }
+        authorizationSource = "runtime";
+      }
       let result: CommandEvidence;
+      const executionId = randomUUID();
+      const before =
+        mutation.risk === "READ_ONLY"
+          ? undefined
+          : await repositorySnapshot(cwd);
       try {
         result = await execute(command, cwd, signal, config.execution.sandbox);
       } catch (error) {
@@ -379,6 +474,25 @@ export function commandTool(
         return {
           content: [{ type: "text", text: JSON.stringify(failure) }],
           details: failure,
+        };
+      }
+      result.executionId = executionId;
+      if (before) {
+        const after = await repositorySnapshot(cwd);
+        const drift = compareRepositorySnapshots(before, after);
+        result.mutation = {
+          ...mutation,
+          beforeSnapshotId: before.id,
+          afterSnapshotId: after.id,
+          drift,
+          attribution:
+            before.head === after.head &&
+            (drift.added.length ||
+              drift.modified.length ||
+              drift.deleted.length ||
+              drift.renamed.length)
+              ? "OBSERVED"
+              : "AMBIGUOUS",
         };
       }
       evidence.push(result);

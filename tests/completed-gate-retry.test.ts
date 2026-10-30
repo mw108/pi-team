@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { access, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
 import {
   classifyQualityGateBlocker,
@@ -8,6 +11,10 @@ import {
 import { renderLiveProgress, renderProgress } from "../src/ui/progress.ts";
 import { renderBlocked } from "../src/workflow/report.ts";
 import { FixtureRunner, config, output, repository } from "./helpers.ts";
+import {
+  compareRepositorySnapshots,
+  repositorySnapshot,
+} from "../src/workflow/git.ts";
 
 const ui = { progress: () => {}, ask: async () => undefined };
 
@@ -133,6 +140,71 @@ test("completed BLOCKED Tester retries after restart without rewinding upstream 
   );
   assert.equal(starts.at(-1)?.meta?.attempt, 6);
   assert.equal(starts.at(-1)?.meta?.trigger, "manual_retry");
+});
+
+test("Tester lockfile drift is diagnosed and recovery preserves files while invalidating gates", async () => {
+  const { cwd, state, engine } = await blockedTester();
+  assert.ok(state.gateRepositorySnapshot);
+  const expected = state.gateRepositorySnapshot!;
+  await writeFile(join(cwd, "package-lock.json"), '{"lockfileVersion":3}\n');
+  const current = await repositorySnapshot(cwd);
+  const drift = compareRepositorySnapshots(expected, current);
+  const executionId = randomUUID();
+  state.commandMutationEvidence.push({
+    executionId,
+    commandId: "synthetic-npm-install",
+    executable: "npm",
+    args: ["install", "--ignore-scripts"],
+    purpose: "test",
+    agent: "tester",
+    phase: "TEST",
+    attempt: state.blockerMeta!.sourceAttempt,
+    risk: "DEPENDENCY_MUTATION",
+    beforeSnapshotId: expected.id,
+    afterSnapshotId: current.id,
+    addedPaths: drift.added,
+    modifiedPaths: drift.modified,
+    deletedPaths: drift.deleted,
+    attribution: "OBSERVED",
+    authorizedDependencyMutation: true,
+    observedAt: new Date().toISOString(),
+  });
+  await engine.store.save(state);
+
+  const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const loaded = await restarted.store.load(state.id);
+  const plan = await getWorkflowRecoveryPlan(loaded, cwd);
+  assert.equal(plan.kind, "attributable-quality-gate-drift", plan.reason);
+  assert.match(plan.reason, /Added:\s+package-lock\.json/);
+  assert.match(plan.reason, /npm install --ignore-scripts/);
+  assert.ok(
+    plan.actions.some(
+      (action) => action.command === "/team-retry tester revalidate",
+    ),
+  );
+  await assert.rejects(restarted.retryAgent(loaded, "tester"), /revalidate/);
+
+  assert.equal(
+    await restarted.retryAgent(loaded, "tester", false, "revalidate"),
+    "prepared",
+  );
+  assert.equal(loaded.phase, "CODE_REVIEW");
+  assert.ok(loaded.results.implementor);
+  assert.equal(loaded.results.codeReviewer, undefined);
+  assert.equal(loaded.results.pentester, undefined);
+  assert.equal(loaded.results.securityReviewer, undefined);
+  assert.equal(loaded.results.tester, undefined);
+  assert.equal(loaded.results.commitAgent, undefined);
+  assert.equal(loaded.gateHashes, undefined);
+  assert.equal(loaded.gateRepositorySnapshot, undefined);
+  await access(join(cwd, "package-lock.json"));
+  assert.ok(
+    loaded.history.some(
+      (event) =>
+        event.event === "quality_gate_drift_recovery_authorized" &&
+        event.meta?.executionId === executionId,
+    ),
+  );
 });
 
 test("legacy completed Tester blocker is inferred only from matching lifecycle", async () => {

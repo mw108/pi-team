@@ -160,6 +160,7 @@ export function fix(
     delete s.results[key];
   }
   delete s.gateHashes;
+  delete s.gateRepositorySnapshot;
   if (route === "FIX_DESIGN")
     for (const key of [
       ...getActiveSolverIds(s.config),
@@ -202,6 +203,7 @@ export function transition(s: WorkflowState) {
         delete s.results[key];
       }
       delete s.gateHashes;
+      delete s.gateRepositorySnapshot;
       delete s.securityRiskReview;
       delete s.pentestUnavailabilityReview;
       s.phase = "SOLVE";

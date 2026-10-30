@@ -8,6 +8,9 @@ import {
   unexpectedWorkflowPaths,
   head,
   classifyAttributedImplementation,
+  repositorySnapshot,
+  compareRepositorySnapshots,
+  formatRepositoryDrift,
 } from "./git.ts";
 import { phaseRoles, getPhaseRoles, transition } from "./router.ts";
 import {
@@ -19,6 +22,7 @@ import { isLimitBlockerStillActive } from "./limit-blocker.ts";
 import { getErrorMessage } from "../agents/error-message.ts";
 import { projectInstructionsDrift } from "./project-instructions.ts";
 import { isLegacySecurityRiskBlock } from "./security-risk-review.ts";
+import { formatCommandLine } from "../agents/command-observability.ts";
 
 export type FixRequirementsOrigin = {
   sourceAgent: "implementor" | "codeReviewer";
@@ -273,6 +277,7 @@ export type RecoveryAction = {
     | "retry_keep"
     | "retry_discard"
     | "retry_override"
+    | "retry_revalidate"
     | "resume"
     | "abort";
   command: string;
@@ -397,6 +402,13 @@ type BaseRecoveryPlan =
   | { kind: "continue"; nextPhase: Phase; agentId: Role; reason: string }
   | { kind: "retry-agent"; agentId: Role; reason: string }
   | { kind: "completed-quality-gate-blocked"; agentId: Role; reason: string }
+  | {
+      kind: "attributable-quality-gate-drift";
+      agentId: "tester" | "pentester";
+      reason: string;
+      earliestPhase: "CODE_REVIEW";
+      executionId: string;
+    }
   | { kind: "unconsumed-manual-retry"; agentId: Role; reason: string }
   | { kind: "interrupted-mutation"; agentId: Role; reason: string }
   | { kind: "waiting-user" | "unsafe" | "none"; reason: string };
@@ -723,14 +735,43 @@ async function planWorkflowRecovery(
       );
     if (state.gateHashes) {
       try {
-        if (
-          (await unexpectedWorkflowPaths(state)).length ||
+        const unexpected = await unexpectedWorkflowPaths(state);
+        const contentChanged =
           JSON.stringify(await gateSnapshot(state)) !==
-            JSON.stringify(state.gateHashes)
-        )
+          JSON.stringify(state.gateHashes);
+        const currentRepository = state.gateRepositorySnapshot
+          ? await repositorySnapshot(cwd)
+          : undefined;
+        const repositoryChanged =
+          currentRepository &&
+          currentRepository.id !== state.gateRepositorySnapshot?.id;
+        if (unexpected.length || contentChanged || repositoryChanged) {
+          if (state.gateRepositorySnapshot && currentRepository) {
+            const report = compareRepositorySnapshots(
+              state.gateRepositorySnapshot,
+              currentRepository,
+            );
+            const evidence = state.commandMutationEvidence.findLast(
+              (item) =>
+                item.agent === gateBlocker.agent &&
+                item.phase === gateBlocker.phase &&
+                item.beforeSnapshotId === state.gateRepositorySnapshot?.id &&
+                item.afterSnapshotId === currentRepository.id &&
+                item.attribution === "OBSERVED",
+            );
+            if (evidence)
+              return {
+                kind: "attributable-quality-gate-drift",
+                agentId: gateBlocker.agent,
+                earliestPhase: "CODE_REVIEW",
+                executionId: evidence.executionId,
+                reason: `${formatRepositoryDrift(report, gateBlocker.phase)}\nObserved after: ${evidence.agent} command ${formatCommandLine({ ...evidence, id: evidence.commandId })}\nExecution: ${evidence.executionId}\n\nThe repository files are preserved. Accepting recovery invalidates prior review, security, pentest, test, and commit evidence and resumes at CODE_REVIEW.`,
+              };
+          }
           return unsafe(
-            "Repository changed after a quality gate; blocked gate cannot be retried safely.",
+            `${state.gateRepositorySnapshot && currentRepository ? `${formatRepositoryDrift(compareRepositorySnapshots(state.gateRepositorySnapshot, currentRepository), gateBlocker.phase)}\n` : ""}Attribution is ambiguous or external; blocked gate cannot be retried safely. Review the files or abort the workflow.`,
           );
+        }
       } catch (error) {
         return unsafe(
           `Cannot verify repository before retry: ${getErrorMessage(error)}`,
@@ -1045,6 +1086,13 @@ export async function getWorkflowRecoveryPlan(
     plan.kind === "completed-quality-gate-blocked"
   )
     actions = [{ kind: "retry", command: `/team-retry ${plan.agentId}` }];
+  else if (plan.kind === "attributable-quality-gate-drift")
+    actions = [
+      {
+        kind: "retry_revalidate",
+        command: `/team-retry ${plan.agentId} revalidate`,
+      },
+    ];
   else if (plan.kind === "interrupted-mutation")
     actions = [
       { kind: "retry_keep", command: `/team-retry ${plan.agentId} keep` },
