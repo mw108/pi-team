@@ -26,7 +26,7 @@ export interface CompletionReportInput {
   workflowId: string;
   task: string;
   requirements: string[];
-  outcome: "done";
+  outcome: "FULL_COMMIT" | "PARTIAL_COMMIT" | "UNCOMMITTED" | "done";
   implementation: {
     contractSummary?: string;
     implementedSummary?: string;
@@ -35,7 +35,18 @@ export interface CompletionReportInput {
   validation: CompletionReport["validation"];
   validationCommands: ValidationCommandResult[];
   commit: CompletionReport["commit"];
-  excludedCommitPaths: { path: string; reason: "non-committable" }[];
+  excludedCommitPaths: {
+    path: string;
+    reason:
+      | "PREEXISTING_DIRTY"
+      | "AMBIGUOUS_OWNERSHIP"
+      | "EXPLICITLY_EXCLUDED"
+      | "SENSITIVE"
+      | "UNVERIFIED"
+      | "non-committable";
+    detail?: string;
+    manualActionRequired?: boolean;
+  }[];
   cycles: { design: number; localFix: number; pentest: number };
   warnings: string[];
   unresolvedIssues: string[];
@@ -155,6 +166,26 @@ export async function buildCompletionReportInput(
     tester,
     tester?.status === "PASS",
   );
+  if (s.config.qualityGates.commit.enabled) {
+    const outcome = s.commitOutcome?.status;
+    validation.push({
+      label: "Commit",
+      status:
+        outcome === "FULL_COMMIT"
+          ? "passed"
+          : outcome === "PARTIAL_COMMIT" || outcome === "UNCOMMITTED"
+            ? "warning"
+            : "not-run",
+      detail:
+        outcome === "PARTIAL_COMMIT"
+          ? "A partial commit was created; excluded working-tree changes remain."
+          : outcome === "UNCOMMITTED"
+            ? "No commit was created; implementation and validation evidence remain separate from commit completeness."
+            : outcome === "FULL_COMMIT"
+              ? "All eligible workflow changes were committed."
+              : "No commit outcome was recorded.",
+    });
+  }
   const validationCommands: ValidationCommandResult[] = [];
   for (const result of tester?.commands ?? []) {
     const outcome = tester?.validationOutcomes?.find(
@@ -256,14 +287,25 @@ export async function buildCompletionReportInput(
     ),
   ]);
   const commitResult = s.results.commitAgent;
-  const excludedCommitPaths = unique(
-    s.commitSelection?.excludedPaths ?? [],
-  ).map((path) => ({ path, reason: "non-committable" as const }));
+  const excludedCommitPaths = s.commitOutcome
+    ? s.commitOutcome.excludedPaths.map((entry) => ({
+        path: entry.path,
+        reason: entry.reason as Exclude<
+          CompletionReportInput["excludedCommitPaths"][number]["reason"],
+          "non-committable"
+        >,
+        detail: entry.detail,
+        manualActionRequired: entry.manualActionRequired,
+      }))
+    : unique(s.commitSelection?.excludedPaths ?? []).map((path) => ({
+        path,
+        reason: "non-committable" as const,
+      }));
   return {
     workflowId: s.id,
     task: s.task,
     requirements: s.requirements,
-    outcome: "done",
+    outcome: s.commitOutcome?.status ?? "done",
     implementation: {
       contractSummary: contract?.goal,
       implementedSummary:
@@ -277,6 +319,7 @@ export async function buildCompletionReportInput(
     excludedCommitPaths,
     commit: {
       created: !!s.commit,
+      ...(s.commitOutcome ? { outcome: s.commitOutcome.status } : {}),
       ...(s.commit
         ? {
             hash: s.commit.hash,
@@ -303,6 +346,16 @@ export async function buildCompletionReportInput(
     unresolvedIssues,
     limitations: unique([
       ...(pentest?.limitations ?? []),
+      ...(s.commitOutcome?.status === "PARTIAL_COMMIT"
+        ? [
+            "The committed revision does not contain every validated working-tree change. Review and integrate the excluded paths separately before relying on the commit as a complete implementation.",
+          ]
+        : []),
+      ...(s.commitOutcome?.status === "UNCOMMITTED"
+        ? [
+            "Implementation and validation completed without a commit. The commit quality gate is not satisfied.",
+          ]
+        : []),
       ...(historical && !s.commit && !s.commitSelection?.completed
         ? [
             "Changed paths are unavailable in this older workflow state without a recorded commit.",
@@ -373,7 +426,16 @@ export function finalizeReport(
 }
 
 export function renderReport(report: CompletionReport, failure?: string) {
-  const lines = ["Team DONE", "", "Summary", report.summary];
+  const lines = [
+    report.commit.outcome === "PARTIAL_COMMIT"
+      ? "Team DONE · completed with exclusions"
+      : report.commit.outcome === "UNCOMMITTED"
+        ? "Team DONE · completed without a commit"
+        : "Team DONE",
+    "",
+    "Summary",
+    report.summary,
+  ];
   if (failure)
     lines.push("", "Report generation", `Narrative report failed: ${failure}`);
   const section = (title: string, items: string[]) => {
@@ -388,7 +450,10 @@ export function renderReport(report: CompletionReport, failure?: string) {
   if (report.excludedCommitPaths?.length)
     section(
       "Modified locally but intentionally not committed",
-      report.excludedCommitPaths.map((entry) => entry.path),
+      report.excludedCommitPaths.map(
+        (entry) =>
+          `${entry.path}${entry.detail ? ` — ${entry.detail}` : ""}${entry.manualActionRequired ? " (manual review and commit required)" : ""}`,
+      ),
     );
   section(
     "Validation",

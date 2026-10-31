@@ -79,7 +79,7 @@ test("dirty-file denial blocks implementation and preserves working content", as
   assert.equal(runner.counts.implementor, undefined);
   assert.match(await readFile(join(cwd, "math.js"), "utf8"), /user edit/);
 });
-test("exact dirty-path approval allows edits after resume but requires manual commit", async () => {
+test("exact dirty-path approval allows edits and an explicit uncommitted completion", async () => {
   const cwd = await repository();
   const before = await head(cwd);
   await writeFile(
@@ -101,12 +101,13 @@ test("exact dirty-path approval allows edits after resume but requires manual co
   engine = new WorkflowEngine(cwd, runner, {
     ...ui,
     approve: async (request) =>
-      request.kind === "dirtyPaths" ? ["math.js"] : ["acknowledge"],
+      request.kind === "dirtyPaths" ? ["math.js"] : ["leave_uncommitted"],
   });
   const loaded = await engine.store.load(s.id);
   await engine.run(loaded);
-  assert.equal(loaded.phase, "BLOCKED");
-  assert.match(loaded.blocker ?? "", /Manual commit required/);
+  assert.equal(loaded.phase, "DONE", loaded.blocker);
+  assert.equal(loaded.commitOutcome?.status, "UNCOMMITTED");
+  assert.equal(loaded.commitOutcome?.decision, "LEAVE_UNCOMMITTED");
   assert.deepEqual(loaded.approvedDirtyPaths, ["math.js"]);
   assert.match(await readFile(join(cwd, "math.js"), "utf8"), /user edit/);
   assert.match(await readFile(join(cwd, "math.js"), "utf8"), /a \+ b/);

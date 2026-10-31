@@ -499,6 +499,29 @@ export function recoveryAction(plan: WorkflowRecoveryPlan): string {
   return plan.reason;
 }
 
+export function isLegacyManualCommitBlock(state: WorkflowState) {
+  if (
+    state.phase !== "BLOCKED" ||
+    state.blocker !==
+      "Manual commit required: inspect and stage approved dirty files yourself. Automatic commit is disabled because hunk ownership cannot be established."
+  )
+    return false;
+  const requested = state.history.findLastIndex(
+    (entry) =>
+      entry.event === "approval_requested" && entry.detail === "manualCommit",
+  );
+  const submitted = state.history.findLastIndex(
+    (entry) =>
+      entry.event === "approval_submitted" &&
+      entry.detail.includes('"kind":"manualCommit"') &&
+      entry.detail.includes('"acknowledge"'),
+  );
+  const blocked = state.history.findLastIndex(
+    (entry) => entry.event === "blocked" && entry.detail === state.blocker,
+  );
+  return requested >= 0 && requested < submitted && submitted < blocked;
+}
+
 async function planWorkflowRecovery(
   state: WorkflowState,
   cwd: string,
@@ -600,6 +623,48 @@ async function planWorkflowRecovery(
       reason:
         "Waiting for user review of accepted security risks. Continue to open the confirmation.",
     };
+  if (isLegacyManualCommitBlock(state)) {
+    if ((await head(cwd)) !== state.baseline.head)
+      return unsafe(
+        "Git HEAD changed since the legacy manual-commit blocker; recovery cannot create a commit safely.",
+      );
+    if (
+      state.config.qualityGates.codeReview.enabled &&
+      state.results.codeReviewer?.status !== "APPROVED"
+    )
+      return unsafe(
+        "Code review evidence is no longer valid for commit recovery.",
+      );
+    if (
+      state.config.qualityGates.testing.enabled &&
+      state.results.tester?.status !== "PASS"
+    )
+      return unsafe("Testing evidence is no longer valid for commit recovery.");
+    if (!state.results.securityReviewer)
+      return unsafe("Security review evidence is missing for commit recovery.");
+    if (state.gateHashes) {
+      try {
+        if (
+          (await unexpectedWorkflowPaths(state)).length ||
+          JSON.stringify(await gateSnapshot(state)) !==
+            JSON.stringify(state.gateHashes)
+        )
+          return unsafe(
+            "Repository state changed after the legacy blocker; rerun the affected quality gates before commit recovery.",
+          );
+      } catch (error) {
+        return unsafe(
+          `Cannot verify repository before legacy commit recovery: ${getErrorMessage(error)}`,
+        );
+      }
+    }
+    return {
+      kind: "retry-agent",
+      agentId: "commitAgent",
+      reason:
+        "Legacy manual-commit acknowledgment found. Recompute a host-owned commit plan and request a new explicit partial-commit decision without rerunning valid upstream gates.",
+    };
+  }
   if (
     state.phase === "BLOCKED" &&
     state.blocker?.startsWith(

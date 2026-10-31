@@ -1,8 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, lstat, realpath, unlink } from "node:fs/promises";
+import {
+  readFile,
+  lstat,
+  realpath,
+  unlink,
+  mkdtemp,
+  rm,
+} from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, posix } from "node:path";
+import { tmpdir } from "node:os";
 import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
@@ -23,7 +31,11 @@ import {
 } from "../agents/path-policy.ts";
 import { scanCommitSecrets } from "../security/secret-scan.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
-import { record, type WorkflowState } from "./state.ts";
+import {
+  record,
+  type CommitPathClassification,
+  type WorkflowState,
+} from "./state.ts";
 import { classifyCommitPaths, isNonCommittablePath } from "./commit-paths.ts";
 import { matchingSecurityRiskReview } from "./security-risk-review.ts";
 import {
@@ -39,6 +51,23 @@ export async function git(cwd: string, args: string[]) {
       cwd,
       maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    })
+  ).stdout;
+}
+async function gitWithEnvironment(
+  cwd: string,
+  args: string[],
+  environment: NodeJS.ProcessEnv,
+) {
+  return (
+    await exec("git", args, {
+      cwd,
+      maxBuffer: 8 * 1024 * 1024,
+      env: {
+        ...process.env,
+        ...environment,
+        GIT_TERMINAL_PROMPT: "0",
+      },
     })
   ).stdout;
 }
@@ -643,14 +672,164 @@ export async function determineAuthoritativeCommitSelection(
   const unexpected = await unexpectedWorkflowChanges(s);
   if (unexpected.length)
     throw new ContractExtensionApprovalRequired(unexpected);
-  const allowed = new Set(workflowScopePaths(s));
-  const baselineDirty = new Set(s.baseline.dirtyPaths);
-  const visible = (await dirtyPaths(s.cwd)).filter(
-    (path) => allowed.has(path) && !baselineDirty.has(path),
+  const allowedPaths = workflowScopePaths(s);
+  const allowed = new Map(allowedPaths.map((path) => [policyPath(path), path]));
+  const baselineDirty = new Set(s.baseline.dirtyPaths.map(policyPath));
+  const currentRepository = await repositorySnapshot(s.cwd);
+  const currentEntries = new Map(
+    currentRepository.entries.map((entry) => [policyPath(entry.path), entry]),
   );
+  const baselineEntries = new Map(
+    (s.baselineRepositorySnapshot?.entries ?? []).map((entry) => [
+      policyPath(entry.path),
+      entry,
+    ]),
+  );
+  const observed = new Set(
+    s.observedImplementorMutations.map((mutation) => mutation.identity),
+  );
+  const commandObserved = new Set(
+    s.commandMutationEvidence
+      .filter(
+        (evidence) =>
+          evidence.agent === "implementor" &&
+          evidence.attribution === "OBSERVED",
+      )
+      .flatMap((evidence) => [
+        ...evidence.addedPaths,
+        ...evidence.modifiedPaths,
+        ...evidence.deletedPaths,
+      ])
+      .map(policyPath),
+  );
+  const baselineStatus = (path: string) => {
+    const entry = baselineEntries.get(policyPath(path));
+    if (entry)
+      return entry.untracked
+        ? "UNTRACKED"
+        : `${entry.indexStatus}${entry.worktreeStatus}`;
+    if (!baselineDirty.has(policyPath(path))) return "CLEAN";
+    const line = s.baseline.status
+      .split(/\r?\n/)
+      .find(
+        (candidate) =>
+          candidate.length >= 4 &&
+          policyPath(candidate.slice(3).replaceAll("\\", "/")) ===
+            policyPath(path),
+      );
+    return line?.startsWith("??")
+      ? "UNTRACKED"
+      : (line?.slice(0, 2) ?? "DIRTY");
+  };
+  const classify = (
+    path: string,
+    gitStatus: string,
+    currentContentIdentity: string,
+  ): CommitPathClassification => {
+    const identity = policyPath(path);
+    const contractAuthorized = allowed.has(identity);
+    const preexisting = baselineDirty.has(identity);
+    const workflowEvidence = [
+      ...(observed.has(identity) ? ["observed_implementor_file_mutation"] : []),
+      ...(commandObserved.has(identity)
+        ? ["observed_implementor_command_mutation"]
+        : []),
+      ...(s.implementationStartHashes?.[path] !== undefined &&
+      s.implementationStartHashes[path] !== currentContentIdentity
+        ? ["host_content_changed_since_implementation_start"]
+        : []),
+    ];
+    const result = (
+      eligibility: CommitPathClassification["eligibility"],
+      ownership: CommitPathClassification["ownership"],
+      exclusionReason: string | undefined,
+      stagingPermitted: boolean,
+      manualActionRequired: boolean,
+    ): CommitPathClassification => ({
+      path,
+      eligibility,
+      gitStatus,
+      baselineStatus: baselineStatus(path),
+      currentContentIdentity,
+      workflowEvidence,
+      contractAuthorized,
+      ownership,
+      ...(exclusionReason ? { exclusionReason } : {}),
+      stagingPermitted,
+      manualActionRequired,
+    });
+    if (!contractAuthorized)
+      return result(
+        "OUTSIDE_CONTRACT",
+        preexisting ? "PREEXISTING" : "EXTERNAL",
+        "Path is not authorized by the Implementation Contract.",
+        false,
+        false,
+      );
+    if (preexisting)
+      return result(
+        workflowEvidence.length ? "AMBIGUOUS_OWNERSHIP" : "PREEXISTING_DIRTY",
+        workflowEvidence.length ? "AMBIGUOUS" : "PREEXISTING",
+        workflowEvidence.length
+          ? "Pre-existing and workflow changes cannot be separated safely."
+          : "The path was already modified when the workflow started.",
+        false,
+        true,
+      );
+    if (isNonCommittablePath(s.config, path))
+      return result(
+        "EXPLICITLY_EXCLUDED",
+        "WORKFLOW",
+        "The path is excluded by the commit policy.",
+        false,
+        true,
+      );
+    if (classifyPath(path) === "requires_user_approval") {
+      const contract = contractSchema.parse(s.results.reviewer);
+      const writeAuthorized =
+        s.config.permissions.files.allowWrite.some((pattern) =>
+          permissionPatternMatches(pattern, path),
+        ) ||
+        s.runtimeFileApprovals.some(
+          (grant) =>
+            grant.role === "implementor" &&
+            grant.operation === "write" &&
+            grant.path === identity,
+        ) ||
+        (s.sensitiveApprovalContractHash ===
+          effectiveContractIdentity(
+            contract,
+            s.workflowApprovedContractPaths,
+          ) &&
+          s.approvedSensitivePaths.includes(identity));
+      if (!writeAuthorized)
+        return result(
+          "SENSITIVE",
+          "UNVERIFIED",
+          "Sensitive-path write authorization is missing.",
+          false,
+          true,
+        );
+    }
+    if (!workflowEvidence.length)
+      workflowEvidence.push(
+        s.implementationStartHashes
+          ? "clean_baseline_contract_change"
+          : "legacy_clean_baseline_contract_change",
+      );
+    return result("SAFE", "WORKFLOW", undefined, true, false);
+  };
+  const classifications: CommitPathClassification[] =
+    currentRepository.entries.map((entry) =>
+      classify(
+        entry.path,
+        entry.untracked ? "??" : `${entry.indexStatus}${entry.worktreeStatus}`,
+        entry.hash,
+      ),
+    );
   // Git status omits ignored local-only files. Compare host snapshots taken
   // immediately before implementation to include those workflow changes.
-  const excludedContractPaths = [...allowed].filter((path) =>
+  const excludedContractPaths = allowedPaths.filter((path) =>
     isNonCommittablePath(s.config, path),
   );
   const currentExcluded = await hashes(s.cwd, excludedContractPaths);
@@ -660,8 +839,33 @@ export async function determineAuthoritativeCommitSelection(
         s.implementationStartHashes[path] !== currentExcluded[path]) ||
       s.observedImplementorMutations.some((mutation) => mutation.path === path),
   );
-  const workflowPaths = [...new Set([...visible, ...changedExcluded])].sort();
-  const selection = classifyCommitPaths(s.config, workflowPaths);
+  for (const path of changedExcluded)
+    if (!currentEntries.has(policyPath(path)))
+      classifications.push(classify(path, "IGNORED", currentExcluded[path]));
+  classifications.sort((a, b) => a.path.localeCompare(b.path));
+  const workflowClassifications = classifications.filter(
+    (classification) => classification.contractAuthorized,
+  );
+  const workflowPaths = workflowClassifications.map(({ path }) => path);
+  const commitPaths = workflowClassifications
+    .filter(({ stagingPermitted }) => stagingPermitted)
+    .map(({ path }) => path);
+  const excludedPaths = workflowClassifications
+    .filter(({ stagingPermitted }) => !stagingPermitted)
+    .map(({ path }) => path);
+  const selection = {
+    workflowPaths,
+    excludedPaths,
+    commitPaths,
+    classifications,
+    expectedHead: s.baseline.head,
+    expectedRepositorySnapshotId: currentRepository.id,
+    mode: (commitPaths.length
+      ? excludedPaths.length
+        ? "PARTIAL"
+        : "FULL"
+      : "NONE") as "FULL" | "PARTIAL" | "NONE",
+  };
   // Apply all commit safety checks, including secret scanning, before the model
   // sees the selection. prepareCommit repeats them after message generation.
   await prepareCommit(
@@ -873,22 +1077,183 @@ export async function createCommit(
     JSON.stringify(intent.hashes)
   )
     throw new Error("Files changed after commit preparation");
-  await git(s.cwd, ["add", "--", ...intent.files]);
-  const staged = (await git(s.cwd, ["diff", "--cached", "--name-only", "-z"]))
+  const userIndexTree = (await git(s.cwd, ["write-tree"])).trim();
+  const temporary = await mkdtemp(join(tmpdir(), "pi-team-index-"));
+  const isolatedIndex = join(temporary, "index");
+  const indexEnvironment = { GIT_INDEX_FILE: isolatedIndex };
+  try {
+    if (intent.head)
+      await gitWithEnvironment(
+        s.cwd,
+        ["read-tree", intent.head],
+        indexEnvironment,
+      );
+    else
+      await gitWithEnvironment(
+        s.cwd,
+        ["read-tree", "--empty"],
+        indexEnvironment,
+      );
+    await gitWithEnvironment(
+      s.cwd,
+      ["add", "--all", "--", ...intent.files],
+      indexEnvironment,
+    );
+    const staged = (
+      await gitWithEnvironment(
+        s.cwd,
+        ["diff", "--cached", "--name-only", "-z"],
+        indexEnvironment,
+      )
+    )
+      .split("\0")
+      .filter(Boolean);
+    if (
+      staged.some((path) => !intent.files.includes(path)) ||
+      intent.files.some((path) => !staged.includes(path))
+    )
+      throw new Error("Isolated staged changes do not match commit intent");
+    await gitWithEnvironment(
+      s.cwd,
+      [
+        ...(s.config.commit.runHooks ? [] : ["-c", "core.hooksPath=/dev/null"]),
+        "commit",
+        "-m",
+        intent.message,
+      ],
+      indexEnvironment,
+    );
+    const hash = await head(s.cwd);
+    if (!hash) throw new Error("Commit hash unavailable");
+    const committed = (
+      await git(s.cwd, [
+        "diff-tree",
+        "--root",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "-z",
+        hash,
+      ])
+    )
+      .split("\0")
+      .filter(Boolean);
+    if (
+      committed.some((path) => !intent.files.includes(path)) ||
+      intent.files.some((path) => !committed.includes(path))
+    )
+      throw new Error("Created commit does not match commit intent");
+    if ((await git(s.cwd, ["write-tree"])).trim() !== userIndexTree)
+      throw new Error(
+        "Git index changed during commit creation; the commit exists but index recovery requires inspection",
+      );
+    if (
+      JSON.stringify(await hashes(s.cwd, intent.files)) !==
+      JSON.stringify(intent.hashes)
+    )
+      throw new Error(
+        "Eligible files changed during commit creation; the commit exists but recovery requires inspection",
+      );
+    // The user's index was verified empty and unchanged. Refresh only the exact
+    // committed paths so it follows the new HEAD without touching exclusions.
+    await git(s.cwd, ["add", "--all", "--", ...intent.files]);
+    if ((await git(s.cwd, ["diff", "--cached", "--name-only"])).trim())
+      throw new Error(
+        "Git index did not return to its verified empty state after commit",
+      );
+    return { hash, files: intent.files, message: intent.message };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
+/** Recover a commit created after intent persistence but before state persistence. */
+export async function recoverCommitFromIntent(s: WorkflowState) {
+  const intent = s.commitIntent;
+  if (!intent) return undefined;
+  const currentHead = await head(s.cwd);
+  if (!currentHead || currentHead === intent.head) return undefined;
+  const parents = (
+    await git(s.cwd, ["rev-list", "--parents", "-n", "1", currentHead])
+  )
+    .trim()
+    .split(/\s+/);
+  const parent = parents[1] ?? null;
+  if (parent !== intent.head)
+    throw new Error(
+      "HEAD changed after commit preparation and does not match the intended commit parent",
+    );
+  const message = (
+    await git(s.cwd, ["log", "-1", "--format=%B", currentHead])
+  ).trimEnd();
+  if (message !== intent.message.trimEnd())
+    throw new Error(
+      "HEAD commit message does not match the persisted commit intent",
+    );
+  const committed = (
+    await git(s.cwd, [
+      "diff-tree",
+      "--root",
+      "--no-commit-id",
+      "--name-only",
+      "-r",
+      "-z",
+      currentHead,
+    ])
+  )
     .split("\0")
     .filter(Boolean);
   if (
-    staged.some((p) => !intent.files.includes(p)) ||
-    intent.files.some((p) => !staged.includes(p))
+    committed.some((path) => !intent.files.includes(path)) ||
+    intent.files.some((path) => !committed.includes(path))
   )
-    throw new Error("Staged changes do not match commit intent");
-  await git(s.cwd, [
-    ...(s.config.commit.runHooks ? [] : ["-c", "core.hooksPath=/dev/null"]),
-    "commit",
-    "-m",
-    intent.message,
-  ]);
-  const hash = await head(s.cwd);
-  if (!hash) throw new Error("Commit hash unavailable");
-  return { hash, files: intent.files, message: intent.message };
+    throw new Error(
+      "HEAD commit paths do not match the persisted commit intent",
+    );
+  if (
+    JSON.stringify(await hashes(s.cwd, intent.files)) !==
+    JSON.stringify(intent.hashes)
+  )
+    throw new Error(
+      "Committed working-tree paths changed before commit recovery could verify them",
+    );
+  for (const path of intent.files) {
+    if (intent.hashes[path] === "DELETED") {
+      const existsInCommit = await git(s.cwd, [
+        "cat-file",
+        "-e",
+        `${currentHead}:${path}`,
+      ]).then(
+        () => true,
+        () => false,
+      );
+      if (existsInCommit)
+        throw new Error(`Deleted commit path still exists in HEAD: ${path}`);
+      continue;
+    }
+    const [workingObject, committedObject] = await Promise.all([
+      git(s.cwd, ["hash-object", "--", path]).then((value) => value.trim()),
+      git(s.cwd, ["rev-parse", `${currentHead}:${path}`]).then((value) =>
+        value.trim(),
+      ),
+    ]);
+    if (workingObject !== committedObject)
+      throw new Error(`HEAD content does not match commit intent: ${path}`);
+  }
+  const cached = (await git(s.cwd, ["diff", "--cached", "--name-only"])).trim();
+  if (cached) {
+    if (!intent.head)
+      throw new Error("Cannot safely recover the Git index for a root commit");
+    const priorTree = (
+      await git(s.cwd, ["rev-parse", `${intent.head}^{tree}`])
+    ).trim();
+    if ((await git(s.cwd, ["write-tree"])).trim() !== priorTree)
+      throw new Error(
+        "Git index changed after commit creation; recovery will not overwrite it",
+      );
+    await git(s.cwd, ["add", "--all", "--", ...intent.files]);
+    if ((await git(s.cwd, ["diff", "--cached", "--name-only"])).trim())
+      throw new Error("Git index recovery did not restore an empty index");
+  }
+  return { hash: currentHead, files: intent.files, message: intent.message };
 }

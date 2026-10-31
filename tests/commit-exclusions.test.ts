@@ -1,17 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { configSchema } from "../src/config/schema.ts";
 import { WorkflowEngine } from "../src/workflow/engine.ts";
-import { validateState } from "../src/workflow/state.ts";
+import { block, record, validateState } from "../src/workflow/state.ts";
 import {
   classifyCommitPaths,
   nonCommittablePaths,
 } from "../src/workflow/commit-paths.ts";
 import { contextFor } from "../src/agents/context.ts";
 import { parseResult } from "../src/agents/schemas.ts";
-import { git, head, prepareCommit } from "../src/workflow/git.ts";
+import {
+  createCommit,
+  git,
+  head,
+  prepareCommit,
+  recoverCommitFromIntent,
+} from "../src/workflow/git.ts";
 import {
   buildCompletionReportInput,
   renderReport,
@@ -48,6 +54,10 @@ async function workflow(
     changeRepositoryAfterApproval?: boolean;
     contractExtensionChoices?: string[];
     noChanges?: boolean;
+    manualCommitChoices?: string[];
+    baselineExtra?: Record<string, string>;
+    runHooks?: boolean;
+    failingCommitHook?: boolean;
   } = {},
 ) {
   const cwd = await repository();
@@ -76,13 +86,25 @@ async function workflow(
       "-m",
       "fixture",
     ]);
-  for (const path of options.baselineDirty ?? [])
+  for (const path of options.baselineDirty ?? []) {
+    await mkdir(dirname(join(cwd, path)), { recursive: true });
     await writeFile(join(cwd, path), "user edit\n");
+  }
+  for (const [path, content] of Object.entries(options.baselineExtra ?? {})) {
+    await mkdir(dirname(join(cwd, path)), { recursive: true });
+    await writeFile(join(cwd, path), content);
+  }
   const cfg = config();
   cfg.commit.excludePaths = options.excludePaths ?? [];
+  cfg.commit.runHooks = options.runHooks ?? false;
   cfg.permissions.files.allowWrite = contractFiles.filter((path) =>
     path.startsWith(".env"),
   );
+  if (options.failingCommitHook) {
+    const hook = join(cwd, ".git", "hooks", "pre-commit");
+    await writeFile(hook, "#!/bin/sh\nexit 1\n");
+    await chmod(hook, 0o755);
+  }
   const reporterInputs: any[] = [];
   const commitInputs: any[] = [];
   const runner = new FixtureRunner(async (role, state, count) => {
@@ -144,6 +166,8 @@ async function workflow(
       }
       if (request.kind === "contractExtension")
         return options.contractExtensionChoices?.splice(0, 1);
+      if (request.kind === "manualCommit")
+        return options.manualCommitChoices?.splice(0, 1);
       return [];
     },
   });
@@ -194,18 +218,20 @@ test("incident paths exclude local files before attribution and stage only five 
   );
   assert.equal(state.phase, "DONE", state.blocker);
   assert.deepEqual(
-    state.commitSelection && {
-      ...state.commitSelection,
-      validatedAt: undefined,
-    },
-    {
-      workflowPaths: incidentFiles.toSorted(),
-      excludedPaths: [".env", ".env.testing"],
-      commitPaths: incidentFiles.slice(2).toSorted(),
-      validatedAt: undefined,
-      completed: true,
-    },
+    state.commitSelection?.workflowPaths,
+    incidentFiles.toSorted(),
   );
+  assert.deepEqual(state.commitSelection?.excludedPaths, [
+    ".env",
+    ".env.testing",
+  ]);
+  assert.deepEqual(
+    state.commitSelection?.commitPaths,
+    incidentFiles.slice(2).toSorted(),
+  );
+  assert.equal(state.commitSelection?.mode, "PARTIAL");
+  assert.equal(state.commitSelection?.completed, true);
+  assert.equal(state.commitOutcome?.status, "PARTIAL_COMMIT");
   assert.deepEqual(state.commit?.files, incidentFiles.slice(2).toSorted());
   assert.deepEqual(
     commitInputs[0].authoritativeCommitPaths,
@@ -229,8 +255,18 @@ test("incident paths exclude local files before attribution and stage only five 
   assert.match(await readFile(join(cwd, ".env"), "utf8"), /workflow change/);
   assert.doesNotMatch(await git(cwd, ["status", "--short"]), /\.env/);
   assert.deepEqual(reporterInputs.at(-1)?.excludedCommitPaths, [
-    { path: ".env", reason: "non-committable" },
-    { path: ".env.testing", reason: "non-committable" },
+    {
+      path: ".env",
+      reason: "EXPLICITLY_EXCLUDED",
+      detail: "The path is excluded by the commit policy.",
+      manualActionRequired: true,
+    },
+    {
+      path: ".env.testing",
+      reason: "EXPLICITLY_EXCLUDED",
+      detail: "The path is excluded by the commit policy.",
+      manualActionRequired: true,
+    },
   ]);
   assert.match(
     renderReport(state.results.reporter!),
@@ -333,6 +369,180 @@ test("pre-existing dirty excluded path remains untouched while normal file commi
   assert.deepEqual(state.commit?.files, [".env.example"]);
   assert.match(await git(cwd, ["status", "--short"]), /\.env/);
   assert.match(await readFile(join(cwd, ".env"), "utf8"), /workflow change/);
+});
+
+test("ambiguous tracked and pre-existing untracked files are excluded while safe files commit", async () => {
+  const ambiguous = "src/dashboard.html";
+  const preExistingAsset = "assets/buttons/addresses.png";
+  const safe = ["src/dashboard.ts", "src/dashboard.test.ts"];
+  const { cwd, state, runner, reporterInputs, before } = await workflow(
+    [ambiguous, preExistingAsset, ...safe],
+    [ambiguous, preExistingAsset, ...safe],
+    {
+      tracked: [ambiguous, ...safe],
+      baselineDirty: [ambiguous, preExistingAsset],
+      baselineExtra: {
+        ".prompts/prompt_13.md": "pre-existing prompt\n",
+      },
+      manualCommitChoices: ["commit_eligible"],
+    },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(runner.counts.commitAgent, 1);
+  assert.equal(state.commitOutcome?.status, "PARTIAL_COMMIT");
+  assert.equal(state.commitOutcome?.parentHead, before);
+  assert.deepEqual(state.commit?.files, safe.toSorted());
+  assert.deepEqual(state.commitSelection?.excludedPaths, [
+    preExistingAsset,
+    ambiguous,
+  ]);
+  const byPath = new Map(
+    state.commitSelection?.classifications?.map((entry) => [entry.path, entry]),
+  );
+  assert.equal(byPath.get(ambiguous)?.eligibility, "AMBIGUOUS_OWNERSHIP");
+  assert.equal(
+    byPath.get(preExistingAsset)?.eligibility,
+    "AMBIGUOUS_OWNERSHIP",
+  );
+  assert.equal(
+    byPath.get(".prompts/prompt_13.md")?.eligibility,
+    "OUTSIDE_CONTRACT",
+  );
+  assert.equal(byPath.get(ambiguous)?.stagingPermitted, false);
+  assert.equal(byPath.get(safe[0])?.eligibility, "SAFE");
+  assert.deepEqual(
+    (await git(cwd, ["show", "--format=", "--name-only", "HEAD"]))
+      .trim()
+      .split("\n")
+      .sort(),
+    safe.toSorted(),
+  );
+  const status = await git(cwd, ["status", "--short", "--untracked-files=all"]);
+  assert.match(status, /src\/dashboard\.html/);
+  assert.match(status, /assets\/buttons\/addresses\.png/);
+  assert.match(status, /\.prompts\/prompt_13\.md/);
+  assert.equal(
+    (await git(cwd, ["diff", "--cached", "--name-only"])).trim(),
+    "",
+  );
+  assert.deepEqual(
+    reporterInputs
+      .at(-1)
+      ?.excludedCommitPaths.map((entry: { path: string }) => entry.path),
+    [preExistingAsset, ambiguous],
+  );
+});
+
+test("user may leave all eligible changes uncommitted and still reach REPORT", async () => {
+  const { cwd, state, before, runner } = await workflow(
+    ["src/mixed.ts", "src/safe.ts"],
+    ["src/mixed.ts", "src/safe.ts"],
+    {
+      tracked: ["src/mixed.ts", "src/safe.ts"],
+      baselineDirty: ["src/mixed.ts"],
+      manualCommitChoices: ["leave_uncommitted"],
+    },
+  );
+  assert.equal(state.phase, "DONE", state.blocker);
+  assert.equal(state.commitOutcome?.status, "UNCOMMITTED");
+  assert.equal(state.commitOutcome?.decision, "LEAVE_UNCOMMITTED");
+  assert.equal(state.commit, undefined);
+  assert.equal(await head(cwd), before);
+  assert.equal(runner.counts.commitAgent, undefined);
+  assert.equal(runner.counts.reporter, 1);
+  assert.match(
+    (state.reportInput as any).validation.find(
+      (entry: { label: string }) => entry.label === "Commit",
+    ).detail,
+    /No commit was created/,
+  );
+});
+
+test("commit hook failure leaves the real index empty and working tree intact", async () => {
+  const { cwd, state, before } = await workflow(
+    ["src/new.ts"],
+    ["src/new.ts"],
+    { runHooks: true, failingCommitHook: true },
+  );
+  assert.equal(state.phase, "BLOCKED");
+  assert.equal(await head(cwd), before);
+  assert.equal(
+    (await git(cwd, ["diff", "--cached", "--name-only"])).trim(),
+    "",
+  );
+  assert.match(
+    await git(cwd, ["status", "--short", "--untracked-files=all"]),
+    /src\/new\.ts/,
+  );
+});
+
+test("persisted commit intent recovers an already-created commit without duplication", async () => {
+  const fixture = await workflow(["src/recover.ts"], ["src/recover.ts"], {
+    failCommitFirst: true,
+  });
+  assert.equal(fixture.state.phase, "BLOCKED");
+  const intent = await prepareCommit(
+    fixture.state,
+    fixture.state.commitSelection!.commitPaths,
+    "feat: recover fixture",
+  );
+  fixture.state.commitIntent = intent;
+  const created = await createCommit(fixture.state);
+  const recovered = await recoverCommitFromIntent(fixture.state);
+  assert.deepEqual(recovered, created);
+  assert.equal(
+    (
+      await git(fixture.cwd, ["rev-list", "--count", `${fixture.before}..HEAD`])
+    ).trim(),
+    "1",
+  );
+  assert.equal(
+    (await git(fixture.cwd, ["diff", "--cached", "--name-only"])).trim(),
+    "",
+  );
+});
+
+test("legacy manualCommit BLOCKED state retries COMMIT without rerunning valid gates", async () => {
+  const first = await workflow(
+    ["src/mixed.ts", "src/safe.ts"],
+    ["src/mixed.ts", "src/safe.ts"],
+    {
+      tracked: ["src/mixed.ts", "src/safe.ts"],
+      baselineDirty: ["src/mixed.ts"],
+    },
+  );
+  assert.equal(first.state.phase, "WAITING_USER");
+  record(
+    first.state,
+    "approval_submitted",
+    JSON.stringify({ kind: "manualCommit", selected: ["acknowledge"] }),
+  );
+  delete first.state.pendingApproval;
+  delete first.state.resumePhase;
+  block(
+    first.state,
+    "Manual commit required: inspect and stage approved dirty files yourself. Automatic commit is disabled because hunk ownership cannot be established.",
+  );
+  await first.engine.store.save(first.state);
+  const recoveredEngine = new WorkflowEngine(first.cwd, first.runner, {
+    ...ui,
+    approve: async (request) =>
+      request.kind === "manualCommit" ? ["commit_eligible"] : [],
+  });
+  const recovered = await recoveredEngine.store.load(first.state.id);
+  assert.equal(
+    await recoveredEngine.retryAgent(recovered, "commitAgent", true),
+    "prepared",
+  );
+  await recoveredEngine.run(recovered);
+  assert.equal(recovered.phase, "DONE", recovered.blocker);
+  assert.equal(recovered.commitOutcome?.status, "PARTIAL_COMMIT");
+  assert.deepEqual(recovered.commit?.files, ["src/safe.ts"]);
+  assert.equal(first.runner.counts.implementor, 1);
+  assert.equal(first.runner.counts.codeReviewer, 1);
+  assert.equal(first.runner.counts.securityReviewer, 1);
+  assert.equal(first.runner.counts.tester, 1);
+  assert.equal(first.runner.counts.commitAgent, 1);
 });
 
 test("unexpected .gitignore change waits for Contract extension approval before Commit Agent", async () => {

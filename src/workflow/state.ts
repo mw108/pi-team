@@ -214,6 +214,41 @@ const repositorySnapshotSchema = z.object({
     }),
   ),
 });
+export const commitEligibilitySchema = z.enum([
+  "SAFE",
+  "PREEXISTING_DIRTY",
+  "AMBIGUOUS_OWNERSHIP",
+  "OUTSIDE_CONTRACT",
+  "EXPLICITLY_EXCLUDED",
+  "SENSITIVE",
+  "EXTERNAL_CHANGE",
+  "UNVERIFIED",
+]);
+export type CommitEligibility = z.infer<typeof commitEligibilitySchema>;
+export const commitPathClassificationSchema = z
+  .object({
+    path: exactPath,
+    eligibility: commitEligibilitySchema,
+    gitStatus: z.string().min(1).max(20),
+    baselineStatus: z.string().min(1).max(20),
+    currentContentIdentity: z.string().min(1),
+    workflowEvidence: z.array(z.string()),
+    contractAuthorized: z.boolean(),
+    ownership: z.enum([
+      "WORKFLOW",
+      "PREEXISTING",
+      "AMBIGUOUS",
+      "EXTERNAL",
+      "UNVERIFIED",
+    ]),
+    exclusionReason: z.string().optional(),
+    stagingPermitted: z.boolean(),
+    manualActionRequired: z.boolean(),
+  })
+  .strict();
+export type CommitPathClassification = z.infer<
+  typeof commitPathClassificationSchema
+>;
 export const stateSchema = z.object({
   version: z.literal(3),
   id: z.string().uuid(),
@@ -537,6 +572,7 @@ export const stateSchema = z.object({
     })
     .optional(),
   gateHashes: z.record(z.string()).optional(),
+  baselineRepositorySnapshot: repositorySnapshotSchema.optional(),
   gateRepositorySnapshot: repositorySnapshotSchema.optional(),
   commandMutationEvidence: z
     .array(
@@ -603,6 +639,12 @@ export const stateSchema = z.object({
       workflowPaths: z.array(z.string()),
       excludedPaths: z.array(z.string()),
       commitPaths: z.array(z.string()),
+      classifications: z.array(commitPathClassificationSchema).optional(),
+      expectedHead: z.string().nullable().optional(),
+      expectedRepositorySnapshotId: z.string().optional(),
+      mode: z.enum(["FULL", "PARTIAL", "NONE"]).optional(),
+      decision: z.enum(["COMMIT_ELIGIBLE", "LEAVE_UNCOMMITTED"]).optional(),
+      decisionAt: z.string().datetime().optional(),
       validatedAt: z.string().optional(),
       completed: z.boolean().default(false),
     })
@@ -613,6 +655,35 @@ export const stateSchema = z.object({
       files: z.array(z.string()),
       message: z.string().optional(),
     })
+    .optional(),
+  commitOutcome: z
+    .object({
+      status: z.enum(["FULL_COMMIT", "PARTIAL_COMMIT", "UNCOMMITTED"]),
+      parentHead: z.string().nullable(),
+      commitHash: z.string().optional(),
+      committedPaths: z.array(exactPath),
+      excludedPaths: z.array(
+        z
+          .object({
+            path: exactPath,
+            reason: commitEligibilitySchema,
+            detail: z.string(),
+            manualActionRequired: z.boolean(),
+          })
+          .strict(),
+      ),
+      decision: z.enum(["COMMIT_ELIGIBLE", "LEAVE_UNCOMMITTED"]),
+      decidedAt: z.string().datetime(),
+      completedAt: z.string().datetime(),
+      qualityGateReferences: z.object({
+        codeReview: z.boolean(),
+        securityReview: z.boolean(),
+        testing: z.boolean(),
+        gateRepositorySnapshotId: z.string().optional(),
+      }),
+      remainingStatus: z.string(),
+    })
+    .strict()
     .optional(),
   reportFailure: z.string().optional(),
   reportInput: z.unknown().optional(),

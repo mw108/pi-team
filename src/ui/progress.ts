@@ -165,9 +165,16 @@ export function deriveAgentProgressState(
   if (
     role === "commitAgent" &&
     state.commitSelection?.completed &&
-    !state.commitSelection.commitPaths.length
+    (!state.commitSelection.commitPaths.length ||
+      state.commitOutcome?.status === "UNCOMMITTED")
   )
-    return { status: "completed", detail: "nothing committable" };
+    return {
+      status: "completed",
+      detail:
+        state.commitOutcome?.status === "UNCOMMITTED"
+          ? "completed without a commit"
+          : "nothing committable",
+    };
   if (lifecycle > invalidation && latest?.event === "agent_attempt_failed")
     return { status: "failed", attempt: latest.meta?.attempt };
   if (lifecycle > invalidation && latest?.event === "agent_aborted_by_user")
@@ -576,6 +583,18 @@ export function renderProgress(
   if (counters) lines.push(counters);
   if (gates.length) lines.push(gates.join(" · "));
   if (state.blocker) lines.push(`Blocked: ${state.blocker}`);
+  if (state.commitOutcome?.status === "PARTIAL_COMMIT")
+    lines.push(
+      `Commit outcome: partial commit ${state.commitOutcome.commitHash ?? ""} · ${state.commitOutcome.excludedPaths.length} path(s) require manual review`,
+    );
+  else if (state.commitOutcome?.status === "UNCOMMITTED")
+    lines.push(
+      `Commit outcome: uncommitted · ${state.commitOutcome.excludedPaths.length} excluded path(s) remain`,
+    );
+  else if (state.commitOutcome?.status === "FULL_COMMIT")
+    lines.push(
+      `Commit outcome: full commit ${state.commitOutcome.commitHash ?? ""}`,
+    );
   if (state.phase === "DONE")
     lines.push(
       `Report: ${state.results.reporter ? "available" : "deterministic fallback available"} · /team-report`,

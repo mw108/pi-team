@@ -587,7 +587,24 @@ export const completionReportSchema = z.object({
   ),
   notes: strings,
   excludedCommitPaths: z
-    .array(z.object({ path: z.string(), reason: z.literal("non-committable") }))
+    .array(
+      z.object({
+        path: z.string(),
+        reason: z.enum([
+          "SAFE",
+          "PREEXISTING_DIRTY",
+          "AMBIGUOUS_OWNERSHIP",
+          "OUTSIDE_CONTRACT",
+          "EXPLICITLY_EXCLUDED",
+          "SENSITIVE",
+          "EXTERNAL_CHANGE",
+          "UNVERIFIED",
+          "non-committable",
+        ]),
+        detail: z.string().optional(),
+        manualActionRequired: z.boolean().optional(),
+      }),
+    )
     .optional(),
   unresolvedIssues: strings,
   commit: z.object({
@@ -595,6 +612,9 @@ export const completionReportSchema = z.object({
     hash: z.string().optional(),
     message: z.string().optional(),
     detail: z.string().optional(),
+    outcome: z
+      .enum(["FULL_COMMIT", "PARTIAL_COMMIT", "UNCOMMITTED"])
+      .optional(),
   }),
 });
 export const normalizeSchema = z.object({

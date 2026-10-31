@@ -184,8 +184,9 @@ export async function contextFor(
     if (!s.commitSelection) throw new Error("Host commit selection is missing");
     context.authoritativeCommitPaths = s.commitSelection.commitPaths;
     context.excludedCommitPaths = s.commitSelection.excludedPaths;
+    context.commitPathClassifications = s.commitSelection.classifications;
     context.commitPathInstruction =
-      "The host has validated the exact file set. Generate a Conventional Commit message for authoritativeCommitPaths. Do not add, remove, or propose paths. excludedCommitPaths are local-only changes and are intentionally omitted; their presence is not an error.";
+      "The host has validated the exact file set. Generate a Conventional Commit message for authoritativeCommitPaths. Do not add, remove, or propose paths. excludedCommitPaths remain unchanged and unstaged; their presence is not an error, and this commit may be incomplete until they are integrated manually.";
   }
   context.previousFindings = s.history
     .filter((e) => e.event.startsWith("FIX_"))

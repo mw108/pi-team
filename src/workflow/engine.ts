@@ -92,6 +92,7 @@ import {
   prepareCommit,
   determineAuthoritativeCommitSelection,
   createCommit,
+  recoverCommitFromIntent,
   repositorySnapshot,
   compareRepositorySnapshots,
   formatRepositoryDrift,
@@ -139,6 +140,7 @@ import {
   recoverableAnsweredImplementorRewind,
   classifyQualityGateBlocker,
   clearQualityGateBlocker,
+  isLegacyManualCommitBlock,
 } from "./recovery.ts";
 import {
   analyzeConfigDrift,
@@ -1141,6 +1143,31 @@ export class WorkflowEngine {
           `Agent ${role} is already active; wait for it to settle.`,
         );
       const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (role === "commitAgent" && isLegacyManualCommitBlock(state)) {
+        if (plan.kind !== "retry-agent" || plan.agentId !== "commitAgent")
+          throw new Error(
+            `${plan.reason} Next safe action: ${plan.actions.map((action) => action.command).join(" · ")}`,
+          );
+        state.phase = "COMMIT";
+        delete state.blocker;
+        delete state.blockerMeta;
+        delete state.pendingApproval;
+        delete state.resumePhase;
+        delete state.commitSelection;
+        delete state.commitIntent;
+        delete state.commitOutcome;
+        delete state.results.commitAgent;
+        delete state.results.reporter;
+        delete state.reportInput;
+        record(
+          state,
+          "legacy_manual_commit_recovery_requested",
+          "Host commit eligibility will be recomputed; a new explicit decision is required",
+          { agent: "commitAgent", attempt: 1 },
+        );
+        await this.store.save(state);
+        return "prepared";
+      }
       if (qualityGateRetryCandidate) {
         if (
           plan.kind !== "completed-quality-gate-blocked" ||
@@ -1457,6 +1484,7 @@ export class WorkflowEngine {
       delete state.gateHashes;
       delete state.gateRepositorySnapshot;
       delete state.commitSelection;
+      delete state.commitOutcome;
     }
     delete state.commitIntent;
     record(state, "downstream_invalidated", `After manual retry of ${role}`);
@@ -1473,6 +1501,61 @@ export class WorkflowEngine {
           .map((h) => h.meta!.attempt),
       ) + 1
     );
+  }
+  private async finalizeCommitOutcome(state: WorkflowState) {
+    const selection = state.commitSelection;
+    if (!selection) throw new Error("Host commit selection is missing");
+    const excluded = (selection.classifications ?? [])
+      .filter((classification) =>
+        selection.excludedPaths.includes(classification.path),
+      )
+      .map((classification) => ({
+        path: classification.path,
+        reason: classification.eligibility,
+        detail:
+          classification.exclusionReason ??
+          "The path was not eligible for automatic commit.",
+        manualActionRequired: classification.manualActionRequired,
+      }));
+    const completedAt = new Date().toISOString();
+    const decision =
+      selection.decision ??
+      (state.commit ? "COMMIT_ELIGIBLE" : "LEAVE_UNCOMMITTED");
+    state.commitOutcome = {
+      status: state.commit
+        ? excluded.length
+          ? "PARTIAL_COMMIT"
+          : "FULL_COMMIT"
+        : "UNCOMMITTED",
+      parentHead: selection.expectedHead ?? state.baseline.head,
+      ...(state.commit ? { commitHash: state.commit.hash } : {}),
+      committedPaths: state.commit?.files ?? [],
+      excludedPaths: excluded,
+      decision,
+      decidedAt: selection.decisionAt ?? selection.validatedAt ?? completedAt,
+      completedAt,
+      qualityGateReferences: {
+        codeReview:
+          !state.config.qualityGates.codeReview.enabled ||
+          state.results.codeReviewer?.status === "APPROVED",
+        securityReview:
+          !!state.results.securityReviewer &&
+          state.results.securityReviewer.findings.every(
+            (finding) => finding.classification !== "CONFIRMED",
+          ),
+        testing:
+          !state.config.qualityGates.testing.enabled ||
+          state.results.tester?.status === "PASS",
+        ...(state.gateRepositorySnapshot?.id
+          ? { gateRepositorySnapshotId: state.gateRepositorySnapshot.id }
+          : {}),
+      },
+      remainingStatus: await git(state.cwd, [
+        "status",
+        "--short",
+        "--untracked-files=all",
+      ]),
+    };
   }
   private async markInterruptedImplementor(
     state: WorkflowState,
@@ -1612,6 +1695,7 @@ export class WorkflowEngine {
         `\n# Pi Team Serena cache\n${missing.join("\n")}\n`,
       );
     const state = newState(this.cwd, task, config, await baseline(this.cwd));
+    state.baselineRepositorySnapshot = await repositorySnapshot(this.cwd);
     state.teamConfigPath = snapshot.path;
     state.teamConfigHash = snapshot.configHash;
     state.semanticConfigHash = snapshot.semanticConfigHash;
@@ -4135,6 +4219,50 @@ export class WorkflowEngine {
                   s,
                   "Contract touches pre-existing user changes: dirty file approval denied",
                 );
+            } else if (request.kind === "manualCommit") {
+              if (selected.length !== 1)
+                throw new Error(
+                  "Manual commit decision requires exactly one option",
+                );
+              const decision = selected[0];
+              if (decision === "acknowledge") {
+                // Historical requests offered acknowledgment only. It remains
+                // readable, but it is not Git-write authorization. COMMIT will
+                // recompute the plan and request an explicit decision.
+                record(
+                  s,
+                  "legacy_manual_commit_acknowledgment_received",
+                  "A new explicit partial-commit decision is required",
+                );
+                delete s.commitSelection;
+              } else {
+                if (!s.commitSelection)
+                  throw new Error(
+                    "Manual commit decision has no current host commit plan",
+                  );
+                if (
+                  !["commit_eligible", "leave_uncommitted"].includes(decision)
+                )
+                  throw new Error("Unknown manual commit decision");
+                s.commitSelection.decision =
+                  decision === "commit_eligible"
+                    ? "COMMIT_ELIGIBLE"
+                    : "LEAVE_UNCOMMITTED";
+                s.commitSelection.decisionAt = new Date().toISOString();
+                record(
+                  s,
+                  "partial_commit_decision_recorded",
+                  s.commitSelection.decision,
+                  {
+                    agent: "commitAgent",
+                    attempt: Math.max(
+                      1,
+                      this.nextAttempt(s, "commitAgent") - 1,
+                    ),
+                    paths: s.commitSelection.commitPaths,
+                  },
+                );
+              }
             } else if (request.kind === "sensitivePaths") {
               const contract = contractSchema.parse(s.results.reviewer);
               const identity = effectiveContractIdentity(
@@ -4328,11 +4456,44 @@ export class WorkflowEngine {
           break;
         }
         if (
-          s.phase !== "REPORT" &&
+          s.phase === "COMMIT" &&
+          s.commitIntent &&
+          !s.commit &&
           (await head(this.cwd)) !== s.baseline.head
+        ) {
+          s.commit = await recoverCommitFromIntent(s);
+          if (s.commit) {
+            if (!s.commitSelection)
+              throw new Error(
+                "Recovered commit has no persisted host commit selection",
+              );
+            s.commitSelection.completed = true;
+            record(s, "commit_recovered_from_intent", s.commit.hash, {
+              agent: "commitAgent",
+              attempt: Math.max(1, this.nextAttempt(s, "commitAgent") - 1),
+              paths: s.commit.files,
+            });
+            await this.store.save(s);
+          }
+        }
+        if (
+          s.phase !== "REPORT" &&
+          (await head(this.cwd)) !== s.baseline.head &&
+          !(s.phase === "COMMIT" && s.commit)
         ) {
           block(s, "Git HEAD changed during workflow");
           break;
+        }
+        if (s.phase === "COMMIT" && s.commit) {
+          if (!s.commitSelection)
+            throw new Error("Committed workflow has no host commit selection");
+          s.commitSelection.completed = true;
+          await this.finalizeCommitOutcome(s);
+          delete s.inFlight;
+          transition(s);
+          record(s, "phase_completed");
+          await this.store.save(s);
+          continue;
         }
         if (s.phase !== "ORCHESTRATE" && !s.commandApprovalComplete) {
           s.discoveredCommands = await discoverCommands(this.cwd);
@@ -4422,27 +4583,6 @@ export class WorkflowEngine {
           s.gateRepositorySnapshot = repositoryState;
         }
         if (s.phase === "COMMIT") {
-          const overlap = workflowScopePaths(s).filter(
-            (path) =>
-              s.baseline.dirtyPaths.includes(path) &&
-              !isNonCommittablePath(s.config, path),
-          );
-          if (overlap.length) {
-            await this.requestApproval(s, {
-              kind: "manualCommit",
-              title: "Manual commit inspection required",
-              prompt: `Automatic staging cannot separate original user hunks from workflow hunks in: ${overlap.join(", ")}. Inspect the diff and stage/commit manually after this workflow stops. No automatic commit will be attempted.`,
-              options: [
-                {
-                  value: "acknowledge",
-                  label: "I will inspect and commit manually",
-                  description:
-                    "Stop with state and working-tree content preserved",
-                },
-              ],
-            });
-            continue;
-          }
           let selection;
           try {
             selection = await determineAuthoritativeCommitSelection(
@@ -4458,8 +4598,40 @@ export class WorkflowEngine {
             await this.requestCredentialFindingApproval(s, error);
             continue;
           }
+          const priorSelection = s.commitSelection;
+          const samePlan =
+            priorSelection?.expectedHead === selection.expectedHead &&
+            priorSelection?.expectedRepositorySnapshotId ===
+              selection.expectedRepositorySnapshotId &&
+            JSON.stringify(priorSelection.commitPaths) ===
+              JSON.stringify(selection.commitPaths) &&
+            JSON.stringify(priorSelection.excludedPaths) ===
+              JSON.stringify(selection.excludedPaths);
+          const manualExclusions = selection.classifications.filter(
+            (classification) =>
+              selection.excludedPaths.includes(classification.path) &&
+              classification.manualActionRequired &&
+              !isNonCommittablePath(s.config, classification.path) &&
+              [
+                "PREEXISTING_DIRTY",
+                "AMBIGUOUS_OWNERSHIP",
+                "UNVERIFIED",
+                "SENSITIVE",
+              ].includes(classification.eligibility),
+          );
           s.commitSelection = {
             ...selection,
+            ...(samePlan && priorSelection?.decision
+              ? {
+                  decision: priorSelection.decision,
+                  decisionAt: priorSelection.decisionAt,
+                }
+              : manualExclusions.length
+                ? {}
+                : {
+                    decision: "COMMIT_ELIGIBLE" as const,
+                    decisionAt: new Date().toISOString(),
+                  }),
             validatedAt: new Date().toISOString(),
             completed: false,
           };
@@ -4485,10 +4657,58 @@ export class WorkflowEngine {
               },
             );
           await this.store.save(s);
+          if (manualExclusions.length && !s.commitSelection.decision) {
+            const excluded = manualExclusions
+              .map(
+                (classification) =>
+                  `- ${classification.path}: ${classification.exclusionReason}`,
+              )
+              .join("\n");
+            await this.requestApproval(s, {
+              kind: "manualCommit",
+              title: "Choose how to finish the commit phase",
+              prompt: `Some files cannot be committed automatically.\n\nExcluded:\n${excluded}\n\nEligible for automatic commit: ${selection.commitPaths.length} file(s).\n\nExcluded files will remain unchanged and unstaged. A partial commit does not contain all validated working-tree changes.`,
+              options: [
+                ...(selection.commitPaths.length
+                  ? [
+                      {
+                        value: "commit_eligible",
+                        label: "Commit eligible files and continue",
+                        description:
+                          "Create an exact-path partial commit and continue to the report",
+                      },
+                    ]
+                  : []),
+                {
+                  value: "leave_uncommitted",
+                  label: "Leave all changes uncommitted",
+                  description:
+                    "Create no commit and continue to the report with an uncommitted outcome",
+                },
+              ],
+            });
+            continue;
+          }
+          if (s.commitSelection.decision === "LEAVE_UNCOMMITTED") {
+            delete s.results.commitAgent;
+            delete s.manualRetry;
+            s.commitSelection.completed = true;
+            await this.finalizeCommitOutcome(s);
+            record(
+              s,
+              "commit_declined_by_user",
+              "All repository changes were preserved without creating a commit",
+            );
+            transition(s);
+            record(s, "phase_completed");
+            await this.store.save(s);
+            continue;
+          }
           if (!selection.commitPaths.length) {
             delete s.results.commitAgent;
             delete s.manualRetry;
             s.commitSelection.completed = true;
+            await this.finalizeCommitOutcome(s);
             record(
               s,
               "commit_nothing_committable",
@@ -4950,6 +5170,7 @@ export class WorkflowEngine {
                 selection.excludedPaths.join(", "),
               );
             selection.completed = true;
+            await this.finalizeCommitOutcome(s);
             this.emitAgentEvent({ type: "complete", role: "commitAgent" });
             record(s, "agent_completed", "commitAgent");
           } catch (error) {
