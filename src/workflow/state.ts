@@ -411,6 +411,10 @@ export const stateSchema = z.object({
               "UNKNOWN",
             ])
             .optional(),
+          mutationReason: z.string().max(500).optional(),
+          mutationPackageManager: z
+            .enum(["npm", "pnpm", "yarn", "bun", "composer"])
+            .optional(),
           potentialRepositoryChanges: z.array(z.string().max(500)).optional(),
         })
         .strict(),

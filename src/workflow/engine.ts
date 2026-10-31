@@ -424,12 +424,14 @@ export class WorkflowEngine {
     role: Role,
     command: Command,
     purpose: string,
+    context?: HostCommandApprovalContext,
   ) {
     return this.commandApprovals.runtimeApprovalPrompt(
       s,
       role,
       command,
       purpose,
+      context,
     );
   }
   private saveRuntimeApproval(
@@ -3194,6 +3196,27 @@ export class WorkflowEngine {
             pending.agentId,
             pending.command,
             pending.purpose,
+            pending.mutationRisk
+              ? {
+                  mutation: {
+                    risk: pending.mutationRisk,
+                    reason:
+                      pending.mutationReason ??
+                      "Persisted host mutation classification",
+                    potentialRepositoryChanges:
+                      pending.potentialRepositoryChanges ?? [],
+                    ...(pending.mutationPackageManager
+                      ? { packageManager: pending.mutationPackageManager }
+                      : {}),
+                  },
+                  requiresDependencyMutationApproval:
+                    pending.mutationRisk === "DEPENDENCY_MUTATION",
+                  requiresExplicitMutationApproval:
+                    pending.mutationRisk === "DEPENDENCY_MUTATION" ||
+                    (pending.mutationRisk === "UNKNOWN" &&
+                      Boolean(pending.mutationPackageManager)),
+                }
+              : undefined,
           );
           request.prompt +=
             "\n\nThe requesting run has ended. This decision will not execute the command; retry the agent after recovery.";

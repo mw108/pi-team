@@ -411,6 +411,9 @@ export class RuntimeCommandApprovalCoordinator {
     const dependencyMutation = context?.requiresDependencyMutationApproval;
     const explicitMutation = context?.requiresExplicitMutationApproval;
     const potentialChanges = context?.mutation.potentialRepositoryChanges ?? [];
+    const mutationSummary = context
+      ? `\n\nMutation risk: ${context.mutation.risk}\nHost classification: ${redactVisibleText(context.mutation.reason)}\nPotential repository changes:\n${potentialChanges.map((path) => `- ${redactVisibleText(path)}`).join("\n") || "- none identified"}`
+      : "";
     return {
       kind: "runtimeCommand",
       title: dependencyMutation
@@ -418,7 +421,7 @@ export class RuntimeCommandApprovalCoordinator {
         : `${label} requests command approval`,
       prompt: dependencyMutation
         ? `Tester requests a dependency installation or update.\n\nCommand: ${line}\n\nReason:\n${redactVisibleText(purpose)}\n\nHost classification: ${context.mutation.reason}\n\nPotential repository changes:\n${potentialChanges.map((path) => `- ${redactVisibleText(path)}`).join("\n") || "- dependency and local tool state"}\n\nThis command may alter dependency state. A prior generic command approval does not authorize this mutation. Scope: this exact executable and argv, once, in the current workflow attempt.`
-        : `Agent: ${label} (${role})\nCategory: ${command.purpose}\n\nCommand: ${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}\n\nThis command may modify project files, generated artifacts, or local development state.\n\nScope: exact command for ${label}${explicitMutation ? " once in this workflow attempt" : " in this workflow"}.${!explicitMutation && rule ? `\n\nAllow similar for ${label}: ${ruleLine}` : ""}`,
+        : `Agent: ${label} (${role})\nCategory: ${command.purpose}\n\nCommand: ${line}\n\nPurpose: ${discovered?.command.purpose ?? redactVisibleText(purpose)}${metadata}${discovered ? `\nReason: ${redactVisibleText(purpose)}` : ""}${mutationSummary}\n\nThis command may modify project files, generated artifacts, or local development state.\n\nScope: exact command for ${label}${explicitMutation ? " once in this workflow attempt" : " in this workflow"}.${!explicitMutation && rule ? `\n\nAllow similar for ${label}: ${ruleLine}` : ""}`,
       options: [
         {
           value: "allow_once",
@@ -528,6 +531,10 @@ export class RuntimeCommandApprovalCoordinator {
       ...(context
         ? {
             mutationRisk: context.mutation.risk,
+            mutationReason: redactVisibleText(context.mutation.reason),
+            ...(context.mutation.packageManager
+              ? { mutationPackageManager: context.mutation.packageManager }
+              : {}),
             potentialRepositoryChanges:
               context.mutation.potentialRepositoryChanges,
           }

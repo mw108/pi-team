@@ -24,7 +24,6 @@ import {
 } from "./permissions.ts";
 import {
   commandTool,
-  execute,
   localHttpTool,
   type CommandEvidence,
   type RuntimeCommandApprover,
@@ -77,7 +76,6 @@ import {
 } from "../workflow/validation-applicability.ts";
 import { recordCommandPurposeMismatch } from "../workflow/command-purpose-mismatch.ts";
 import { commandKey, effectiveConfig } from "./discovery.ts";
-import { ExecutableResolutionError } from "./executable-resolution.ts";
 import { resolveRequestTimeout } from "./request-timeout.ts";
 import {
   AgentOutputError,
@@ -124,6 +122,10 @@ import {
   type AgentHumanInputWait,
   type AgentTimeoutEvent,
 } from "./agent-timeout.ts";
+import {
+  executeRequiredValidationStage,
+  requiredValidationBlockReason,
+} from "../workflow/required-validation-execution.ts";
 
 export type ActivityObserver = (
   toolName: string | undefined,
@@ -1033,96 +1035,58 @@ export class PiRunner implements AgentRunner {
       if (signal?.aborted) throw new Error("Workflow interrupted");
       const input = await contextFor(role, state);
       if (role === "tester") {
-        const current = currentVerifiedCommandResults(
-          state,
-          await repositoryEvidenceState(state),
-        );
         const validationLog = new AttemptLogger(
           new AgentLogStore(state.cwd).path(state.id, role, attempt),
         );
-        const applicability = await validationApplicability(state);
-        const required = requiredValidationCommands(applicability);
-        const authorized = effectiveConfig(state).commands.filter((c) =>
-          allowedCommandCategories("tester").includes(c.purpose),
-        );
-        for (const command of required.filter((requiredCommand) =>
-          authorized.some(
-            (candidate) =>
-              commandKey(candidate) === commandKey(requiredCommand),
-          ),
-        )) {
-          if (
-            current.some(
-              (result) =>
-                result.commandIdentity === commandKey(command) &&
-                result.exitCode === 0 &&
-                result.agent === "tester" &&
-                result.attempt === attempt,
-            )
-          )
-            continue;
-          activity?.(`validation_${command.purpose}`);
-          try {
-            const result = await execute(
-              command,
-              state.cwd,
-              executionSignal,
-              effectiveConfig(state).execution.sandbox,
-            );
-            evidence.push(result);
-            await captureResult(command, result);
-            validationLog.append({
-              type: "validation_command",
-              id: result.id,
-              exitCode: result.exitCode,
-              output: result.output,
-              timedOut: result.timedOut,
-              durationMs: result.durationMs,
-              sandbox: result.sandbox,
-            });
-          } catch (error) {
-            if (!(error instanceof ExecutableResolutionError)) throw error;
-            const failures = (input.commandStartupFailures ??= []) as any[];
-            failures.push({
-              code: error.code,
-              osError:
-                error.code === "EXECUTABLE_NOT_FOUND" ? "ENOENT" : undefined,
-              requestedCommand: commandSummary(command.id, command),
-              workingDirectory: state.cwd,
-              platform: process.platform,
-              processStarted: false,
-              resolution: error.resolution,
-              nextAction:
-                "Use an evidence-backed candidateValidationCommand through team_command; normal command authorization applies.",
-            });
-            validationLog.append({
-              type: "command_resolution_failed",
-              commandId: command.id,
-              code: error.code,
-              processStarted: false,
-              platform: process.platform,
-              resolution: error.resolution,
-            });
-          } finally {
-            activity?.(undefined);
-          }
+        const stage = await executeRequiredValidationStage({
+          state,
+          attempt,
+          signal: executionSignal,
+          runtimeApproval: pausableRuntimeApproval,
+          onResult: captureResult,
+          onDenial: (status) => {
+            if (status === "denied") commandDenied = true;
+          },
+          activity,
+        });
+        for (const commandId of stage.executed)
+          validationLog.append({
+            type: "host_required_validation_executed",
+            commandId,
+            attempt,
+          });
+        if (stage.blocked) {
+          validationLog.append({
+            type: "host_required_validation_blocked",
+            commandId: stage.blocked.obligationId,
+            code: stage.blocked.code,
+            reason: stage.blocked.reason,
+          });
+          await validationLog.flush();
+          record(
+            state,
+            "host_required_validation_blocked",
+            stage.blocked.reason,
+            {
+              agent: "tester",
+              attempt,
+              commandId: stage.blocked.obligationId,
+              reason: stage.blocked.code,
+            },
+          );
+          return {
+            status: "BLOCKED",
+            reason: requiredValidationBlockReason(stage.blocked),
+            commands: [],
+            failedAreas: [],
+            validationOutcomes: [],
+          };
         }
         await validationLog.flush();
-        const refreshed = currentVerifiedCommandResults(
-          state,
-          await repositoryEvidenceState(state),
-        );
-        const priorObligationMatches = await resolveValidationObligationMatches(
-          required,
-          refreshed.filter(
-            (item) =>
-              item.agent === "tester" &&
-              allowedCommandCategories("tester").includes(
-                item.command.purpose as "test" | "static",
-              ),
-          ),
-          state.cwd,
-        );
+        const refreshed = stage.current;
+        const required = stage.required;
+        const applicability = stage.applicability;
+        const priorObligationMatches = stage.matches;
         const priorObligationEvidence = new Set(
           priorObligationMatches.map((match) => match.executionId),
         );
@@ -1134,6 +1098,13 @@ export class PiRunner implements AgentRunner {
         );
         input.requiredValidationCommands = required;
         input.validationApplicability = applicability;
+        input.requiredValidationExecution = {
+          owner: "host",
+          executedObligationIds: stage.executed,
+          resolvedObligations: stage.matches,
+          policy:
+            "Only current host-verified Tester evidence satisfies TEST obligations; prior-phase evidence remains audit context.",
+        };
         // Keep team_command active for additional checks; its runtime approval
         // coordinator handles missing Tester authorization.
       }

@@ -330,6 +330,12 @@ export function commandTool(
             normalized.command,
             normalized.request,
             signal,
+            undefined,
+            {
+              mutation,
+              requiresExplicitMutationApproval: false,
+              requiresDependencyMutationApproval: false,
+            },
           );
           if (decision !== "allow" || signal?.aborted) {
             onDenial?.(decision === "deny" ? "denied" : "pending");
