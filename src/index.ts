@@ -6,12 +6,8 @@ import { loadConfig } from "./config/loader.ts";
 import { PiRunner } from "./agents/runner.ts";
 import { WorkflowEngine } from "./workflow/engine.ts";
 import { StateStore } from "./workflow/persistence.ts";
-import {
-  askUser,
-  askApproval,
-  askResearchQuestions,
-  checkAskCompatibility,
-} from "./integrations/pi-ask.ts";
+import { checkAskCompatibility } from "./integrations/pi-ask.ts";
+import { UserInteractionService } from "./integrations/user-interaction.ts";
 import { doctor } from "./integrations/doctor.ts";
 import { progress, renderProgress } from "./ui/progress.ts";
 import { ProgressRuntime } from "./ui/runtime.ts";
@@ -270,6 +266,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           throw new Error("Another repository has an active team workflow.");
         const state = active?.state ?? (await new StateStore(root).latest());
         if (!state) throw new Error("No team workflow in this repository.");
+        const interactions = new UserInteractionService(pi, ctx, () => state);
         const runtime =
           active?.runtime ??
           new ProgressRuntime(() => {
@@ -279,10 +276,10 @@ export default function teamExtension(pi: ExtensionAPI) {
           active?.engine ??
           new WorkflowEngine(root, new PiRunner(), {
             progress: (s) => runtime.bind(s),
-            ask: (q) => askUser(pi, ctx, q),
-            askResearchQuestions: (questions) =>
-              askResearchQuestions(pi, ctx, questions),
-            approve: (request) => askApproval(pi, ctx, request),
+            ask: (q, signal) => interactions.ask(q, signal),
+            askResearchQuestions: (questions, signal) =>
+              interactions.askResearchQuestions(questions, signal),
+            approve: (request, signal) => interactions.approve(request, signal),
             agentEvent: (event) => runtime.event(event),
           });
         runtime.bindSessions(engine.sessions);
@@ -292,7 +289,7 @@ export default function teamExtension(pi: ExtensionAPI) {
           : engine.retryConfirmation(state, role);
         let confirmed = false;
         if (message) {
-          const selected = await askApproval(pi, ctx, {
+          const selected = await interactions.approve({
             kind: "manualRetry",
             title: `Retry ${getAgentDisplayName(state.config, role)}?`,
             prompt: message,
@@ -364,6 +361,7 @@ export default function teamExtension(pi: ExtensionAPI) {
         const root = await projectRoot(ctx.cwd);
         const state = await new StateStore(root).latest();
         if (!state) throw new Error("No team workflow in this repository.");
+        const interactions = new UserInteractionService(pi, ctx, () => state);
         const plan = await getWorkflowRecoveryPlan(state, root);
         if (plan.kind !== "continue" && plan.kind !== "unconsumed-manual-retry")
           throw new Error(
@@ -378,10 +376,10 @@ export default function teamExtension(pi: ExtensionAPI) {
         const controller = new AbortController();
         const engine = new WorkflowEngine(root, new PiRunner(), {
           progress: (s) => runtime!.bind(s),
-          ask: (q) => askUser(pi, ctx, q),
-          askResearchQuestions: (questions) =>
-            askResearchQuestions(pi, ctx, questions),
-          approve: (request) => askApproval(pi, ctx, request),
+          ask: (q, signal) => interactions.ask(q, signal),
+          askResearchQuestions: (questions, signal) =>
+            interactions.askResearchQuestions(questions, signal),
+          approve: (request, signal) => interactions.approve(request, signal),
           agentEvent: (event) => runtime!.event(event),
         });
         runtime.bindSessions(engine.sessions);
@@ -444,10 +442,11 @@ export default function teamExtension(pi: ExtensionAPI) {
                 : undefined;
           const runtime =
             live?.state?.id === state.id ? live.runtime : undefined;
+          const interactions = new UserInteractionService(pi, ctx, () => state);
           if (runtime) progress(ctx, state, runtime);
           ctx.ui.notify(
             redactVisibleText(
-              `${renderProgress(state, runtime, true).join("\n")}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${
+              `${renderProgress(state, runtime, true).join("\n")}\n${interactions.status(state.config)}${runtime ? "" : "\nLive runtime details unavailable outside the active session."}${
                 recovery
                   ? `\n${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}${
                       recovery.actions.length > 1
@@ -577,6 +576,11 @@ export default function teamExtension(pi: ExtensionAPI) {
       // Reserve ownership synchronously, before waitForIdle can yield to a
       // second /team invocation. The background task releases this same entry.
       const entry: ActiveWorkflow = { controller, runtime };
+      const interactions = new UserInteractionService(
+        pi,
+        ctx,
+        () => entry.state,
+      );
       active = entry;
       controller.signal.addEventListener("abort", () => runtime.cancel(), {
         once: true,
@@ -587,10 +591,10 @@ export default function teamExtension(pi: ExtensionAPI) {
           throw new Error("Team startup was stopped before workflow creation.");
         const engine = new WorkflowEngine(ctx.cwd, new PiRunner(), {
           progress: (s) => runtime.bind(s),
-          ask: (q) => askUser(pi, ctx, q),
-          askResearchQuestions: (questions) =>
-            askResearchQuestions(pi, ctx, questions),
-          approve: (request) => askApproval(pi, ctx, request),
+          ask: (q, signal) => interactions.ask(q, signal),
+          askResearchQuestions: (questions, signal) =>
+            interactions.askResearchQuestions(questions, signal),
+          approve: (request, signal) => interactions.approve(request, signal),
           agentEvent: (event) => runtime.event(event),
         });
         runtime.bindSessions(engine.sessions);

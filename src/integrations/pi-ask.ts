@@ -62,6 +62,7 @@ async function invoke(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   params: unknown,
+  signal?: AbortSignal,
 ) {
   const { tool } = await checkAskCompatibility({
     appendEntry: pi.appendEntry.bind(pi),
@@ -69,7 +70,7 @@ async function invoke(
   const result = await tool.execute(
     `team-question-${Date.now()}`,
     params,
-    undefined,
+    signal,
     undefined,
     // pi-ask 1.2 uses the base extension context only; Pi 0.99 types tool contexts separately.
     ctx as ExtensionToolContext,
@@ -133,34 +134,41 @@ export async function askApproval(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   request: ApprovalRequest,
+  signal?: AbortSignal,
 ) {
   return approvalValues(
     request,
-    await invoke(pi, ctx, approvalParams(request)),
+    await invoke(pi, ctx, approvalParams(request), signal),
   );
 }
 export async function askUser(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   question: Question,
+  signal?: AbortSignal,
 ): Promise<string | undefined> {
-  const details = await invoke(pi, ctx, {
-    title: "Team requires input",
-    questions: [
-      {
-        id: "requirement",
-        prompt: question.question,
-        label: "Requirement",
-        options: [
-          {
-            value: "clarify",
-            label: "Provide clarification",
-            description: question.reason,
-          },
-        ],
-      },
-    ],
-  });
+  const details = await invoke(
+    pi,
+    ctx,
+    {
+      title: "Team requires input",
+      questions: [
+        {
+          id: "requirement",
+          prompt: question.question,
+          label: "Requirement",
+          options: [
+            {
+              value: "clarify",
+              label: "Provide clarification",
+              description: question.reason,
+            },
+          ],
+        },
+      ],
+    },
+    signal,
+  );
   const answer = details?.answers?.requirement;
   const text =
     answer?.customText || answer?.note || answer?.optionNotes?.clarify;
@@ -207,8 +215,14 @@ export async function askResearchQuestions(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   questions: string[],
+  signal?: AbortSignal,
 ) {
-  const details = await invoke(pi, ctx, researchQuestionParams(questions));
+  const details = await invoke(
+    pi,
+    ctx,
+    researchQuestionParams(questions),
+    signal,
+  );
   const answers = researchQuestionAnswers(questions, details);
   if (details && !answers)
     ctx.ui.notify(

@@ -222,6 +222,8 @@ Retrying a completed result asks for confirmation. The old result remains availa
 
 ```yaml
 ui:
+  approvals:
+    transport: terminal # terminal (default) or telegram
   progress:
     enabled: true
     refreshMs: 2000 # 500–10000
@@ -468,19 +470,39 @@ Use Pi's `/login` and `/model` to authenticate and inspect actual model IDs, or 
 
 Commit preparation scans only files selected for the commit. Recognized credential formats and private keys are mandatory blockers; reviewable heuristic findings require a decision through pi-ask. **Allow once** covers only the exact finding in the current in-memory commit attempt. **Allow for this workflow** persists that exact scanner, rule, repository path, file SHA-256, and finding fingerprint. **Allow all findings of this type in this file** persists the scanner, canonical finding type, and exact repository-relative path for the workflow. **Allow all findings of this type for this workflow** persists the scanner and finding type across the workflow's otherwise authorized commit files. **Deny** blocks the commit. File- and workflow-scoped type approvals cover matching findings already detected and matching findings encountered on later scans or retries, including after restart; other scanners, finding types, and (for file scope) paths still require their own decision. These approvals prevent repetitive prompts but never disable scanning or bypass file authorization, sensitive-path checks, Security Reviewer and Tester gates, repository drift checks, staging restrictions, or commit integrity checks. A changed file invalidates an exact-finding approval but not an explicitly granted finding-type scope. An unavailable or unanswered approval leaves the workflow in `WAITING_USER` and does not commit. Obvious static dummy passwords in test fixtures may be ignored by the built-in heuristic, but test files are still scanned for realistic credentials and high-confidence signatures.
 
-Only the Orchestrator presents user questions. Subagents return a validated `QUESTION_REQUEST`. The engine combines related questions, persists `WAITING_USER` before asking, invokes pi-ask's own `ask_user` implementation and resumes only after a nonempty submitted clarification. Use the built-in **Type your own** option or attach a substantive note; selecting the placeholder alone is not an answer. Cancellation and noninteractive mode leave the workflow waiting.
+Only the Orchestrator presents user questions. Subagents return a validated `QUESTION_REQUEST`. The engine combines related questions, persists `WAITING_USER` before asking, invokes the configured Pi-Team interaction transport and resumes only after a nonempty submitted clarification. In terminal mode this uses pi-ask's own `ask_user` implementation. Use the built-in **Type your own** option or attach a substantive note; selecting the placeholder alone is not an answer. Cancellation and noninteractive mode leave the workflow waiting.
 
 When Security Reviewer reports `ACCEPTED_RISK` findings, Pi-Team saves the exact finding set and reviewer attempt, then presents one Yes/No confirmation through pi-ask. The question includes each finding ID and the original reviewer evidence, truncated only when needed for question length. Status and diagnostic logs use metadata or redacted text. **Yes** records explicit user acceptance and resumes the configured next gate; **No** aborts the workflow. Confirmed vulnerabilities still follow remediation, and false positives need no approval. Accepted risks are never approved automatically.
 
 `/team-continue` reopens a pending risk confirmation after interruption and continues without another question if Yes was already saved. It also recovers workflows blocked by the earlier accepted-risk gate. `/team-retry securityReviewer` supersedes the previous pending or accepted decision, invalidates downstream results, and asks again if the fresh review reports accepted risks, even when the findings are identical.
 
-No custom question UI is implemented. `/ask-settings`, `/answer` and `/ask:replay` remain available through the installed package. `ask_user` requires Pi TUI mode for its rich form. Replay answers do not independently modify team state; `/team resume` reopens the persisted team question.
+No replacement terminal question UI is implemented. `/ask-settings`, `/answer` and `/ask:replay` remain available through the installed package. Terminal `ask_user` requires Pi TUI mode for its rich form. Replay answers do not independently modify team state; `/team resume` reopens the persisted team question.
 
 ### pi-ask compatibility
 
 Tested with **1.2.0**; the adapter currently accepts `>=1.2.0 <1.3.0` and also verifies the required file, export and actual `ask_user` registration. The package exposes its Pi extension entry point, but no documented public host-call API. The isolated adapter in `src/integrations/pi-ask.ts` therefore captures `registerAskTool` from `src/ask-tool.ts`; no other production workflow module imports pi-ask internals. Its own UI, selection contract and result normalization remain in use.
 
 Pi session startup, `/team doctor` and `npm run doctor` check availability/version/registration and give an actionable error before workflow use. Review a new minor version's API, update the range intentionally, and rerun compatibility plus TUI tests before upgrading. The range is a compatibility policy, not a guarantee about untested patch releases.
+
+### Telegram interaction transport
+
+Pi-Team-owned approvals and questions can be routed through the separately installed `pi-ask-user-telegram` extension:
+
+```yaml
+ui:
+  approvals:
+    transport: telegram
+```
+
+`terminal` is the default, including for every existing configuration without `ui.approvals`. Telegram mode supports runtime command approval, exact contract-path and sensitive-file access, dirty-path selection, contract extensions, configuration drift, retry/recovery decisions, security and Pentest decisions, credential findings, partial-commit decisions, ordinary requirement questions, and Researcher clarification questions. It does not redirect unrelated Pi core dialogs or prompts owned by other extensions.
+
+Configure `PI_TELEGRAM_BOT_TOKEN`, `PI_TELEGRAM_CHAT_ID`, and `PI_TELEGRAM_USER_ID` in the environment that launches Pi, install/enable `pi-ask-user-telegram`, and restart Pi. The optional poll/ordinary-tool timeout variables are documented by that extension. Pi-Team programmatic requests retain their existing no-timeout behavior; workflow abort, agent retry, session shutdown, or explicit Telegram cancellation invalidates the active request. `/telegram-status` reports the shared extension, while `/team-status` shows the selected transport, shared service state, failure reason, and pending count without credentials.
+
+The extensions share the Telegram extension's one authenticated poller through Pi 1.4's process-wide extension event bus and versioned `pi-ask-user-telegram:interaction-service:v1` protocol. Pi-Team never creates a bot client or obtains the bot token. Telegram buttons return opaque request correlation plus internal decision IDs; Pi-Team then validates the decision against the current domain request and its existing workflow, role, command/path, attempt, and commit-plan checks. A generic affirmative or custom-text reply never grants approval. Multi-select dirty-path approvals remain edit-only and do not grant commit ownership. Partial commit choices still act only on the persisted, revalidated eligible-file plan.
+
+Every approval exposes **View details** before its decision buttons. Long payloads are sent as numbered messages without silently dropping content; if complete details cannot be delivered, the request fails closed. Clearly recognizable secrets are detected by the existing redactor and cause the Telegram request to be rejected before anything is sent, because a redacted command or decision would not be a complete review. An approval or question too large for the bounded redaction path is likewise rejected rather than sent incompletely. Telegram transport failures are distinct from denial and never fabricate an answer. There is deliberately no automatic terminal fallback: when Telegram is missing, incompatible, stopped, or failed, Pi-Team reports an actionable error and preserves the pending workflow for `/team resume`, `/team-continue`, or the existing retry command after recovery. This prevents two simultaneously valid dialogs and makes late Telegram callbacks harmless.
+
+Pending domain requests remain in version-3 workflow state; bot credentials, Telegram message IDs, and callbacks are not persisted. After restart, use `/team resume <workflow-id>` (or the recovery action shown by `/team-status`) to present the still-valid pending domain request again. Old Telegram buttons belong to the disposed in-memory request and cannot resolve the replacement. Switch back by setting `transport: terminal` and restarting/reloading Pi; configuration drift is handled by the normal workflow rules.
 
 ### Serena
 

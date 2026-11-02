@@ -56,6 +56,8 @@ pentest:
 commit:
   runHooks: false
 ui:
+  approvals:
+    transport: terminal
   progress:
     enabled: true
     refreshMs: 2000

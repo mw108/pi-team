@@ -40,7 +40,10 @@ export interface CommandApprovalDependencies {
     meta: NonNullable<WorkflowState["history"][number]["meta"]>,
   ): Promise<void>;
   progress(state: WorkflowState): void;
-  approve?(request: ApprovalRequest): Promise<string[] | undefined>;
+  approve?(
+    request: ApprovalRequest,
+    signal?: AbortSignal,
+  ): Promise<string[] | undefined>;
   save(state: WorkflowState): Promise<void>;
 }
 
@@ -60,7 +63,7 @@ export class RuntimeCommandApprovalCoordinator {
     });
     try {
       return await Promise.race([
-        this.deps.approve?.(request) ?? Promise.resolve(undefined),
+        this.deps.approve?.(request, signal) ?? Promise.resolve(undefined),
         aborted,
       ]);
     } finally {

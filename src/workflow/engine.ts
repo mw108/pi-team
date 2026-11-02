@@ -202,11 +202,15 @@ const mutatingRoles: Role[] = [
 ];
 export interface EngineUI {
   progress(state: WorkflowState): void;
-  ask(question: Question): Promise<string | undefined>;
+  ask(question: Question, signal?: AbortSignal): Promise<string | undefined>;
   askResearchQuestions?(
     questions: string[],
+    signal?: AbortSignal,
   ): Promise<{ question: string; answer: string }[] | undefined>;
-  approve?(request: ApprovalRequest): Promise<string[] | undefined>;
+  approve?(
+    request: ApprovalRequest,
+    signal?: AbortSignal,
+  ): Promise<string[] | undefined>;
   agentEvent?(event: AgentEvent): void;
 }
 export class WorkflowEngine {
@@ -417,8 +421,8 @@ export class WorkflowEngine {
     persistAttempt: (state, event, detail, meta) =>
       this.persistAttempt(state, event, detail, meta),
     progress: (state) => this.ui.progress(state),
-    approve: (request) =>
-      this.ui.approve?.(request) ?? Promise.resolve(undefined),
+    approve: (request, signal) =>
+      this.ui.approve?.(request, signal) ?? Promise.resolve(undefined),
     save: (state) => this.store.save(state),
   });
   private runtimeApprovalPrompt(
@@ -3173,7 +3177,7 @@ export class WorkflowEngine {
           request.options = request.options.filter(
             (option) => option.value !== "allow_once",
           );
-          const selected = await this.ui.approve?.(request);
+          const selected = await this.ui.approve?.(request, signal);
           const choice = selected?.length === 1 ? selected[0] : undefined;
           if (
             !choice ||
@@ -3233,7 +3237,7 @@ export class WorkflowEngine {
           request.options = request.options.filter(
             (option) => option.value !== "allow_once",
           );
-          const selected = await this.ui.approve?.(request);
+          const selected = await this.ui.approve?.(request, signal);
           const choice = selected?.length === 1 ? selected[0] : undefined;
           if (
             !choice ||
@@ -3307,7 +3311,7 @@ export class WorkflowEngine {
           request.options = request.options.filter(
             (option) => option.value !== "allow_once",
           );
-          const selected = await this.ui.approve?.(request);
+          const selected = await this.ui.approve?.(request, signal);
           const choice = selected?.length === 1 ? selected[0] : undefined;
           if (
             !choice ||
@@ -3524,6 +3528,7 @@ export class WorkflowEngine {
             try {
               selected = await this.ui.approve?.(
                 this.contractExtensionPrompt(pending),
+                signal,
               );
             } catch {
               await this.store.save(s);
@@ -3703,6 +3708,7 @@ export class WorkflowEngine {
             try {
               selected = await this.ui.approve?.(
                 credentialFindingPrompt(pending),
+                signal,
               );
             } catch {
               await this.store.save(s);
@@ -3880,23 +3886,26 @@ export class WorkflowEngine {
             }
             let selected: string[] | undefined;
             try {
-              selected = await this.ui.approve?.({
-                kind: "securityRisk",
-                title: "Review accepted security risks",
-                prompt: securityRiskQuestion(review),
-                options: [
-                  {
-                    value: "yes",
-                    label: "Yes",
-                    description: "Accept the displayed risks and continue",
-                  },
-                  {
-                    value: "no",
-                    label: "No",
-                    description: "Abort the workflow",
-                  },
-                ],
-              });
+              selected = await this.ui.approve?.(
+                {
+                  kind: "securityRisk",
+                  title: "Review accepted security risks",
+                  prompt: securityRiskQuestion(review),
+                  options: [
+                    {
+                      value: "yes",
+                      label: "Yes",
+                      description: "Accept the displayed risks and continue",
+                    },
+                    {
+                      value: "no",
+                      label: "No",
+                      description: "Abort the workflow",
+                    },
+                  ],
+                },
+                signal,
+              );
             } catch (error) {
               record(
                 s,
@@ -3946,7 +3955,10 @@ export class WorkflowEngine {
           }
           if (s.pendingResearchQuestions?.length && !s.pendingApproval) {
             const questions = s.pendingResearchQuestions;
-            const answers = await this.ui.askResearchQuestions?.(questions);
+            const answers = await this.ui.askResearchQuestions?.(
+              questions,
+              signal,
+            );
             if (!answers) {
               await this.store.save(s);
               break;
@@ -3989,7 +4001,7 @@ export class WorkflowEngine {
               break;
             }
             const request = s.pendingApproval;
-            const selected = await this.ui.approve?.(request);
+            const selected = await this.ui.approve?.(request, signal);
             if (selected === undefined) {
               await this.store.save(s);
               break;
@@ -4423,7 +4435,7 @@ export class WorkflowEngine {
             block(s, "User-question limit reached");
             break;
           }
-          const answer = await this.ui.ask(s.pendingQuestion);
+          const answer = await this.ui.ask(s.pendingQuestion, signal);
           if (!answer) {
             await this.store.save(s);
             break;

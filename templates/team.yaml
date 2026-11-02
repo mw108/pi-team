@@ -61,6 +61,8 @@ commit:
   runHooks: false
   excludePaths: []
 ui:
+  approvals:
+    transport: terminal
   progress:
     enabled: true
     refreshMs: 2000

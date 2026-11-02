@@ -271,6 +271,12 @@ export const configSchema = z
       .default({}),
     ui: z
       .object({
+        approvals: z
+          .object({
+            transport: z.enum(["terminal", "telegram"]).default("terminal"),
+          })
+          .strict()
+          .default({}),
         progress: z
           .object({
             enabled: z.boolean().default(true),
