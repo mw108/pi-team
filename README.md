@@ -873,3 +873,14 @@ pi remove /absolute/path/to/pi-team/node_modules/pi-web-access
 ```
 
 Preserve or archive workflow states before removing them. Remove only the configuration entries created for this setup; do not delete unrelated user Pi/Serena/provider configuration. Serena predated this installation and should remain installed. Removing Pi Team does not push changes or rewrite repository history.
+
+# Telegram workflow outcome notifications
+
+When `ui.approvals.transport` is `telegram`, a durably saved blocked or aborted
+workflow is reported through the shared Telegram extension when it supports
+`notification-service:v1`. Delivery is best effort; failures are reported in
+the Pi UI and do not change the workflow. Notifications are deduplicated within
+the current session, but may be repeated after a restart. They currently have no
+interactive retry button. Inspect `/team-status` and use its recommended
+terminal recovery command, including `/team-retry` where applicable. Pi must be
+running to send a notification; this does not restart a terminated process.
