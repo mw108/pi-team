@@ -354,3 +354,104 @@ test("Tester PASS still renders as successful", async () => {
   assert.equal(state.phase, "DONE", state.blocker);
   assert.match(renderProgress(state).join("\n"), /✓ Tester/);
 });
+
+test("persisted Composer prerequisite rejection offers unavailable repair without mutation", async () => {
+  const { cwd, state, engine } = await blockedTester();
+  const { recordVerifiedCommandResult } =
+    await import("../src/workflow/verified-commands.ts");
+  const command = {
+    id: "detected-83acb1760320",
+    executable: "composer",
+    args: ["run", "test"],
+    purpose: "test" as const,
+    timeoutMs: 120000,
+  };
+  await writeFile(
+    join(cwd, "composer.json"),
+    JSON.stringify({
+      scripts: {
+        test: [
+          "@php artisan config:clear --ansi @no_additional_args",
+          "@php artisan test",
+        ],
+      },
+    }),
+  );
+  state.config.commands.push(command);
+  const evidence = await recordVerifiedCommandResult(
+    state,
+    command,
+    {
+      id: command.id,
+      exitCode: 1,
+      output:
+        'No arguments expected for "config:clear" command,\ngot "@no_additional_args".',
+      processStarted: true,
+      sandbox: {
+        mode: "none",
+        network: "host",
+        temporaryHome: true,
+        filesystemIsolation: false,
+      },
+    },
+    "tester",
+    2,
+  );
+  assert.ok(evidence);
+  // Legacy evidence has no captured wrapper; matching configuration hash permits deterministic interpretation.
+  delete evidence.wrapperDefinition;
+  state.verifiedCommandResults.push(evidence);
+  state.results.tester!.validationOutcomes = [
+    {
+      id: command.id,
+      validationType: "TEST",
+      validator: "UNKNOWN",
+      validatorSource: "unknown",
+      outcome: "INDETERMINATE",
+      reason: "Nonzero exit without a recognized validation outcome",
+      recoverable: false,
+      applicability: "REQUIRED",
+    },
+  ];
+  await engine.store.save(state);
+  const loaded = await engine.store.load(state.id);
+  assert.ok(loaded);
+  assert.equal(
+    loaded.verifiedCommandResults.at(-1)?.wrapperDefinition,
+    undefined,
+  );
+  const persistedPlan = await getWorkflowRecoveryPlan(loaded, cwd);
+  assert.equal(
+    persistedPlan.actions[0]?.repair?.classification,
+    "INVOCATION_ERROR",
+  );
+  const before = JSON.stringify(state);
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.equal(plan.actions[0]?.kind, "repair_wrapper_unavailable");
+  assert.equal(plan.actions[0]?.repair?.commandId, command.id);
+  assert.equal(plan.actions[0]?.repair?.executionId, evidence.executionId);
+  assert.equal(plan.actions[0]?.repair?.available, false);
+  assert.equal(plan.actions[0]?.command, undefined);
+  assert.match(plan.reason, /composer.json/);
+  assert.match(plan.reason, /INVOCATION_ERROR/);
+  assert.ok(
+    !plan.actions.some((action) => action.command?.startsWith("/team-retry")),
+  );
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(
+    state.results.tester!.validationOutcomes![0].outcome,
+    "INDETERMINATE",
+  );
+  const incomplete = structuredClone(state);
+  delete incomplete.verifiedCommandResults.at(-1)!.execution;
+  const insufficient = await getWorkflowRecoveryPlan(incomplete, cwd);
+  assert.match(insufficient.reason, /process-start provenance is unavailable/);
+  assert.ok(!insufficient.actions.some((action) => action.repair));
+  const successful = structuredClone(state);
+  successful.verifiedCommandResults.at(-1)!.exitCode = 0;
+  const passed = await getWorkflowRecoveryPlan(successful, cwd);
+  assert.ok(!passed.actions.some((action) => action.repair));
+  await writeFile(join(cwd, "composer.json"), "{}");
+  const stale = await getWorkflowRecoveryPlan(state, cwd);
+  assert.ok(!stale.actions.some((action) => action.repair));
+});

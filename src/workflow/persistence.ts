@@ -45,15 +45,14 @@ export function statePersistenceError(error: unknown) {
   }
   return undefined;
 }
-const ownProcessStart = new Date(
-  Date.now() - process.uptime() * 1000,
-).toISOString();
 async function processIdentity(pid: number): Promise<string | undefined> {
-  if (pid === process.pid) return ownProcessStart;
   try {
     return (
-      (await exec("ps", ["-o", "lstart=", "-p", String(pid)])).stdout.trim() ||
-      undefined
+      (
+        await exec("ps", ["-o", "lstart=", "-p", String(pid)], {
+          env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+        })
+      ).stdout.trim() || undefined
     );
   } catch {
     return undefined;
@@ -75,7 +74,14 @@ async function ownerAlive(old: {
   }
   if (old.processIdentity) {
     const current = await processIdentity(old.pid!);
-    if (current && current !== old.processIdentity) return false;
+    // Older hosts recorded their own identity as ISO but inspected peers using
+    // ps lstart. A format mismatch is not evidence that a live PID was reused.
+    if (
+      current &&
+      current !== old.processIdentity &&
+      !/^\d{4}-\d{2}-\d{2}T/.test(old.processIdentity)
+    )
+      return false;
   }
   return true;
 }
@@ -83,6 +89,17 @@ export class StateStore {
   readonly dir: string;
   readonly legacyDir: string;
   private saveQueue = Promise.resolve();
+  private lockToken?: string;
+  async assertLockOwner(expected = this.lockToken) {
+    if (!expected) throw new Error("Workflow lock ownership is unavailable");
+    const current = JSON.parse(
+      await readFile(join(this.dir, "active.lock"), "utf8"),
+    );
+    if (current.token !== expected)
+      throw new Error(
+        "Workflow lock ownership changed; stale execution must stop",
+      );
+  }
   constructor(cwd: string) {
     const root = projectRootSync(cwd);
     this.dir = join(root, ".pi", "team", "state");
@@ -98,7 +115,10 @@ export class StateStore {
       sanitizeWorkflowStateText(candidate);
       const validated = validateState(candidate);
       sanitizeWorkflowStateText(state);
-      const pending = this.saveQueue.then(() => this.write(validated));
+      const expectedOwner = this.lockToken;
+      const pending = this.saveQueue.then(() =>
+        this.write(validated, expectedOwner),
+      );
       this.saveQueue = pending.catch(() => {});
       await pending;
     } catch (error) {
@@ -106,7 +126,8 @@ export class StateStore {
       throw new StatePersistenceError(state.id, error);
     }
   }
-  private async write(state: WorkflowState) {
+  private async write(state: WorkflowState, expectedOwner?: string) {
+    if (expectedOwner) await this.assertLockOwner(expectedOwner);
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const path = this.path(state.id),
       temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -119,6 +140,7 @@ export class StateStore {
       } finally {
         await file.close();
       }
+      if (expectedOwner) await this.assertLockOwner(expectedOwner);
       await rename(temp, path);
       replaced = true;
     } finally {
@@ -285,7 +307,9 @@ export class StateStore {
     } finally {
       await unlink(temp).catch(() => {});
     }
+    this.lockToken = token;
     return async () => {
+      if (this.lockToken === token) this.lockToken = undefined;
       const current = await readFile(path, "utf8").catch(() => "");
       try {
         if (JSON.parse(current).token === token) await unlink(path);

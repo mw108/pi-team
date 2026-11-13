@@ -1,3 +1,18 @@
+import {
+  assessInterruptedGate,
+  formatInterruptedGateAssessment,
+} from "./interrupted-gate-assessment.ts";
+import {
+  classifyVerifiedCommand,
+  currentVerifiedCommandResults,
+  repositoryEvidenceState,
+  withVerifiedWrapperDefinition,
+} from "./verified-commands.ts";
+import {
+  requiredValidationCommands,
+  validationApplicability,
+} from "./validation-applicability.ts";
+import { commandKey } from "../agents/discovery.ts";
 import { loadConfig } from "../config/loader.ts";
 import { analyzeConfigDrift, driftSummary } from "../config/drift.ts";
 import { contractSchema, type Role } from "../agents/schemas.ts";
@@ -211,7 +226,15 @@ export function classifyManualRetry(
   if (!sourceAttempt) return ambiguous("Retry request has no source attempt.");
   const starts = state.history.filter(
     (event) =>
-      event.event === "agent_attempt_started" && event.meta?.agent === agent,
+      (event.event === "agent_attempt_started" ||
+        (event.event === "execution_reserved" &&
+          !state.history.some(
+            (h) =>
+              h.event === "agent_attempt_started" &&
+              h.meta?.agent === agent &&
+              h.meta.attempt === event.meta?.attempt,
+          ))) &&
+      event.meta?.agent === agent,
   );
   const sourceStarts = starts.filter(
     (event) => event.meta?.attempt === sourceAttempt,
@@ -223,15 +246,30 @@ export function classifyManualRetry(
       event.meta?.agent === agent &&
       event.meta.attempt === sourceAttempt,
   );
-  if (sourceStarts.length !== 1 || terminals.length !== 1)
+  const recovery = state.history.filter(
+    (e) =>
+      e.event === "interrupted_agent_recovery_accepted" &&
+      e.meta?.agent === agent &&
+      e.meta.attempt === sourceAttempt,
+  );
+  const crashRecovery =
+    ((agent === "pentester" && phase === "PENTEST") ||
+      (agent === "tester" && phase === "TEST")) &&
+    terminals.length === 0 &&
+    recovery.length === 1 &&
+    state.history.indexOf(recovery[0]) < requestIndex &&
+    state.history.indexOf(recovery[0]) > state.history.indexOf(sourceStarts[0]);
+  if (sourceStarts.length !== 1 || (terminals.length !== 1 && !crashRecovery))
     return ambiguous("Source attempt lifecycle is incomplete or ambiguous.");
   if (
-    state.history.indexOf(sourceStarts[0]) >=
-      state.history.indexOf(terminals[0]) ||
+    (!crashRecovery &&
+      state.history.indexOf(sourceStarts[0]) >=
+        state.history.indexOf(terminals[0])) ||
     state.history.indexOf(sourceStarts[0]) >= requestIndex
   )
     return ambiguous("Retry request does not follow the source attempt start.");
   if (
+    !crashRecovery &&
     state.history
       .slice(state.history.indexOf(sourceStarts[0]) + 1, requestIndex + 1)
       .filter(
@@ -272,6 +310,7 @@ export function classifyManualRetry(
 
 export type RecoveryAction = {
   kind:
+    | "repair_wrapper_unavailable"
     | "continue"
     | "retry"
     | "retry_keep"
@@ -280,7 +319,22 @@ export type RecoveryAction = {
     | "retry_revalidate"
     | "resume"
     | "abort";
-  command: string;
+  command?: string;
+  description?: string;
+  repair?: {
+    available: false;
+    workflowId: string;
+    commandId: string;
+    executable: string;
+    argv: string[];
+    exitCode: number;
+    classification: "INVOCATION_ERROR";
+    configuration: "composer.json";
+    executionId: string;
+    mechanism: "authorized_implementor_contract_extension";
+    interpretation: "host_reclassification";
+    evidence: string;
+  };
 };
 export type QualityGateBlocker =
   | {
@@ -411,10 +465,126 @@ type BaseRecoveryPlan =
     }
   | { kind: "unconsumed-manual-retry"; agentId: Role; reason: string }
   | { kind: "interrupted-mutation"; agentId: Role; reason: string }
+  | {
+      kind: "interrupted-quality-gate";
+      agentId: "pentester" | "tester";
+      attempt: number;
+      reason: string;
+    }
   | { kind: "waiting-user" | "unsafe" | "none"; reason: string };
 export type WorkflowRecoveryPlan = BaseRecoveryPlan & {
   actions: RecoveryAction[];
 };
+
+/** A crash is recognizable only with an exact phase, blocker and lifecycle. */
+export function interruptedQualityGate(
+  state: WorkflowState,
+  agent: "pentester" | "tester",
+): number | undefined {
+  const phase = agent === "pentester" ? "PENTEST" : "TEST";
+  if (
+    state.phase !== "BLOCKED" ||
+    !state.blocker?.startsWith(`Interrupted ${phase};`) ||
+    state.commit ||
+    state.results[agent]
+  )
+    return undefined;
+  if (state.history.findLast((e) => e.event === "blocked")?.phase !== phase)
+    return undefined;
+  if (
+    state.inFlight &&
+    (state.inFlight.phase !== phase ||
+      state.inFlight.roles.length !== 1 ||
+      state.inFlight.roles[0] !== agent)
+  )
+    return undefined;
+  if (
+    state.manualRetry &&
+    (state.manualRetry.agent !== agent || state.manualRetry.phase !== phase)
+  )
+    return undefined;
+  const starts = state.history.filter(
+    (e) =>
+      (e.event === "agent_attempt_started" ||
+        (e.event === "execution_reserved" &&
+          !state.history.some(
+            (h) =>
+              h.event === "agent_attempt_started" &&
+              h.meta?.agent === agent &&
+              h.meta.attempt === e.meta?.attempt,
+          ))) &&
+      e.meta?.agent === agent,
+  );
+  const last = starts.at(-1);
+  const attempt = last?.meta?.attempt;
+  if (
+    attempt &&
+    state.executions.some(
+      (e) =>
+        e.agent === agent && e.attempt === attempt && e.status === "COMPLETED",
+    )
+  )
+    return undefined;
+  if (
+    !attempt ||
+    last.phase !== phase ||
+    starts.filter((e) => e.meta?.attempt === attempt).length !== 1 ||
+    starts.some((e) => !e.meta?.attempt || e.meta.attempt > attempt)
+  )
+    return undefined;
+  if (
+    state.history.some(
+      (e) =>
+        (e.event === "agent_attempt_completed" ||
+          e.event === "agent_attempt_failed") &&
+        e.meta?.agent === agent &&
+        (!e.meta.attempt || e.meta.attempt >= attempt),
+    )
+  )
+    return undefined;
+  if (
+    state.history.some(
+      (e) =>
+        e.event === "interrupted_agent_recovery_accepted" &&
+        e.meta?.agent === agent &&
+        e.meta.attempt === attempt,
+    )
+  )
+    return undefined;
+  if (state.manualRetry) {
+    const requests = state.history.filter(
+      (e) =>
+        e.event === "agent_retry_requested_by_user" &&
+        e.meta?.agent === agent &&
+        e.meta.attempt === attempt,
+    );
+    const previousAcceptance = state.history.findLastIndex(
+      (e) =>
+        e.event === "interrupted_agent_recovery_accepted" &&
+        e.meta?.agent === agent &&
+        e.meta.attempt === attempt - 1,
+    );
+    const previousRequest = state.history.findLastIndex(
+      (e) =>
+        e.event === "agent_retry_requested_by_user" &&
+        e.meta?.agent === agent &&
+        e.meta.attempt === attempt - 1,
+    );
+    const consumedMarker =
+      requests.length === 0 &&
+      last.meta?.trigger === "manual_retry" &&
+      previousAcceptance >= 0 &&
+      previousRequest > previousAcceptance &&
+      previousRequest < state.history.indexOf(last);
+    if (
+      !consumedMarker &&
+      (requests.length !== 1 ||
+        state.history.indexOf(requests[0]) <= state.history.indexOf(last))
+    )
+      return undefined;
+  }
+  return attempt;
+}
 
 export function interruptedMutationRecovery(state: WorkflowState) {
   if (state.phase !== "BLOCKED") return undefined;
@@ -489,7 +659,10 @@ export function interruptedMutationRecovery(state: WorkflowState) {
 }
 
 export function recoveryAction(plan: WorkflowRecoveryPlan): string {
-  if (plan.actions.length) return plan.actions[0].command;
+  if (plan.actions.length)
+    return (
+      plan.actions[0].command ?? plan.actions[0].description ?? plan.reason
+    );
   if (plan.kind === "continue") return "/team-continue";
   if (plan.kind === "retry-agent") return `/team-retry ${plan.agentId}`;
   if (plan.kind === "interrupted-mutation")
@@ -704,6 +877,20 @@ async function planWorkflowRecovery(
       agentId: interrupted.agent,
       reason: `Recovery required: Implementor was interrupted during a mutating run.\nRepository: ${safe} safe to discard; ${ambiguous} ambiguous.\n${ambiguous ? `Inspect ambiguous paths: ${classification.ambiguous.join(", ")}\n` : recommendDiscard ? "Recommended: /team-retry implementor discard\n" : ""}Options: /team-retry implementor keep · /team-retry implementor discard · /team-abort implementor\nPlease inspect repository changes before retrying.`,
     };
+  }
+  for (const agent of ["pentester", "tester"] as const) {
+    const attempt = interruptedQualityGate(state, agent);
+    if (attempt) {
+      const assessment = await assessInterruptedGate(state, agent, attempt);
+      if (!assessment.eligible)
+        return unsafe(formatInterruptedGateAssessment(assessment));
+      return {
+        kind: "interrupted-quality-gate",
+        agentId: agent,
+        attempt,
+        reason: formatInterruptedGateAssessment(assessment),
+      };
+    }
   }
   const manual = classifyManualRetry(state);
   if (manual.kind === "unconsumed" && !state.inFlight) {
@@ -1127,6 +1314,87 @@ export async function getWorkflowRecoveryPlan(
   cwd: string,
   active = false,
 ): Promise<WorkflowRecoveryPlan> {
+  if (
+    !active &&
+    !state.inFlight &&
+    !state.manualRetry &&
+    !state.pendingApproval &&
+    !state.pendingQuestion &&
+    !state.pendingContractPaths.length &&
+    !state.pendingContractExtensions.length &&
+    !state.pendingRuntimeFiles.length &&
+    !state.pendingRuntimeCommands.length &&
+    !state.pendingResearchQuestions?.length &&
+    classifyQualityGateBlocker(state)?.kind === "owned" &&
+    state.results.tester?.status === "BLOCKED"
+  ) {
+    const required = requiredValidationCommands(
+      await validationApplicability(state),
+    );
+    const current = currentVerifiedCommandResults(
+      state,
+      await repositoryEvidenceState(state),
+    );
+    for (const item of current) {
+      if (
+        item.agent !== "tester" ||
+        !required.some(
+          (command) => commandKey(command) === item.commandIdentity,
+        )
+      )
+        continue;
+      const interpreted = await withVerifiedWrapperDefinition(item, cwd);
+      const outcome = classifyVerifiedCommand(interpreted);
+      if (
+        item.exitCode !== 0 &&
+        /No\s+arguments\s+expected\s+for/.test(
+          item.output + (item.stderrTail ?? ""),
+        ) &&
+        item.command.executable === "composer" &&
+        (!interpreted.wrapperDefinition ||
+          item.execution?.processStarted !== true)
+      ) {
+        return {
+          kind: "unsafe",
+          reason: `Cannot establish wrapper invocation failure for ${item.command.id} (execution ${item.executionId}): historical Composer script definition/hash or process-start provenance is unavailable. Required validation remains unresolved; restore matching evidence or obtain a fresh authorized execution.`,
+          actions: [],
+        };
+      }
+
+      if (
+        outcome.category !== "INVOCATION_ERROR" ||
+        !interpreted.wrapperDefinition ||
+        !outcome.reason.startsWith("Composer script")
+      )
+        continue;
+      const recommendation =
+        "Repair unavailable in this milestone: repair the Composer test script through an authorized Implementor/Contract-extension workflow, then rerun the exact required validation.";
+      return {
+        kind: "unsafe",
+        reason: `Required validation wrapper failed.\nCommand: ${formatCommandLine({ ...item.command, purpose: "test" })}\nCommand ID: ${item.command.id}\nExit code: ${item.exitCode}\nClassification: INVOCATION_ERROR\nCause: ${outcome.reason}\nAffected configuration: composer.json\n${recommendation}`,
+        actions: [
+          {
+            kind: "repair_wrapper_unavailable",
+            description: recommendation,
+            repair: {
+              available: false,
+              workflowId: state.id,
+              commandId: item.command.id,
+              executable: item.command.executable,
+              argv: [...item.command.args],
+              exitCode: item.exitCode,
+              classification: "INVOCATION_ERROR",
+              configuration: "composer.json",
+              executionId: item.executionId,
+              mechanism: "authorized_implementor_contract_extension",
+              interpretation: "host_reclassification",
+              evidence: outcome.reason,
+            },
+          },
+        ],
+      };
+    }
+  }
   const plan = await planWorkflowRecovery(state, cwd, active);
   if (active)
     return {
@@ -1162,6 +1430,10 @@ export async function getWorkflowRecoveryPlan(
     actions = [
       { kind: "retry_keep", command: `/team-retry ${plan.agentId} keep` },
       { kind: "retry_discard", command: `/team-retry ${plan.agentId} discard` },
+    ];
+  else if (plan.kind === "interrupted-quality-gate")
+    actions = [
+      { kind: "retry", command: `/team-retry ${plan.agentId} recover` },
     ];
   else if (plan.kind === "waiting-user")
     actions = [{ kind: "resume", command: `/team resume ${state.id}` }];

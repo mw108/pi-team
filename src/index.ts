@@ -8,7 +8,6 @@ import { WorkflowEngine } from "./workflow/engine.ts";
 import { StateStore } from "./workflow/persistence.ts";
 import { checkAskCompatibility } from "./integrations/pi-ask.ts";
 import { UserInteractionService } from "./integrations/user-interaction.ts";
-import { TelegramNotifications } from "./integrations/telegram-notifications.ts";
 import { doctor } from "./integrations/doctor.ts";
 import { progress, renderProgress } from "./ui/progress.ts";
 import { ProgressRuntime } from "./ui/runtime.ts";
@@ -66,22 +65,6 @@ async function finalText(state: WorkflowState) {
   return `Team ${state.phase}\nCurrent phase: ${state.phase}`;
 }
 export default function teamExtension(pi: ExtensionAPI) {
-  const notifications = new TelegramNotifications(pi);
-  async function notifyOutcome(
-    state: WorkflowState,
-    ctx: ExtensionCommandContext,
-  ) {
-    try {
-      const persisted = await new StateStore(state.cwd).load(state.id);
-      if (persisted.phase === state.phase)
-        await notifications.outcome(persisted);
-    } catch (error) {
-      ctx.ui.notify(
-        `Telegram notification failed: ${formatErrorForPiNotification(error)}`,
-        "warning",
-      );
-    }
-  }
   type ActiveWorkflow = {
     controller: AbortController;
     runtime: ProgressRuntime;
@@ -100,8 +83,6 @@ export default function teamExtension(pi: ExtensionAPI) {
     const task = Promise.resolve()
       .then(run)
       .then(async (finished) => {
-        if (finished.phase === "BLOCKED" || finished.phase === "ABORTED")
-          await notifyOutcome(finished, ctx);
         if (append)
           pi.appendEntry("pi-team:workflow", {
             id: finished.id,
@@ -243,7 +224,6 @@ export default function teamExtension(pi: ExtensionAPI) {
           if (role && interruptedMutationRecovery(state)?.agent === role)
             await engine.abortInterruptedRecovery(state, role);
           else await engine.abortPersisted(state, role);
-          if (state.phase === "ABORTED") await notifyOutcome(state, ctx);
           ctx.ui.notify(
             `Team workflow ${state.phase === "ABORTED" ? "aborted" : "recovery aborted"}; repository changes preserved.`,
             "info",
@@ -254,112 +234,119 @@ export default function teamExtension(pi: ExtensionAPI) {
       }
     },
   });
-  const executeRetry = async (args: string, ctx: ExtensionCommandContext) => {
-    let ownedRuntime: ProgressRuntime | undefined;
-    try {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      if (
-        parts.length < 1 ||
-        parts.length > 2 ||
-        !roles.includes(parts[0] as Role) ||
-        (parts[1] !== undefined &&
-          parts[1] !== "keep" &&
-          parts[1] !== "discard" &&
-          parts[1] !== "override" &&
-          parts[1] !== "revalidate")
-      )
-        throw new Error(
-          "Usage: /team-retry <agent-id> [keep|discard|override] or /team-retry <tester|pentester> revalidate",
-        );
-      const role = parts[0] as Role;
-      const mode = parts[1] as
-        "keep" | "discard" | "override" | "revalidate" | undefined;
-      if (continuationPending)
-        throw new Error("Workflow continuation is in progress.");
-      if (active && !active.state)
-        throw new Error("Team workflow startup is still in progress.");
-      const root = await projectRoot(ctx.cwd);
-      if (active?.state && active.state.cwd !== root)
-        throw new Error("Another repository has an active team workflow.");
-      const state = active?.state ?? (await new StateStore(root).latest());
-      if (!state) throw new Error("No team workflow in this repository.");
-      const interactions = new UserInteractionService(pi, ctx, () => state);
-      const runtime =
-        active?.runtime ??
-        new ProgressRuntime(() => {
-          if (runtime.state) progress(ctx, runtime.state, runtime);
-        });
-      const engine =
-        active?.engine ??
-        new WorkflowEngine(root, new PiRunner(), {
-          progress: (s) => runtime.bind(s),
-          ask: (q, signal) => interactions.ask(q, signal),
-          askResearchQuestions: (questions, signal) =>
-            interactions.askResearchQuestions(questions, signal),
-          approve: (request, signal) => interactions.approve(request, signal),
-          agentEvent: (event) => runtime.event(event),
-        });
-      runtime.bindSessions(engine.sessions);
-      if (!active) ownedRuntime = runtime;
-      const message = mode ? undefined : engine.retryConfirmation(state, role);
-      let confirmed = false;
-      if (message) {
-        const selected = await interactions.approve({
-          kind: "manualRetry",
-          title: `Retry ${getAgentDisplayName(state.config, role)}?`,
-          prompt: message,
-          options: [
-            {
-              value: "retry",
-              label: "Retry",
-              description: "Start a fresh agent attempt",
-            },
-            {
-              value: "cancel",
-              label: "Cancel",
-              description: "Keep the current result",
-            },
-          ],
-        });
-        if (!selected?.includes("retry")) {
-          ctx.ui.notify("Retry cancelled.", "info");
-          return;
-        }
-        confirmed = true;
-      }
-      const result = await engine.retryAgent(state, role, confirmed, mode);
-      ctx.ui.notify(
-        mode === "revalidate" && result === "prepared"
-          ? "Repository changes preserved; stale quality gates invalidated. Revalidation is starting at Code Review."
-          : `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "fresh attempt starting" : result === "queued" ? "retry queued" : "restarting"}.`,
-        "info",
-      );
-      if (result !== "prepared") return;
-      const controller = new AbortController();
-      active = { controller, runtime, state, engine };
-      runtime.configure(
-        state.config.ui.progress.refreshMs,
-        state.config.ui.progress.enabled,
-      );
-      runtime.bind(state);
-      try {
-        launch(active, () => engine.run(state, controller.signal), ctx);
-        ownedRuntime = undefined;
-      } catch (error) {
-        runtime.dispose();
-        active = undefined;
-        throw error;
-      }
-    } catch (e) {
-      ctx.ui.notify(formatErrorForPiNotification(e), "error");
-    } finally {
-      ownedRuntime?.dispose();
-    }
-  };
   pi.registerCommand("team-retry", {
     description:
-      "Retry an agent: /team-retry <agent-id> [keep|discard|override|revalidate]",
-    handler: executeRetry,
+      "Retry an agent: /team-retry <agent-id> [keep|discard|override|revalidate|recover]",
+    handler: async (args, ctx) => {
+      let ownedRuntime: ProgressRuntime | undefined;
+      try {
+        const parts = args.trim().split(/\s+/).filter(Boolean);
+        if (
+          parts.length < 1 ||
+          parts.length > 2 ||
+          !roles.includes(parts[0] as Role) ||
+          (parts[1] !== undefined &&
+            parts[1] !== "keep" &&
+            parts[1] !== "discard" &&
+            parts[1] !== "override" &&
+            parts[1] !== "revalidate" &&
+            parts[1] !== "recover")
+        )
+          throw new Error(
+            "Usage: /team-retry <agent-id> [keep|discard|override] or /team-retry <tester|pentester> <revalidate|recover>",
+          );
+        const role = parts[0] as Role;
+        const mode = parts[1] as
+          | "keep"
+          | "discard"
+          | "override"
+          | "revalidate"
+          | "recover"
+          | undefined;
+        if (continuationPending)
+          throw new Error("Workflow continuation is in progress.");
+        if (active && !active.state)
+          throw new Error("Team workflow startup is still in progress.");
+        const root = await projectRoot(ctx.cwd);
+        if (active?.state && active.state.cwd !== root)
+          throw new Error("Another repository has an active team workflow.");
+        const state = active?.state ?? (await new StateStore(root).latest());
+        if (!state) throw new Error("No team workflow in this repository.");
+        const interactions = new UserInteractionService(pi, ctx, () => state);
+        const runtime =
+          active?.runtime ??
+          new ProgressRuntime(() => {
+            if (runtime.state) progress(ctx, runtime.state, runtime);
+          });
+        const engine =
+          active?.engine ??
+          new WorkflowEngine(root, new PiRunner(), {
+            progress: (s) => runtime.bind(s),
+            ask: (q, signal) => interactions.ask(q, signal),
+            askResearchQuestions: (questions, signal) =>
+              interactions.askResearchQuestions(questions, signal),
+            approve: (request, signal) => interactions.approve(request, signal),
+            agentEvent: (event) => runtime.event(event),
+          });
+        runtime.bindSessions(engine.sessions);
+        if (!active) ownedRuntime = runtime;
+        const message = mode
+          ? undefined
+          : engine.retryConfirmation(state, role);
+        let confirmed = false;
+        if (message) {
+          const selected = await interactions.approve({
+            kind: "manualRetry",
+            title: `Retry ${getAgentDisplayName(state.config, role)}?`,
+            prompt: message,
+            options: [
+              {
+                value: "retry",
+                label: "Retry",
+                description: "Start a fresh agent attempt",
+              },
+              {
+                value: "cancel",
+                label: "Cancel",
+                description: "Keep the current result",
+              },
+            ],
+          });
+          if (!selected?.includes("retry")) {
+            ctx.ui.notify("Retry cancelled.", "info");
+            return;
+          }
+          confirmed = true;
+        }
+        const result = await engine.retryAgent(state, role, confirmed, mode);
+        ctx.ui.notify(
+          mode === "revalidate" && result === "prepared"
+            ? "Repository changes preserved; stale quality gates invalidated. Revalidation is starting at Code Review."
+            : `${getAgentDisplayName(state.config, role)} (${role}) ${result === "prepared" ? "retry prepared" : result === "queued" ? "retry queued" : "restarting"}.`,
+          "info",
+        );
+        if (result !== "prepared") return;
+        const controller = new AbortController();
+        active = { controller, runtime, state, engine };
+        runtime.configure(
+          state.config.ui.progress.refreshMs,
+          state.config.ui.progress.enabled,
+        );
+        runtime.bind(state);
+        try {
+          launch(active, () => engine.run(state, controller.signal), ctx);
+          ownedRuntime = undefined;
+        } catch (error) {
+          runtime.dispose();
+          active = undefined;
+          throw error;
+        }
+      } catch (e) {
+        ctx.ui.notify(formatErrorForPiNotification(e), "error");
+      } finally {
+        ownedRuntime?.dispose();
+      }
+    },
   });
   pi.registerCommand("team-continue", {
     description:
@@ -471,7 +458,9 @@ export default function teamExtension(pi: ExtensionAPI) {
                       recovery.actions.length > 1
                         ? `\nAlso available: ${recovery.actions
                             .slice(1)
-                            .map((action) => action.command)
+                            .map(
+                              (action) => action.command ?? action.description,
+                            )
                             .join(" · ")}`
                         : ""
                     }`

@@ -1,3 +1,7 @@
+import {
+  reserveChild,
+  captureProcessIdentity,
+} from "../workflow/execution-identity.ts";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { CommandOutputCollector } from "./command-output.ts";
@@ -94,6 +98,7 @@ export async function execute(
     network: "deny",
     pentestNetwork: "deny",
   },
+  executionId = randomUUID(),
 ): Promise<CommandEvidence> {
   if (signal?.aborted) throw new Error("Command aborted");
   const startedAt = Date.now();
@@ -103,7 +108,10 @@ export async function execute(
     throw new Error("Command aborted");
   }
   try {
+    const tracked = await reserveChild(executionId, command.id);
+    await tracked?.update("STARTING");
     return await new Promise((resolve, reject) => {
+      let startup: Promise<unknown> = Promise.resolve();
       const child = spawn(prepared.executable, prepared.args, {
         cwd: prepared.cwd,
         env: prepared.env,
@@ -128,13 +136,40 @@ export async function execute(
           else child.kill("SIGKILL");
         } catch {}
       };
+      child.once("spawn", () => {
+        startup = captureProcessIdentity(
+          child.pid!,
+          process.platform !== "win32",
+        ).then((identity) => {
+          // If the original handle exited during /proc reads, a reused PID
+          // could now name another process. Retain uncertainty, not its identity.
+          if (child.exitCode !== null || child.signalCode !== null)
+            identity.creation = undefined;
+          return tracked?.update("RUNNING", identity);
+        });
+        void startup.catch((error) => {
+          // This is our ChildProcess handle. Do not signal a possibly reused
+          // process-group number after the leader has already exited.
+          if (child.exitCode === null && child.signalCode === null)
+            child.kill("SIGKILL");
+          reject(error);
+        });
+      });
       const timer = setTimeout(() => {
         collector.timeout();
         timedOut = true;
         kill();
       }, command.timeoutMs);
       signal?.addEventListener("abort", kill, { once: true });
-      child.on("error", (e) => {
+      child.on("error", async (e) => {
+        try {
+          await tracked?.update("TERMINATED", undefined, -1);
+        } catch (error) {
+          if (child.exitCode === null && child.signalCode === null)
+            child.kill("SIGKILL");
+          reject(error);
+          return;
+        }
         clearTimeout(timer);
         signal?.removeEventListener("abort", kill);
         if (prepared.sandbox.mode === "bubblewrap") {
@@ -166,7 +201,14 @@ export async function execute(
         }
         reject(e);
       });
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
+        try {
+          await startup;
+          await tracked?.update("TERMINATED", undefined, code);
+        } catch (error) {
+          reject(error);
+          return;
+        }
         clearTimeout(timer);
         signal?.removeEventListener("abort", kill);
         const { output, stdout, stderr } = collector.finish();
@@ -181,6 +223,7 @@ export async function execute(
           return;
         }
         resolve({
+          executionId,
           id: command.id,
           exitCode: code ?? -1,
           output,
@@ -426,7 +469,13 @@ export function commandTool(
           ? undefined
           : await repositorySnapshot(cwd);
       try {
-        result = await execute(command, cwd, signal, config.execution.sandbox);
+        result = await execute(
+          command,
+          cwd,
+          signal,
+          config.execution.sandbox,
+          executionId,
+        );
       } catch (error) {
         if (!(error instanceof ExecutableResolutionError)) throw error;
         failedStarts.add(commandKey(command));

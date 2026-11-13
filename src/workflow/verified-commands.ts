@@ -91,6 +91,7 @@ export type EffectiveValidationIdentity = z.infer<
 >;
 
 export const verifiedCommandResultSchema = z.object({
+  wrapperDefinition: z.array(z.string()).optional(),
   executionId: z.string().uuid(),
   command: z.object({
     id: z.string(),
@@ -550,6 +551,48 @@ export async function resolveStaticValidatorIdentity(
   }
 }
 
+/** Recover wrapper context only from the exact configuration hash observed by the host. */
+export async function withVerifiedWrapperDefinition(
+  result: VerifiedCommandResult,
+  cwd: string,
+): Promise<VerifiedCommandResult> {
+  if (
+    executableName(result.command.executable) !== "composer" ||
+    result.command.args.length !== 2 ||
+    result.command.args[0] !== "run" ||
+    !result.repoState.composerJsonHash
+  )
+    return result;
+  try {
+    const source = await readFile(join(cwd, "composer.json"));
+    if (
+      source.length > 262144 ||
+      createHash("sha256").update(source).digest("hex") !==
+        result.repoState.composerJsonHash
+    )
+      return result;
+    const definition = JSON.parse(source.toString()).scripts?.[
+      result.command.args[1]
+    ];
+    if (
+      Array.isArray(definition) &&
+      definition.length === 2 &&
+      definition.every((item) => typeof item === "string") &&
+      /^@php artisan [a-zA-Z0-9:_-]+(?: [a-zA-Z0-9@:_=-]+)*$/.test(
+        definition[0],
+      ) &&
+      definition[1] === "@php artisan test"
+    )
+      return {
+        ...result,
+        wrapperDefinition: definition.map(redactVisibleText),
+      };
+  } catch {
+    /* Missing historical configuration must not be invented. */
+  }
+  return result;
+}
+
 export async function recordVerifiedCommandResult(
   state: WorkflowState,
   command: Command,
@@ -582,39 +625,42 @@ export async function recordVerifiedCommandResult(
             : {}),
         }
       : undefined;
-  return {
-    executionId: evidence.executionId ?? randomUUID(),
-    command: {
-      id: command.id,
-      executable: command.executable,
-      args: [...command.args],
-      purpose: command.purpose,
-      ...(command.verificationId
-        ? { verificationId: command.verificationId }
-        : {}),
+  return withVerifiedWrapperDefinition(
+    {
+      executionId: evidence.executionId ?? randomUUID(),
+      command: {
+        id: command.id,
+        executable: command.executable,
+        args: [...command.args],
+        purpose: command.purpose,
+        ...(command.verificationId
+          ? { verificationId: command.verificationId }
+          : {}),
+      },
+      commandIdentity: commandKey(command),
+      ...(validatorIdentity ? { validatorIdentity } : {}),
+      ...(effectiveValidationIdentity ? { effectiveValidationIdentity } : {}),
+      agent,
+      attempt,
+      exitCode: evidence.exitCode,
+      output: redactVisibleText(evidence.output.slice(-4000)),
+      stdoutTail: evidence.stdout
+        ? redactVisibleText(evidence.stdout.slice(-4000))
+        : undefined,
+      stderrTail: evidence.stderr
+        ? redactVisibleText(evidence.stderr.slice(-4000))
+        : undefined,
+      completedAt: evidence.completedAt ?? new Date().toISOString(),
+      repoState,
+      execution: {
+        processStarted: evidence.processStarted,
+        platform: evidence.platform,
+        requestedExecutable: evidence.requestedExecutable,
+        resolvedExecutable: evidence.resolvedExecutable,
+      },
     },
-    commandIdentity: commandKey(command),
-    ...(validatorIdentity ? { validatorIdentity } : {}),
-    ...(effectiveValidationIdentity ? { effectiveValidationIdentity } : {}),
-    agent,
-    attempt,
-    exitCode: evidence.exitCode,
-    output: redactVisibleText(evidence.output.slice(-4000)),
-    stdoutTail: evidence.stdout
-      ? redactVisibleText(evidence.stdout.slice(-4000))
-      : undefined,
-    stderrTail: evidence.stderr
-      ? redactVisibleText(evidence.stderr.slice(-4000))
-      : undefined,
-    completedAt: evidence.completedAt ?? new Date().toISOString(),
-    repoState,
-    execution: {
-      processStarted: evidence.processStarted,
-      platform: evidence.platform,
-      requestedExecutable: evidence.requestedExecutable,
-      resolvedExecutable: evidence.resolvedExecutable,
-    },
-  };
+    state.cwd,
+  );
 }
 
 export function isVerifiedCommandResultCurrent(
@@ -871,6 +917,10 @@ export async function matchValidationObligation(
       evidence: ["Executable and argument identity match exactly."],
     };
 
+  // A required package script is a distinct gate: executing its underlying
+  // validator does not prove that the wrapper itself works.
+  if (packageScriptRequest(required)) return;
+
   const [requiredIdentity, executedIdentity, requiredScope, executedScope] =
     await Promise.all([
       resolveEffectiveValidationIdentity(required, cwd),
@@ -1075,6 +1125,34 @@ export function classifyVerifiedCommand(
   const output = withoutAnsi(
     [result.output, result.stdoutTail, result.stderrTail].join("\n"),
   );
+  const consoleError = output.match(
+    /No\s+arguments\s+expected\s+for\s+"([a-zA-Z0-9:_-]+)"\s+command,\s*got\s+"([^"\r\n]+)"\./,
+  );
+  const definition = result.wrapperDefinition;
+  if (
+    consoleError &&
+    result.execution?.processStarted === true &&
+    result.commandIdentity === commandKey(result.command) &&
+    executableName(result.command.executable) === "composer" &&
+    result.command.args.length === 2 &&
+    result.command.args[0] === "run" &&
+    definition?.length === 2 &&
+    definition[1] === "@php artisan test" &&
+    /^@php artisan [a-zA-Z0-9:_-]+(?: [a-zA-Z0-9@:_=-]+)*$/.test(
+      definition[0],
+    ) &&
+    definition[0].split(/\s+/)[2] === consoleError[1] &&
+    consoleError[1] !== "test" &&
+    definition[0].split(/\s+/).slice(3).includes(consoleError[2]) &&
+    !/PHPUnit|AssertionError|FAIL(?:URES|ED|!)|Tests?:|tests? (?:passed|failed)|Exception:/i.test(
+      output,
+    )
+  )
+    return outcome(
+      "INVOCATION_ERROR",
+      `Composer script ${result.command.args[1]}: Artisan ${consoleError[1]} rejected argument ${consoleError[2]}. Required validation did not complete. Observed diagnostic: ${consoleError[0]}`,
+      false,
+    );
   if (
     validationType === "DIAGNOSTIC" &&
     /(?:^|\n)\s*(?:PARSE ERROR|PHP Parse error:)|syntax error,\s*unexpected/i.test(

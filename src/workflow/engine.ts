@@ -1,4 +1,14 @@
 import {
+  runWithExecutionContext,
+  captureProcessIdentity,
+  inspectExecution,
+  type ExecutionContext,
+} from "./execution-identity.ts";
+import {
+  assessInterruptedGate,
+  formatInterruptedGateAssessment,
+} from "./interrupted-gate-assessment.ts";
+import {
   RuntimeCommandApprovalCoordinator,
   type AttemptControl,
 } from "./approval-coordinator.ts";
@@ -135,6 +145,7 @@ import { solverIds } from "../agents/schemas.ts";
 import {
   getWorkflowRecoveryPlan,
   classifyManualRetry,
+  interruptedQualityGate,
   interruptedMutationRecovery,
   pendingFixRequirements,
   recoverableAnsweredImplementorRewind,
@@ -481,9 +492,17 @@ export class WorkflowEngine {
   ) {
     if (this.persistenceFailure) throw this.persistenceFailure;
     try {
+      const execution = state.executions.find(
+        (e) => e.agent === meta.agent && e.attempt === meta.attempt,
+      );
+      if (execution && event === "agent_attempt_completed")
+        execution.status = "COMPLETED";
+      if (execution && event === "agent_attempt_failed")
+        execution.status = "INTERRUPTED";
       record(state, event, detail, meta);
-      const snapshot = structuredClone(state);
-      const pending = this.historyWrite.then(() => this.store.save(snapshot));
+      // Snapshot when the serialized write enters StateStore, not before older
+      // writes drain: identity callbacks must not overwrite newer state.
+      const pending = this.historyWrite.then(() => this.store.save(state));
       this.historyWrite = pending.catch(() => {});
       await pending;
     } catch (error) {
@@ -759,14 +778,15 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed = false,
-    mode?: "keep" | "discard" | "override" | "revalidate",
+    mode?: "keep" | "discard" | "override" | "revalidate" | "recover",
   ) {
     if (
       mode !== undefined &&
       mode !== "keep" &&
       mode !== "discard" &&
       mode !== "override" &&
-      mode !== "revalidate"
+      mode !== "revalidate" &&
+      mode !== "recover"
     )
       throw new Error(
         "Usage: /team-retry <agent-id> [keep|discard|override] or /team-retry <tester|pentester> revalidate",
@@ -778,7 +798,11 @@ export class WorkflowEngine {
     if (this.running) return this.retryAgentLocked(state, role, confirmed);
     const unlock = await this.store.lock();
     try {
-      if (mode === "override" || state !== this.ownedState) {
+      if (
+        mode === "override" ||
+        mode === "recover" ||
+        state !== this.ownedState
+      ) {
         const latest = await this.store.latest();
         if (!latest || latest.id !== state.id)
           throw new Error(
@@ -797,7 +821,7 @@ export class WorkflowEngine {
     state: WorkflowState,
     role: Role,
     confirmed: boolean,
-    mode?: "keep" | "discard" | "override" | "revalidate",
+    mode?: "keep" | "discard" | "override" | "revalidate" | "recover",
   ) {
     this.assertActiveAgent(state, role);
     const instructionDrift = await projectInstructionsDrift(
@@ -806,6 +830,151 @@ export class WorkflowEngine {
     );
     if (instructionDrift) throw new Error(instructionDrift);
     const label = getAgentDisplayName(state.config, role);
+    if (mode === "recover") {
+      if (role !== "pentester" && role !== "tester")
+        throw new Error(
+          "Crash recovery is available only for Pentester or Tester.",
+        );
+      if (
+        this.running ||
+        this.activeAttempts.size ||
+        this.sessions.list(state.id).length ||
+        this.retryRequests.size
+      )
+        throw new Error("Workflow or agent is already active.");
+      const plan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        plan.kind !== "interrupted-quality-gate" ||
+        plan.agentId !== role ||
+        interruptedQualityGate(state, role) !== plan.attempt
+      )
+        throw new Error(
+          `${plan.reason} Next safe action: ${plan.actions.map((a) => a.command).join(" · ")}`,
+        );
+      if (!state.gateRepositorySnapshot || !state.gateHashes)
+        throw new Error(
+          "Missing pre-attempt repository snapshot or gate hashes; inspect repository and abort.",
+        );
+      const assessment = await assessInterruptedGate(state, role, plan.attempt);
+      if (!assessment.eligible)
+        throw new Error(formatInterruptedGateAssessment(assessment));
+      const reviewedState = JSON.stringify(await this.store.load(state.id));
+      const verify = async () => {
+        const next = await assessInterruptedGate(state, role, plan.attempt);
+        if (
+          !next.eligible ||
+          next.fingerprint !== assessment.fingerprint ||
+          JSON.stringify(await this.store.load(state.id)) !== reviewedState
+        )
+          throw new Error(
+            `Repository changed or recovery conditions changed during review; request recovery again.\n${formatInterruptedGateAssessment(next)}`,
+          );
+      };
+      const commands = state.commandMutationEvidence.filter(
+        (e) => e.agent === role && e.attempt === plan.attempt,
+      );
+      const commandSummary = commands
+        .slice(0, 10)
+        .map(
+          (e) =>
+            `${formatCommandLine({ ...e, id: e.commandId })} (${e.risk}, ${e.attribution})`,
+        )
+        .join("\n");
+      const selected = await this.ui.approve?.({
+        kind: "manualRetry",
+        title: `Recover ${label} attempt ${plan.attempt}?`,
+        prompt: `${formatInterruptedGateAssessment(assessment)}\nProposed next action: ${assessment.status === "UNCHANGED" ? "Start a new attempt" : "Preserve changes and rerun CODE_REVIEW before retrying"}.\n${commands.length} recorded command mutation evidence item(s) exist for this attempt.${commandSummary ? `\n${commandSummary}` : ""}${commands.length > 10 ? "\nAdditional command evidence is in workflow history." : ""}\nThe interrupted agent may have affected databases, external services, ignored files, or files outside the repository; those effects cannot be excluded. Review them before retrying.`,
+        options: [
+          {
+            value: "recover",
+            label: "Recover",
+            description: "Start a new attempt after reviewing effects",
+          },
+          {
+            value: "cancel",
+            label: "Cancel",
+            description: "Leave the workflow blocked",
+          },
+        ],
+      });
+      if (selected?.length !== 1 || selected[0] !== "recover")
+        throw new Error("Recovery cancelled; workflow remains blocked.");
+      await verify();
+      const reviewedPlan = await getWorkflowRecoveryPlan(state, this.cwd);
+      if (
+        reviewedPlan.kind !== "interrupted-quality-gate" ||
+        reviewedPlan.agentId !== role ||
+        reviewedPlan.attempt !== plan.attempt
+      )
+        throw new Error(
+          "Recovery conditions changed during review; request recovery again.",
+        );
+      record(
+        state,
+        "interrupted_agent_recovery_accepted",
+        `${role} interrupted attempt ${plan.attempt} reviewed`,
+        { agent: role, attempt: plan.attempt },
+      );
+      const revalidate =
+        assessment.status === "ATTRIBUTABLE_TO_INTERRUPTED_ATTEMPT";
+      if (revalidate) {
+        if (state.results.codeReviewer)
+          state.results.previous_codeReviewer = state.results.codeReviewer;
+        delete state.results.codeReviewer;
+        this.invalidateDependents(state, "codeReviewer");
+      }
+      state.phase = revalidate
+        ? "CODE_REVIEW"
+        : role === "pentester"
+          ? "PENTEST"
+          : "TEST";
+      delete state.blocker;
+      delete state.inFlight;
+      if (revalidate) delete state.manualRetry;
+      else state.manualRetry = { agent: role, phase: state.phase };
+      record(
+        state,
+        "interrupted_agent_recovery_assessment",
+        JSON.stringify(assessment),
+      );
+      record(state, "agent_retry_requested_by_user", `${role} crash recovery`, {
+        agent: role,
+        attempt: plan.attempt,
+      });
+      await this.store.save(state);
+      // The lock is released before the command launches run(); force that
+      // handoff to reload in case another process consumed the decision.
+      this.ownedState = undefined;
+      return "prepared";
+    }
+    // An interrupted mutating attempt cannot be turned into an ordinary retry:
+    // its missing terminal event makes that retry impossible to resume safely.
+    // Leave the original evidence intact for explicit crash recovery.
+    if (
+      !this.running &&
+      !mode &&
+      (role === "tester" || role === "pentester") &&
+      classifyManualRetry(state).kind !== "unconsumed"
+    ) {
+      const starts = state.history.filter(
+        (event) =>
+          event.event === "agent_attempt_started" && event.meta?.agent === role,
+      );
+      const latest = starts.at(-1);
+      if (
+        latest?.meta?.attempt &&
+        !state.history.some(
+          (event) =>
+            (event.event === "agent_attempt_completed" ||
+              event.event === "agent_attempt_failed") &&
+            event.meta?.agent === role &&
+            event.meta.attempt === latest.meta?.attempt,
+        )
+      )
+        throw new Error(
+          `Interrupted ${role} attempt has no terminal event; automatic retry is disabled. Inspect repository and external effects before recovery.`,
+        );
+    }
     if (this.runningWorkflowId && this.runningWorkflowId !== state.id)
       throw new Error("Workflow mismatch for agent retry.");
     const control = this.activeAttempts.get(role);
@@ -1497,6 +1666,9 @@ export class WorkflowEngine {
     return (
       Math.max(
         0,
+        ...state.executions
+          .filter((e) => e.agent === role)
+          .map((e) => e.attempt),
         ...state.history
           .filter(
             (h) =>
@@ -1791,6 +1963,32 @@ export class WorkflowEngine {
       }
       const timeoutMs = getAgentTimeoutMs(s.config, role);
       const timeoutMode = timeoutMs === undefined ? "unlimited" : "limited";
+      if (role === "pentester" || role === "tester") {
+        for (const previous of authoritative.executions.filter(
+          (e) => e.agent === role,
+        )) {
+          // Only a durable recovery acceptance authorizes leaving an older execution behind.
+          const accepted = authoritative.history.some(
+            (h) =>
+              h.event === "interrupted_agent_recovery_accepted" &&
+              h.meta?.agent === role &&
+              h.meta.attempt === previous.attempt,
+          );
+          if (
+            !accepted &&
+            previous.status !== "COMPLETED" &&
+            previous.status !== "INTERRUPTED"
+          )
+            throw new Error(
+              `Execution ${previous.id} requires explicit interrupted recovery before another attempt.`,
+            );
+          const status = await inspectExecution(previous);
+          if (status.status !== "TERMINATED")
+            throw new Error(
+              `Execution ${previous.id}: ${status.status}. ${status.reason}`,
+            );
+        }
+      }
       const nextAttempt = this.nextAttempt(authoritative, role);
       const logged =
         s.config.logging.agentLogs.level === "off"
@@ -1825,13 +2023,6 @@ export class WorkflowEngine {
       signal?.addEventListener("abort", abortForWorkflow, { once: true });
       if (signal?.aborted) control.controller.abort();
       this.retryRequests.delete(role);
-      this.emitAgentEvent({
-        type: "start",
-        role,
-        attempt: attemptNumber,
-        trigger,
-        retryNumber,
-      });
       const started = Date.now();
       const calls = new Map<
         string,
@@ -1891,6 +2082,49 @@ export class WorkflowEngine {
           timeoutMode,
           trigger,
         });
+        let identityContext: ExecutionContext | undefined;
+        if (role === "pentester" || role === "tester") {
+          const execution = {
+            id: randomUUID(),
+            workflowId: authoritative.id,
+            agent:
+              role === "tester" ? ("tester" as const) : ("pentester" as const),
+            attempt: attemptNumber,
+            status: "RESERVED" as const,
+            owner: await captureProcessIdentity(),
+            children: [],
+          };
+          authoritative.executions.push(execution);
+          await this.persistAttempt(
+            authoritative,
+            "execution_reserved",
+            `Execution ${execution.id} reserved; runner not entered`,
+            {
+              agent: role,
+              attempt: attemptNumber,
+              executionId: execution.id,
+              trigger,
+            },
+          );
+          identityContext = {
+            update: async (change) => {
+              change(execution);
+              await this.persistAttempt(
+                authoritative,
+                "execution_identity_updated",
+                `Execution ${execution.id} identity updated`,
+                {
+                  agent: role,
+                  attempt: attemptNumber,
+                  executionId: execution.id,
+                },
+              );
+            },
+          };
+          await identityContext.update((e) => {
+            e.status = "STARTING";
+          });
+        }
         await this.persistAttempt(
           authoritative,
           "agent_attempt_started",
@@ -1904,6 +2138,13 @@ export class WorkflowEngine {
             trigger,
           },
         );
+        this.emitAgentEvent({
+          type: "start",
+          role,
+          attempt: attemptNumber,
+          trigger,
+          retryNumber,
+        });
         if (
           trigger === "manual_retry" &&
           authoritative.manualRetry?.agent === role
@@ -1920,9 +2161,13 @@ export class WorkflowEngine {
             identity: string;
           }
         >();
+        const runTracked: AgentRunner["run"] = (...args) =>
+          runWithExecutionContext(identityContext, () =>
+            this.runner.run(...args),
+          );
         const result = parseResult(
           role,
-          await this.runner.run(
+          await runTracked(
             role,
             s,
             control.controller.signal,
@@ -2567,7 +2812,10 @@ export class WorkflowEngine {
                   return false;
                 if (grant.count === 1) contractOnce.delete(token);
                 else
-                  contractOnce.set(token, { ...grant, count: grant.count - 1 });
+                  contractOnce.set(token, {
+                    ...grant,
+                    count: grant.count - 1,
+                  });
                 consumedContractOnce.set(toolCallId, {
                   operation,
                   path: grant.path,
@@ -2733,6 +2981,12 @@ export class WorkflowEngine {
             });
           await logged?.logger.flush();
           throw persistenceFailure;
+        }
+        if (control.intention) {
+          const execution = authoritative.executions.find(
+            (e) => e.agent === role && e.attempt === attemptNumber,
+          );
+          if (execution) execution.status = "INTERRUPTED";
         }
         if (control.intention === "superseded") {
           logged?.logger.append({
@@ -4537,7 +4791,18 @@ export class WorkflowEngine {
             continue;
           }
         }
-        if (s.phase === "PENTEST") {
+        if (
+          s.phase === "PENTEST" &&
+          !(
+            s.manualRetry?.agent === "pentester" &&
+            s.history.findLast(
+              (e) =>
+                e.event === "interrupted_agent_recovery_accepted" &&
+                e.meta?.agent === "pentester",
+            )?.meta?.attempt ===
+              this.nextAttempt(s, "pentester") - 1
+          )
+        ) {
           if (s.pentestCycle >= s.config.workflow.maxPentestCycles) {
             block(s, "Pentest cycle limit reached");
             break;

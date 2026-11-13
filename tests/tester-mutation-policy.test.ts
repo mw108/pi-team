@@ -144,7 +144,7 @@ test("explicit one-time authorization records synthetic install mutation provena
   else {
     await writeFile(
       executable,
-      '#!/usr/bin/env node\nrequire("fs").writeFileSync("package-lock.json", "{\\"lockfileVersion\\":3}\\n");\n',
+      '#!/usr/bin/env node\nimport("node:fs").then(fs => fs.writeFileSync("package-lock.json", "{\\"lockfileVersion\\":3}\\n"));\n',
     );
     await chmod(executable, 0o755);
   }

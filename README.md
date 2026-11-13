@@ -67,6 +67,8 @@ Then enter:
 /team-retry implementor keep
 /team-retry implementor discard
 /team-retry implementor override
+/team-retry pentester recover
+/team-retry tester recover
 /team-stop
 /team resume
 /team resume <workflow-id>
@@ -174,6 +176,38 @@ Use instance IDs such as `solver1`, `solver2`, `researcher`, and `codeReviewer`.
 `/team-retry <agent-id>` reruns a specific agent with an existing attempt or result. `/team resume` restores or replays persisted interrupted work after Pi restarts, following its existing read-only replay rules. `/team-continue` moves from a safely recoverable BLOCKED transition to the next incomplete phase without rerunning completed work.
 
 A Tester or Pentester can finish its model run but return `BLOCKED`. This leaves an unresolved quality gate, not a successful gate or an agent execution failure. `/team-status` shows `◉` and the gate reason; `✓` indicates a successful gate. When the blocker belongs to the gate and no separate decision is pending, `/team-retry <agent-id>` works even after Pi restarts. It archives the blocked result, preserves completed upstream gates and attempt history, and reruns the blocked gate. `/team-continue` lists that retry command as an actionable recovery option. If blocker ownership is ambiguous or a separate blocker exists, retry leaves the blocker intact.
+
+After a Pi or OS crash, an interrupted Pentester or Tester is not replayed automatically: either agent can run commands with side effects. For a uniquely recorded interruption, use `/team-retry pentester recover` or `/team-retry tester recover`. This recognizes the older deadlocked manual-retry marker without editing workflow JSON. Pi Team locks and reloads the workflow, checks lifecycle history, baseline and pre-gate HEAD, repository snapshots and gate hashes, and requests explicit confirmation. The review includes workflow/attempt identity, changed paths, command mutation execution IDs, and uncertainties. Repository or persisted-state changes during confirmation invalidate the decision.
+
+Unchanged repositories preserve completed upstream gates. Changed repositories require a unique, complete chain of host-observed command snapshot brackets for that exact interrupted attempt, authorized contract operations and normal paths. These brackets establish a candidate source, not exclusive authorship: concurrent editing cannot be ruled out. If accepted, content is preserved and CODE_REVIEW and its downstream gates run again before the interrupted agent. Missing or conflicting evidence, changed HEAD, renamed/staged content, protected paths, unknown/dependency mutation risk, and uncovered gate-hash drift remain blocked. Recovery never resets, cleans or discards files.
+
+Recovery acceptance and retry preparation are saved atomically under the workflow lock. No agent has started at that point. A prepared unchanged retry can resume after restart; once startup is durably recorded, another crash requires a fresh recovery review and a higher attempt number. Attributable changes resume at Code Review. Failure before the atomic save requires approval again. A completed lifecycle event without its final result is ambiguous and is not automatically replayed. This prevents duplicate starts in the tested locking/restart scenarios; it is not an exactly-once guarantee across arbitrary process crashes.
+
+Pi agent sessions run inside the host Node process. Pentester/Tester executions now have a durable UUID associated with workflow, role and attempt in version-3 state. A RESERVED record is saved before runner startup; STARTING is saved before entering the SDK. `agent_attempt_started` records engine startup, not proof that an OS child exists. The SDK session ID and RUNNING state are saved after session creation. Completion is saved with the terminal lifecycle event. Reservations participate in attempt numbering, so a crash before `agent_attempt_started` cannot reuse that attempt number. Expired SDK async contexts cannot append new command identities or mutate workflow state.
+
+The managed command tool saves a separate child reservation, then STARTING before `spawn`, records PID/creation identity on the spawn event, and saves exit status on close. Process creation and persistence are not atomic. If a crash occurs after spawn but before identity persistence, the durable child remains STARTING and UNKNOWN; recovery refuses replay. There is no command that overrides a verified ACTIVE or newly recorded UNKNOWN execution. Stop the owning run normally, allow known children to exit, and repeat inspection; do not kill a process merely because its PID appears in state.
+
+On Linux, verification uses hashed machine/PID-namespace identity, boot ID and `/proc/<pid>/stat` start ticks. PID reuse is distinguished from the original execution. A recorded process group is checked conservatively after leader exit: a remaining group without provable ancestry is UNKNOWN, not verified termination. Permission failures, other hosts/namespaces and unsupported platforms return UNKNOWN. Windows has no creation-identity verifier in this implementation; interrupted new Windows executions can therefore remain blocked. A direct child exit durably observed by the host is evidence for that child, not detached descendants. Legacy states without execution metadata retain explicit uncertainty and the existing manual review policy; metadata is never invented.
+
+Workflow locking remains authoritative across processes. Saves begun under a held lock retain its expected owner token and recheck ownership before publishing; losing ownership stops stale state publication and does not remove a replacement owner. Lock owners use the same OS start representation for self and peer inspection; legacy ISO identities remain conservatively live while their PID exists. Recovery acceptance and preparation are atomic under this lock, but reservation, SDK startup, OS spawn and identity persistence are separate boundaries. Tests prove duplicate prevention for the covered claims/races, not exactly-once external side effects. SDK extensions (including shared Serena workers), remote services and processes that escape the recorded group are not owned by this command tracker. Their termination cannot be inferred from host exit. No automatic replay or arbitrary process killing is introduced.
+
+| Crash boundary                                            | Durable evidence and restart behavior                                                              |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Before approval or before acceptance save                 | No durable authorization; ask again.                                                               |
+| After acceptance/preparation save                         | Prepared retry survives; reload and claim under the existing lock.                                 |
+| After reservation, before runner entry                    | Reservation consumes its attempt number; verify owner and require explicit recovery.               |
+| During SDK startup                                        | STARTING remains distinct from not-started; inspect owner and supported child identities.          |
+| After child spawn, before identity save                   | Child STARTING is UNKNOWN; replay blocked.                                                         |
+| After child identity save                                 | Inspect matching host/boot/start identity; ACTIVE cannot be overridden.                            |
+| After attempt-start persistence or during execution       | No automatic mutating replay; lifecycle, process, repository and approval checks remain mandatory. |
+| After exit, before terminal persistence                   | Do not invent completion; durable child exit and owner identity constrain further review.          |
+| After terminal persistence, before result/downstream save | Never restart the terminal attempt; missing final results remain ambiguous and blocked.            |
+
+The Linux SIGKILL regressions in `tests/linux-crash-recovery.test.ts` run real isolated hosts and managed children, synchronize over fixture-local Unix sockets, kill only the test host, and inspect the orphan from a separate restart process. They cover live children for both gates, child termination before restart, concurrent claims of the approved retry, and a real crash while the identity save is suspended after spawn. Physical child starts and agent starts are counted in an append-only fixture log. The controlled child uses the existing host-execution fixture mode so parent death cannot be confused with sandbox namespace teardown; production sandbox configuration is unchanged. These tests do not validate hardware power loss, SDK-owned workers, remote services, or escaped descendants.
+
+Exactly-once startup of SDK/external processes cannot be guaranteed across the spawn/persistence gap. A prepared retry is not an execution, and a reservation is not proof of successful startup. Unsupported SDK worker inspection and platform verification remain explicit limitations.
+
+Approval is recorded before a fresh attempt is prepared. If Pi stops after approval but before the attempt starts, `/team-continue` can resume the accepted retry after the usual checks. If the new attempt itself starts and is interrupted, inspect its effects and request recovery again; it is a separate attempt. Ambiguous lifecycle evidence is not treated as completion and cannot be overridden by this command.
 
 For a pending `FIX_REQUIREMENTS` question, `/team-status` shows the source agent and both choices: `/team resume <workflow-id>` answers the question and restarts from ORCHESTRATE; `/team-retry <source-agent> override` cancels that unanswered question and retries the source phase with existing requirements and upstream results. Technical implementation blockers use a separate typed recovery prompt: **Retry Implementor** preserves the Reviewer Contract, upstream results, partial working-tree files, and full-cycle counter; **Revise requirements** is the explicit route back through requirement clarification; **Abort workflow** stops without reverting files. `keep` and `discard` are only for interrupted repository mutation recovery. `override` does not change repository files or apply to research clarification and tool approvals. The `questionCount` counter counts answered questions, so an unanswered question canceled by override does not change it.
 
@@ -873,14 +907,3 @@ pi remove /absolute/path/to/pi-team/node_modules/pi-web-access
 ```
 
 Preserve or archive workflow states before removing them. Remove only the configuration entries created for this setup; do not delete unrelated user Pi/Serena/provider configuration. Serena predated this installation and should remain installed. Removing Pi Team does not push changes or rewrite repository history.
-
-# Telegram workflow outcome notifications
-
-When `ui.approvals.transport` is `telegram`, a durably saved blocked or aborted
-workflow is reported through the shared Telegram extension when it supports
-`notification-service:v1`. Delivery is best effort; failures are reported in
-the Pi UI and do not change the workflow. Notifications are deduplicated within
-the current session, but may be repeated after a restart. They currently have no
-interactive retry button. Inspect `/team-status` and use its recommended
-terminal recovery command, including `/team-retry` where applicable. Pi must be
-running to send a notification; this does not restart a terminated process.

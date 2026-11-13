@@ -2266,6 +2266,27 @@ test("verified Laravel and single-command Composer wrappers may cover the defaul
     purpose: "test" as const,
     timeoutMs: 120000,
   };
+  const directResult = await recordVerifiedCommandResult(
+    state,
+    required,
+    { id: required.id, exitCode: 0, output: "OK", sandbox },
+    "tester",
+    1,
+  );
+  assert.ok(directResult);
+  assert.equal(
+    await matchValidationObligation(
+      {
+        ...required,
+        id: "required-wrapper",
+        executable: "composer",
+        args: ["run", "test"],
+      },
+      directResult,
+      cwd,
+    ),
+    undefined,
+  );
   for (const [id, executable, args] of [
     ["artisan", "php", ["artisan", "test"]],
     ["composer-artisan", "composer", ["run", "test"]],
@@ -2633,4 +2654,76 @@ test("the reported Laravel PHPUnit incident is satisfied by equivalent persisted
     },
   );
   assert.equal(state.verifiedCommandResults.length, 1);
+});
+
+test("Composer prerequisite argument rejection requires verified wrapper context", () => {
+  const diagnostic =
+    'No arguments expected for "config:clear" command,\ngot "@no_additional_args".';
+  const item = classifiedResult(
+    "composer",
+    ["run", "test"],
+    "test",
+    1,
+    diagnostic,
+  );
+  item.execution = { processStarted: true };
+  item.wrapperDefinition = [
+    "@php artisan config:clear --ansi @no_additional_args",
+    "@php artisan test",
+  ];
+  for (const output of [
+    diagnostic,
+    "\x1b[31m" + diagnostic.replace("\n", "  \n  ") + "\x1b[0m",
+  ]) {
+    assert.equal(
+      classifyVerifiedCommand({ ...item, output }).category,
+      "INVOCATION_ERROR",
+    );
+  }
+  for (const output of [
+    "unknown failure",
+    diagnostic + "\nPHPUnit: 1 failed",
+    diagnostic + "\nTests: 1 failed",
+    diagnostic + "\nRuntimeException: failed",
+  ]) {
+    assert.notEqual(
+      classifyVerifiedCommand({ ...item, output }).category,
+      "INVOCATION_ERROR",
+    );
+  }
+  assert.equal(
+    classifyVerifiedCommand({ ...item, output: "", stderrTail: diagnostic })
+      .category,
+    "INVOCATION_ERROR",
+  );
+  assert.equal(
+    classifyVerifiedCommand({ ...item, output: "Tests: 1 failed, 104 passed" })
+      .category,
+    "TEST_FAILURE",
+  );
+  assert.equal(
+    classifyVerifiedCommand({
+      ...item,
+      output: diagnostic
+        .replaceAll("config:clear", "cache:clear")
+        .replaceAll("@no_additional_args", "extra"),
+      wrapperDefinition: [
+        "@php artisan cache:clear extra",
+        "@php artisan test",
+      ],
+    }).category,
+    "INVOCATION_ERROR",
+  );
+  assert.equal(
+    classifyVerifiedCommand({ ...item, exitCode: 0 }).category,
+    "PASS",
+  );
+  assert.equal(
+    classifyVerifiedCommand({ ...item, wrapperDefinition: undefined }).category,
+    "INDETERMINATE",
+  );
+  assert.equal(
+    classifyVerifiedCommand({ ...item, execution: undefined }).category,
+    "INDETERMINATE",
+  );
 });

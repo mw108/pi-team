@@ -1,3 +1,4 @@
+import { executionContext } from "../workflow/execution-identity.ts";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -751,6 +752,16 @@ export class PiRunner implements AgentRunner {
               ),
             ],
     });
+    try {
+      await executionContext.getStore()?.update((e) => {
+        e.sessionId = session.sessionId;
+        e.status = "RUNNING";
+      });
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
+
     await session.bindExtensions({ mode: "print" });
     // Pi defaults to parallel batches; sequential execution lets a failed-call
     // guard stop the remainder of a response before more tools run.

@@ -1,3 +1,4 @@
+import { executionIdentitySchema } from "./execution-identity.ts";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import {
@@ -545,6 +546,7 @@ export const stateSchema = z.object({
     .optional(),
   sensitiveApprovalContractHash: z.string().optional(),
   pendingApproval: approvalSchema.optional(),
+  executions: z.array(executionIdentitySchema).default([]),
   inFlight: z
     .object({ phase: z.enum(phases), roles: z.array(z.enum(roles)) })
     .optional(),
@@ -779,6 +781,24 @@ function migrateState(value: unknown): unknown {
 }
 export function validateState(value: unknown): WorkflowState {
   const state = stateSchema.parse(migrateState(value));
+  const executionIds = new Set<string>();
+  const executionAttempts = new Set<string>();
+  for (const execution of state.executions) {
+    const key = `${execution.agent}:${execution.attempt}`;
+    if (
+      execution.workflowId !== state.id ||
+      executionIds.has(execution.id) ||
+      executionAttempts.has(key)
+    )
+      throw new Error(
+        "Execution reservation has duplicate or mismatched workflow/attempt identity",
+      );
+    executionIds.add(execution.id);
+    executionAttempts.add(key);
+    const children = new Set(execution.children.map((child) => child.id));
+    if (children.size !== execution.children.length)
+      throw new Error("Duplicate child execution identity");
+  }
   for (const mutation of state.observedImplementorMutations)
     if (policyPath(mutation.path) !== mutation.identity)
       throw new Error(
@@ -980,6 +1000,7 @@ export function newState(
     phase: "ORCHESTRATE",
     config,
     fullCycle: 1,
+    executions: [],
     localFixCycle: 0,
     pentestCycle: 0,
     agentFailures: 0,

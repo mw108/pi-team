@@ -13,6 +13,7 @@ import {
 } from "../src/workflow/state.ts";
 import {
   getWorkflowRecoveryPlan,
+  interruptedQualityGate,
   recoveryAction,
 } from "../src/workflow/recovery.ts";
 import { renderBlocked } from "../src/workflow/report.ts";
@@ -339,12 +340,17 @@ test("recovery planner always exposes an executable action for persisted nonterm
 });
 
 const ui = { progress: () => {}, ask: async () => undefined };
-async function completed(commit = false, pentest = false) {
+async function completed(
+  commit = false,
+  pentest = false,
+  testerWrites = false,
+) {
   const cwd = await repository();
   const cfg = config();
   cfg.qualityGates.commit.enabled = commit;
   cfg.qualityGates.pentest.enabled = pentest;
   cfg.logging.agentLogs.level = "off";
+  cfg.tester.mayModifyTests = testerWrites;
   const runner = new FixtureRunner();
   const engine = new WorkflowEngine(cwd, runner, ui);
   const state = await engine.start("Fix addition", cfg);
@@ -352,10 +358,16 @@ async function completed(commit = false, pentest = false) {
   assert.equal(state.phase, "DONE", state.blocker);
   return { cwd, state, engine, runner };
 }
-async function blockedAt(phase: Phase, remove: string[], commit = false) {
-  const fixture = await completed(commit);
+async function blockedAt(
+  phase: Phase,
+  remove: string[],
+  commit = false,
+  testerWrites = false,
+) {
+  const fixture = await completed(commit, false, testerWrites);
   const { state, engine } = fixture;
   for (const role of remove) delete state.results[role];
+  state.executions = state.executions.filter((e) => !remove.includes(e.agent));
   if (phase !== "COMMIT" && phase !== "REPORT") {
     if (phase === "IMPLEMENT") delete state.gateHashes;
     delete state.commit;
@@ -364,6 +376,8 @@ async function blockedAt(phase: Phase, remove: string[], commit = false) {
   state.history = state.history.filter((event) => {
     if (
       event.event === "agent_attempt_started" ||
+      event.event === "execution_reserved" ||
+      event.event === "execution_identity_updated" ||
       event.event === "agent_attempt_completed" ||
       event.event === "agent_completed"
     )
@@ -375,6 +389,375 @@ async function blockedAt(phase: Phase, remove: string[], commit = false) {
   await engine.store.save(state);
   return fixture;
 }
+
+test("legacy interrupted Pentester retry requires approval and resumes at attempt two", async () => {
+  const { cwd, state, engine } = await blockedAt("PENTEST", [
+    "pentester",
+    "securityReviewer",
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.config.qualityGates.pentest.enabled = true;
+  state.phase = "PENTEST";
+  record(state, "agent_attempt_started", "pentester run 1 started", {
+    agent: "pentester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted PENTEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  record(state, "agent_retry_requested_by_user", "pentester manual retry", {
+    agent: "pentester",
+    attempt: 1,
+  });
+  state.manualRetry = { agent: "pentester", phase: "PENTEST" };
+  await engine.store.save(state);
+  const plan = await getWorkflowRecoveryPlan(state, cwd);
+  assert.ok(
+    plan.actions.some(
+      (action) => action.command === "/team-retry pentester recover",
+    ),
+  );
+  await assert.rejects(engine.retryAgent(state, "pentester"), /Interrupted/);
+  const restarted = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  assert.equal(
+    await restarted.retryAgent(state, "pentester", false, "recover"),
+    "prepared",
+  );
+  const accepted = await restarted.store.load(state.id);
+  assert.ok(
+    accepted.history.some(
+      (event) => event.event === "interrupted_agent_recovery_accepted",
+    ),
+  );
+  await restarted.run(state);
+  assert.equal(
+    state.history.filter(
+      (event) =>
+        event.event === "agent_attempt_started" &&
+        event.meta?.agent === "pentester" &&
+        event.meta.attempt === 2,
+    ).length,
+    1,
+  );
+  assert.equal(
+    state.history.filter(
+      (event) =>
+        event.event === "agent_attempt_completed" &&
+        event.meta?.agent === "pentester" &&
+        event.meta.attempt === 1,
+    ).length,
+    0,
+  );
+  assert.ok(state.results.securityReviewer);
+});
+
+test("interrupted Tester requires approval and preserves upstream gates", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  assert.ok(
+    (await getWorkflowRecoveryPlan(state, cwd)).actions.some(
+      (action) => action.command === "/team-retry tester recover",
+    ),
+  );
+  await assert.rejects(
+    engine.retryAgent(state, "tester", false, "recover"),
+    /cancelled/,
+  );
+  assert.equal((await engine.store.load(state.id)).manualRetry, undefined);
+  const runner = new FixtureRunner();
+  const restarted = new WorkflowEngine(cwd, runner, {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  assert.equal(
+    await restarted.retryAgent(state, "tester", false, "recover"),
+    "prepared",
+  );
+  await restarted.run(state);
+  assert.equal(
+    state.history.filter(
+      (e) =>
+        e.event === "agent_attempt_started" &&
+        e.meta?.agent === "tester" &&
+        e.meta.attempt === 2,
+    ).length,
+    1,
+  );
+  assert.ok(state.results.codeReviewer);
+  assert.ok(state.results.securityReviewer);
+  assert.ok(state.results.tester);
+});
+
+test("interrupted recovery rejects changed repository and missing snapshot without approving", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  let approvals = 0;
+  const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => {
+      approvals++;
+      return ["recover"];
+    },
+  });
+  await writeFile(join(cwd, "unexpected.txt"), "external change");
+  await assert.rejects(
+    retry.retryAgent(state, "tester", false, "recover"),
+    /Repository changed/,
+  );
+  assert.equal(approvals, 0);
+  assert.equal((await retry.store.load(state.id)).manualRetry, undefined);
+  const loaded = await retry.store.load(state.id);
+  delete loaded.gateRepositorySnapshot;
+  await retry.store.save(loaded);
+  await assert.rejects(
+    retry.retryAgent(loaded, "tester", false, "recover"),
+    /Missing pre-attempt/,
+  );
+});
+
+test("accepted crash recovery survives restart and can only be accepted once", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await retry.retryAgent(state, "tester", false, "recover");
+  const fresh = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const loaded = await fresh.store.load(state.id);
+  assert.equal(
+    (await getWorkflowRecoveryPlan(loaded, cwd)).kind,
+    "unconsumed-manual-retry",
+  );
+  await assert.rejects(fresh.retryAgent(loaded, "tester", false, "recover"));
+  await fresh.continueBlocked(loaded);
+  assert.equal(
+    loaded.history.filter(
+      (e) =>
+        e.event === "agent_attempt_started" &&
+        e.meta?.agent === "tester" &&
+        e.meta.attempt === 2,
+    ).length,
+    1,
+  );
+  assert.equal(
+    loaded.history.filter(
+      (e) => e.event === "interrupted_agent_recovery_accepted",
+    ).length,
+    1,
+  );
+});
+
+test("crash after retry startup requires a fresh decision for the newer attempt", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await retry.retryAgent(state, "tester", false, "recover");
+  state.inFlight = { phase: "TEST", roles: ["tester"] };
+  record(state, "agent_attempt_started", "tester run 2 started", {
+    agent: "tester",
+    attempt: 2,
+    trigger: "manual_retry",
+  });
+  await retry.store.save(state);
+  await retry.recover(state);
+  assert.ok(
+    (await getWorkflowRecoveryPlan(state, cwd)).actions.some(
+      (a) => a.command === "/team-retry tester recover",
+    ),
+  );
+  await retry.retryAgent(state, "tester", false, "recover");
+  await retry.run(state);
+  assert.equal(
+    state.history.filter(
+      (e) =>
+        e.event === "agent_attempt_started" &&
+        e.meta?.agent === "tester" &&
+        e.meta.attempt === 3,
+    ).length,
+    1,
+  );
+});
+
+test("interrupted quality gate classification rejects contradictory lifecycle", async () => {
+  const { state } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  assert.equal(interruptedQualityGate(state, "tester"), 1);
+  assert.equal(interruptedQualityGate(state, "pentester"), undefined);
+  const duplicate = structuredClone(state);
+  duplicate.history.push(
+    structuredClone(
+      duplicate.history.findLast(
+        (e) =>
+          e.event === "agent_attempt_started" && e.meta?.agent === "tester",
+      )!,
+    ),
+  );
+  assert.equal(interruptedQualityGate(duplicate, "tester"), undefined);
+  const missing = structuredClone(state);
+  missing.history = missing.history.filter(
+    (e) => !(e.event === "agent_attempt_started" && e.meta?.agent === "tester"),
+  );
+  assert.equal(interruptedQualityGate(missing, "tester"), undefined);
+  const completed = structuredClone(state);
+  record(completed, "agent_attempt_completed", "tester run 1 completed", {
+    agent: "tester",
+    attempt: 1,
+  });
+  assert.equal(interruptedQualityGate(completed, "tester"), undefined);
+  const newerTerminal = structuredClone(state);
+  record(newerTerminal, "agent_attempt_failed", "tester run 2 failed", {
+    agent: "tester",
+    attempt: 2,
+  });
+  assert.equal(interruptedQualityGate(newerTerminal, "tester"), undefined);
+});
+
+test("concurrent crash recovery requests cannot accept twice", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  const callbacks = { ...ui, approve: async () => ["recover"] };
+  const a = new WorkflowEngine(cwd, new FixtureRunner(), callbacks);
+  const b = new WorkflowEngine(cwd, new FixtureRunner(), callbacks);
+  const [first, second] = await Promise.allSettled([
+    a.retryAgent(structuredClone(state), "tester", false, "recover"),
+    b.retryAgent(structuredClone(state), "tester", false, "recover"),
+  ]);
+  assert.equal(
+    [first, second].filter((result) => result.status === "fulfilled").length,
+    1,
+  );
+  const saved = await engine.store.load(state.id);
+  assert.equal(
+    saved.history.filter(
+      (e) => e.event === "interrupted_agent_recovery_accepted",
+    ).length,
+    1,
+  );
+});
+
+test("repository changes during recovery confirmation invalidate approval", async () => {
+  const { cwd, state, engine } = await blockedAt("TEST", [
+    "tester",
+    "commitAgent",
+    "reporter",
+  ]);
+  state.phase = "TEST";
+  record(state, "agent_attempt_started", "tester run 1 started", {
+    agent: "tester",
+    attempt: 1,
+  });
+  block(
+    state,
+    "Interrupted TEST; inspect repository effects before recovery. Automatic replay of mutating work is disabled.",
+  );
+  await engine.store.save(state);
+  const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => {
+      await writeFile(join(cwd, "changed-during-review.txt"), "change");
+      return ["recover"];
+    },
+  });
+  await assert.rejects(
+    retry.retryAgent(state, "tester", false, "recover"),
+    /changed-during-review\.txt/,
+  );
+  const saved = await retry.store.load(state.id);
+  assert.equal(saved.manualRetry, undefined);
+  assert.equal(
+    saved.history.some(
+      (e) => e.event === "interrupted_agent_recovery_accepted",
+    ),
+    false,
+  );
+});
 
 async function editConfig(cwd: string, edit: (config: any) => void) {
   const path = join(cwd, ".pi/team/team.yaml");
@@ -1079,3 +1462,675 @@ test("runtime command rejects arguments and status and report share recovery adv
   }
   assert.equal((await engine.store.load(state.id)).phase, "BLOCKED");
 });
+
+async function interruptedAssessmentFixture(
+  agent: "pentester" | "tester",
+  testerWrites = false,
+) {
+  const phase = agent === "pentester" ? "PENTEST" : "TEST";
+  const fixture = await blockedAt(
+    phase,
+    agent === "pentester"
+      ? ["pentester", "securityReviewer", "tester", "commitAgent", "reporter"]
+      : ["tester", "commitAgent", "reporter"],
+    false,
+    testerWrites,
+  );
+  fixture.state.phase = phase;
+  if (agent === "pentester")
+    fixture.state.config.qualityGates.pentest.enabled = true;
+  record(fixture.state, "agent_attempt_started", `${agent} run 1 started`, {
+    agent,
+    attempt: 1,
+  });
+  block(
+    fixture.state,
+    `Interrupted ${phase}; inspect repository effects before recovery. Automatic replay of mutating work is disabled.`,
+  );
+  await fixture.engine.store.save(fixture.state);
+  return fixture;
+}
+
+test("interrupted gate lifecycle rejects contradictory or terminal evidence", async () => {
+  const { state } = await interruptedAssessmentFixture("pentester");
+  assert.equal(interruptedQualityGate(state, "pentester"), 1);
+  assert.equal(interruptedQualityGate(state, "tester"), undefined);
+  for (const event of [
+    "agent_attempt_completed",
+    "agent_attempt_failed",
+  ] as const) {
+    const copy = structuredClone(state);
+    record(copy, event, "terminal", { agent: "pentester", attempt: 1 });
+    assert.equal(interruptedQualityGate(copy, "pentester"), undefined);
+  }
+  const duplicate = structuredClone(state);
+  record(duplicate, "agent_attempt_started", "duplicate", {
+    agent: "pentester",
+    attempt: 1,
+  });
+  assert.equal(interruptedQualityGate(duplicate, "pentester"), undefined);
+  const missing = structuredClone(state);
+  missing.history = missing.history.filter(
+    (e) => e.meta?.agent !== "pentester",
+  );
+  assert.equal(interruptedQualityGate(missing, "pentester"), undefined);
+  const wrong = structuredClone(state);
+  wrong.manualRetry = { agent: "tester", phase: "TEST" };
+  assert.equal(interruptedQualityGate(wrong, "pentester"), undefined);
+});
+
+for (const agent of ["pentester", "tester"] as const)
+  test(`${agent} interrupted command brackets preserve changes and require fresh Code Review`, async () => {
+    const { cwd, state, engine } = await interruptedAssessmentFixture(
+      agent,
+      agent === "tester",
+    );
+    const { repositorySnapshot, compareRepositorySnapshots } =
+      await import("../src/workflow/git.ts");
+    const { assessInterruptedGate } =
+      await import("../src/workflow/interrupted-gate-assessment.ts");
+    const target = agent === "tester" ? "tests/math.test.mjs" : "math.js";
+    if (agent === "tester") {
+      state.results.reviewer!.filesToModify.push(target);
+      state.gateHashes = await (
+        await import("../src/workflow/git.ts")
+      ).gateSnapshot(state);
+    }
+    const before = state.gateRepositorySnapshot!;
+    const content = await readFile(join(cwd, target), "utf8");
+    await writeFile(
+      join(cwd, target),
+      content + "\n// observed command change\n",
+    );
+    const after = await repositorySnapshot(cwd);
+    const drift = compareRepositorySnapshots(before, after);
+    state.commandMutationEvidence.push({
+      executionId: "00000000-0000-4000-8000-000000000099",
+      commandId: "fixture",
+      executable: "fixture",
+      args: [],
+      purpose: agent === "tester" ? "test" : "pentest",
+      agent,
+      phase: agent === "tester" ? "TEST" : "PENTEST",
+      attempt: 1,
+      risk: "SOURCE_MUTATION",
+      beforeSnapshotId: before.id,
+      afterSnapshotId: after.id,
+      addedPaths: drift.added,
+      modifiedPaths: drift.modified,
+      deletedPaths: drift.deleted,
+      attribution: "OBSERVED",
+      observedAt: new Date().toISOString(),
+    });
+    const assessment = await assessInterruptedGate(state, agent, 1);
+    assert.equal(
+      assessment.status,
+      "ATTRIBUTABLE_TO_INTERRUPTED_ATTEMPT",
+      assessment.reason,
+    );
+    assert.equal(assessment.processStatus, "UNKNOWN");
+    const ambiguous = structuredClone(state);
+    ambiguous.commandMutationEvidence.push({
+      ...state.commandMutationEvidence.at(-1)!,
+      executionId: "00000000-0000-4000-8000-000000000098",
+    });
+    assert.equal(
+      (await assessInterruptedGate(ambiguous, agent, 1)).eligible,
+      false,
+    );
+    await engine.store.save(state);
+    let prompt = "";
+    const recovered = new WorkflowEngine(cwd, new FixtureRunner(), {
+      ...ui,
+      approve: async (request) => {
+        prompt = request.prompt;
+        return ["recover"];
+      },
+    });
+    await recovered.retryAgent(state, agent, false, "recover");
+    assert.match(prompt, /Previous subprocess termination cannot be proven/);
+    assert.equal(state.phase, "CODE_REVIEW");
+    assert.equal(
+      await readFile(join(cwd, target), "utf8"),
+      content + "\n// observed command change\n",
+    );
+    assert.equal(state.results.codeReviewer, undefined);
+    assert.ok(state.results.implementor);
+    const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+    await restarted.run(state);
+    assert.equal(state.phase, "DONE", state.blocker);
+    assert.ok(state.results.securityReviewer);
+    assert.equal(
+      state.history.filter(
+        (e) =>
+          e.event === "agent_attempt_started" &&
+          e.meta?.agent === agent &&
+          e.meta.attempt === 2,
+      ).length,
+      1,
+    );
+  });
+
+for (const mutation of [
+  "untracked",
+  "tracked",
+  "deleted",
+  "protected",
+  "head",
+  "missing_snapshot",
+  "missing_hashes",
+] as const)
+  test(`interrupted recovery assessment blocks ${mutation} without changing content`, async () => {
+    const { cwd, state } = await interruptedAssessmentFixture("tester");
+    const { assessInterruptedGate } =
+      await import("../src/workflow/interrupted-gate-assessment.ts");
+    const { unlink } = await import("node:fs/promises");
+    if (mutation === "untracked")
+      await writeFile(join(cwd, "external.txt"), "external");
+    if (mutation === "tracked")
+      await writeFile(join(cwd, "math.js"), "// external\n");
+    if (mutation === "deleted") await unlink(join(cwd, "math.js"));
+    if (mutation === "protected")
+      await writeFile(join(cwd, "package.json"), "{}");
+    if (mutation === "head")
+      await git(cwd, ["commit", "--allow-empty", "-m", "external commit"]);
+    if (mutation === "missing_snapshot") delete state.gateRepositorySnapshot;
+    if (mutation === "missing_hashes") delete state.gateHashes;
+    const before = JSON.stringify(state);
+    const assessment = await assessInterruptedGate(state, "tester", 1);
+    assert.equal(assessment.eligible, false, assessment.reason);
+    const plan = await getWorkflowRecoveryPlan(state, cwd);
+    assert.equal(plan.kind, "unsafe");
+    assert.ok(!plan.actions.some((a) => a.command?.includes(" recover")));
+    assert.equal(JSON.stringify(state), before);
+  });
+
+test("recovery rejects persisted-state changes during approval and wrong workflow", async () => {
+  const { cwd, state, engine } = await interruptedAssessmentFixture("tester");
+  const wrong = structuredClone(state);
+  wrong.id = "00000000-0000-4000-8000-000000000077";
+  await assert.rejects(
+    engine.retryAgent(wrong, "tester", false, "recover"),
+    /Workflow mismatch/,
+  );
+  const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => {
+      const changed = await engine.store.load(state.id);
+      record(changed, "external_review_event", "state changed during approval");
+      await engine.store.save(changed);
+      return ["recover"];
+    },
+  });
+  await assert.rejects(
+    retry.retryAgent(state, "tester", false, "recover"),
+    /conditions changed during review/,
+  );
+  const durable = await retry.store.load(state.id);
+  assert.equal(durable.phase, "BLOCKED");
+  assert.ok(
+    !durable.history.some(
+      (e) => e.event === "interrupted_agent_recovery_accepted",
+    ),
+  );
+});
+
+for (const crashAfterSave of [false, true])
+  test(`recovery persistence failure ${crashAfterSave ? "after" : "before"} durable acceptance preserves retry boundary`, async () => {
+    const { cwd, state } = await interruptedAssessmentFixture("tester");
+    const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+      ...ui,
+      approve: async () => ["recover"],
+    });
+    const save = retry.store.save.bind(retry.store);
+    retry.store.save = async (candidate) => {
+      if (
+        candidate.history.some(
+          (e) => e.event === "interrupted_agent_recovery_accepted",
+        )
+      ) {
+        if (crashAfterSave) await save(candidate);
+        throw new Error("simulated recovery persistence crash");
+      }
+      await save(candidate);
+    };
+    await assert.rejects(
+      retry.retryAgent(state, "tester", false, "recover"),
+      /simulated recovery persistence crash/,
+    );
+    const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+    const durable = await restarted.store.load(state.id);
+    assert.equal(
+      durable.history.filter(
+        (e) => e.event === "interrupted_agent_recovery_accepted",
+      ).length,
+      crashAfterSave ? 1 : 0,
+    );
+    assert.equal(
+      durable.history.filter(
+        (e) =>
+          e.event === "agent_attempt_started" &&
+          e.meta?.agent === "tester" &&
+          e.meta.attempt === 2,
+      ).length,
+      0,
+    );
+    if (crashAfterSave) {
+      await restarted.continueBlocked(durable);
+      assert.equal(durable.phase, "DONE", durable.blocker);
+      assert.equal(
+        durable.history.filter(
+          (e) =>
+            e.event === "agent_attempt_started" &&
+            e.meta?.agent === "tester" &&
+            e.meta.attempt === 2,
+        ).length,
+        1,
+      );
+    } else {
+      assert.equal(durable.phase, "BLOCKED");
+      assert.equal(durable.manualRetry, undefined);
+      assert.equal(
+        (await getWorkflowRecoveryPlan(durable, cwd)).kind,
+        "interrupted-quality-gate",
+      );
+    }
+  });
+
+test("ordinary retry racing crash recovery cannot prepare duplicate work", async () => {
+  const { cwd, state } = await interruptedAssessmentFixture("tester");
+  const recovery = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  const ordinary = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+  const requests = await Promise.allSettled([
+    recovery.retryAgent(structuredClone(state), "tester", false, "recover"),
+    ordinary.retryAgent(structuredClone(state), "tester"),
+  ]);
+  const loaded = await recovery.store.load(state.id);
+  assert.ok(requests.some((r) => r.status === "rejected"));
+  const accepted = loaded.history.filter(
+    (e) => e.event === "interrupted_agent_recovery_accepted",
+  );
+  assert.ok(accepted.length <= 1);
+  if (accepted.length) {
+    const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+    await restarted.run(loaded);
+    assert.equal(
+      loaded.history.filter(
+        (e) =>
+          e.event === "agent_attempt_started" &&
+          e.meta?.agent === "tester" &&
+          e.meta.attempt === 2,
+      ).length,
+      1,
+    );
+  } else assert.equal(loaded.phase, "BLOCKED");
+});
+
+test("unchanged interrupted snapshot preserves approved changes on an already dirty baseline", async () => {
+  const { cwd, state, engine } = await interruptedAssessmentFixture("tester");
+  const { assessInterruptedGate } =
+    await import("../src/workflow/interrupted-gate-assessment.ts");
+  state.baseline.dirtyPaths.push("math.js");
+  const before = await readFile(join(cwd, "math.js"), "utf8");
+  await engine.store.save(state);
+  const assessment = await assessInterruptedGate(state, "tester", 1);
+  assert.equal(assessment.status, "UNCHANGED");
+  const restarted = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await restarted.retryAgent(state, "tester", false, "recover");
+  await restarted.run(state);
+  assert.equal(await readFile(join(cwd, "math.js"), "utf8"), before);
+  assert.ok(state.results.implementor);
+});
+
+for (const boundary of [
+  "RESERVED",
+  "STARTING",
+  "ATTEMPT_STARTED",
+  "RUNNING",
+  "EXIT_UNPERSISTED",
+  "COMPLETED_AFTER",
+] as const)
+  test(
+    `execution identity crash boundary: ${boundary}`,
+    { skip: process.platform !== "linux" },
+    async () => {
+      const { cwd, state } = await interruptedAssessmentFixture("tester");
+      let calls = 0;
+      const { executionContext } =
+        await import("../src/workflow/execution-identity.ts");
+      const runner = new FixtureRunner(async (role) => {
+        if (role === "tester") {
+          calls++;
+          await executionContext.getStore()?.update((e) => {
+            e.status = "RUNNING";
+          });
+        }
+        return undefined;
+      });
+      const engine = new WorkflowEngine(cwd, runner, {
+        ...ui,
+        approve: async () => ["recover"],
+      });
+      await engine.retryAgent(state, "tester", false, "recover");
+      const save = engine.store.save.bind(engine.store);
+      let failed = false;
+      engine.store.save = async (candidate) => {
+        const execution = candidate.executions.find(
+          (e) => e.agent === "tester" && e.attempt === 2,
+        );
+        const start = candidate.history.some(
+          (h) =>
+            h.event === "agent_attempt_started" &&
+            h.meta?.agent === "tester" &&
+            h.meta.attempt === 2,
+        );
+        const terminal = candidate.history.some(
+          (h) =>
+            h.event === "agent_attempt_completed" &&
+            h.meta?.agent === "tester" &&
+            h.meta.attempt === 2,
+        );
+        const hit =
+          execution &&
+          (boundary === "ATTEMPT_STARTED"
+            ? start
+            : boundary === "EXIT_UNPERSISTED" || boundary === "COMPLETED_AFTER"
+              ? terminal
+              : execution.status === boundary);
+        if (hit && !failed) {
+          failed = true;
+          if (boundary !== "EXIT_UNPERSISTED") await save(candidate);
+          throw new Error("simulated execution crash");
+        }
+        await save(candidate);
+      };
+      await engine.run(state).catch(() => {});
+      assert.equal(failed, true);
+      const restarted = new WorkflowEngine(cwd, new FixtureRunner(), ui);
+      const durable = await restarted.store.load(state.id);
+      const execution = durable.executions.find(
+        (e) => e.agent === "tester" && e.attempt === 2,
+      )!;
+      assert.ok(execution?.id);
+      assert.equal(
+        durable.history.some(
+          (h) =>
+            h.event === "agent_attempt_completed" &&
+            h.meta?.agent === "tester" &&
+            h.meta.attempt === 2,
+        ),
+        boundary === "COMPLETED_AFTER",
+      );
+      assert.equal(
+        calls,
+        ["RUNNING", "EXIT_UNPERSISTED", "COMPLETED_AFTER"].includes(boundary)
+          ? 1
+          : 0,
+      );
+      assert.equal(
+        durable.history.filter(
+          (h) =>
+            h.event === "agent_attempt_started" &&
+            h.meta?.agent === "tester" &&
+            h.meta.attempt === 2,
+        ).length,
+        ["RESERVED", "STARTING"].includes(boundary) ? 0 : 1,
+      );
+      await restarted.recover(durable);
+      const rejected = await getWorkflowRecoveryPlan(durable, cwd);
+      assert.notEqual(rejected.kind, "continue");
+      await assert.rejects(
+        restarted.retryAgent(durable, "tester", false, "recover"),
+      );
+      assert.equal(durable.executions.filter((e) => e.attempt === 2).length, 1);
+      if (boundary !== "COMPLETED_AFTER") {
+        // Controlled stand-in for a host crash: the original owner is now provably absent.
+        durable.executions.find(
+          (e) => e.agent === "tester" && e.attempt === 2,
+        )!.owner = { ...execution.owner!, pid: 2147483647 };
+        await restarted.store.save(durable);
+        const next = new WorkflowEngine(cwd, new FixtureRunner(), {
+          ...ui,
+          approve: async () => ["recover"],
+        });
+        const fresh = await next.store.load(state.id);
+        await next.retryAgent(fresh, "tester", false, "recover");
+        await next.run(fresh);
+        assert.equal(fresh.phase, "DONE", fresh.blocker);
+        assert.equal(
+          fresh.history.filter(
+            (h) =>
+              h.event === "agent_attempt_started" &&
+              h.meta?.agent === "tester" &&
+              h.meta.attempt === 3,
+          ).length,
+          1,
+        );
+        assert.notEqual(
+          fresh.executions.find((e) => e.attempt === 3)!.id,
+          execution.id,
+        );
+      }
+    },
+  );
+
+test("two independent processes cannot start the same prepared retry", async () => {
+  const { cwd, state, engine } = await interruptedAssessmentFixture("tester");
+  const prepare = new WorkflowEngine(cwd, new FixtureRunner(), {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await prepare.retryAgent(state, "tester", false, "recover");
+  const { promisify } = await import("node:util");
+  const { execFile } = await import("node:child_process");
+  const code = `import {WorkflowEngine} from ${JSON.stringify(new URL("../src/workflow/engine.ts", import.meta.url).href)};import {FixtureRunner} from ${JSON.stringify(new URL("./helpers.ts", import.meta.url).href)};const engine=new WorkflowEngine(${JSON.stringify(cwd)},new FixtureRunner(),{progress(){},ask:async()=>undefined});try {await engine.run(await engine.store.load(${JSON.stringify(state.id)}));}catch(error){if(!String(error).includes("already running"))throw error;}`;
+  await Promise.all(
+    [1, 2].map(() =>
+      promisify(execFile)(process.execPath, [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "-e",
+        code,
+      ]),
+    ),
+  );
+  const final = await engine.store.load(state.id);
+  assert.equal(final.phase, "DONE", final.blocker);
+  assert.equal(
+    final.executions.filter((e) => e.agent === "tester" && e.attempt === 2)
+      .length,
+    1,
+  );
+  assert.equal(
+    final.history.filter(
+      (h) =>
+        h.event === "agent_attempt_started" &&
+        h.meta?.agent === "tester" &&
+        h.meta.attempt === 2,
+    ).length,
+    1,
+  );
+});
+
+test(
+  "unknown recorded child startup blocks recovery without asking for approval",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const { cwd, state, engine } = await interruptedAssessmentFixture("tester");
+    const { captureProcessIdentity } =
+      await import("../src/workflow/execution-identity.ts");
+    state.executions.push({
+      id: "00000000-0000-4000-8000-000000000061",
+      workflowId: state.id,
+      agent: "tester",
+      attempt: 1,
+      status: "STARTING",
+      owner: { ...(await captureProcessIdentity()), pid: 2147483647 },
+      children: [
+        { id: "00000000-0000-4000-8000-000000000062", status: "STARTING" },
+      ],
+    });
+    await engine.store.save(state);
+    let approvals = 0;
+    const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+      ...ui,
+      approve: async () => {
+        approvals++;
+        return ["recover"];
+      },
+    });
+    await assert.rejects(
+      retry.retryAgent(state, "tester", false, "recover"),
+      /UNKNOWN/,
+    );
+    assert.equal(approvals, 0);
+    assert.equal((await retry.store.load(state.id)).phase, "BLOCKED");
+  },
+);
+
+test("concurrent identity callbacks retain cumulative metadata and terminal identity", async () => {
+  const { cwd, state } = await interruptedAssessmentFixture("tester");
+  const { executionContext } =
+    await import("../src/workflow/execution-identity.ts");
+  const runner = new FixtureRunner(async (role) => {
+    if (role === "tester") {
+      const context = executionContext.getStore()!;
+      await Promise.all([
+        context.update((e) => {
+          e.sessionId = "controlled-sdk-session";
+        }),
+        context.update((e) => {
+          e.children.push({
+            id: "00000000-0000-4000-8000-000000000063",
+            status: "RESERVED",
+          });
+        }),
+      ]);
+    }
+    return undefined;
+  });
+  const engine = new WorkflowEngine(cwd, runner, {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await engine.retryAgent(state, "tester", false, "recover");
+  await engine.run(state);
+  const durable = await engine.store.load(state.id);
+  const execution = durable.executions.find(
+    (e) => e.agent === "tester" && e.attempt === 2,
+  )!;
+  assert.equal(execution.sessionId, "controlled-sdk-session");
+  assert.equal(execution.children.length, 2);
+  assert.equal(
+    execution.children.filter(
+      (child) =>
+        child.id === "00000000-0000-4000-8000-000000000063" &&
+        child.status === "RESERVED",
+    ).length,
+    1,
+  );
+  assert.equal(
+    execution.children.filter(
+      (child) =>
+        child.id !== "00000000-0000-4000-8000-000000000063" &&
+        child.status === "TERMINATED" &&
+        child.exitCode === 0,
+    ).length,
+    1,
+  );
+  assert.equal(new Set(execution.children.map((child) => child.id)).size, 2);
+  assert.equal(execution.status, "COMPLETED");
+  assert.equal(durable.phase, "DONE", durable.blocker);
+});
+
+test("lock ownership lost during SDK execution stops identity writes and preserves state", async () => {
+  const { cwd, state } = await interruptedAssessmentFixture("tester");
+  const { executionContext } =
+    await import("../src/workflow/execution-identity.ts");
+  const { unlink } = await import("node:fs/promises");
+  let runnerEntered = false;
+  const runner = new FixtureRunner(async (role) => {
+    if (role === "tester") {
+      runnerEntered = true;
+      await writeFile(
+        join(engine.store.dir, "active.lock"),
+        JSON.stringify({
+          pid: process.pid,
+          token: "replacement-owner",
+          at: new Date().toISOString(),
+        }),
+      );
+      await executionContext.getStore()!.update((e) => {
+        e.sessionId = "must-not-publish";
+      });
+    }
+    return undefined;
+  });
+  const engine = new WorkflowEngine(cwd, runner, {
+    ...ui,
+    approve: async () => ["recover"],
+  });
+  await engine.retryAgent(state, "tester", false, "recover");
+  await assert.rejects(engine.run(state), /lock ownership changed/);
+  assert.equal(runnerEntered, true);
+  const loaded = await engine.store.load(state.id);
+  assert.equal(
+    loaded.executions.find((e) => e.agent === "tester" && e.attempt === 2)
+      ?.sessionId,
+    undefined,
+  );
+  const path = join(engine.store.dir, "active.lock");
+  assert.equal(
+    JSON.parse(await readFile(path, "utf8")).token,
+    "replacement-owner",
+  );
+  await unlink(path);
+});
+
+test(
+  "verified active execution cannot be overridden by recovery approval",
+  { skip: process.platform !== "linux" },
+  async () => {
+    const { cwd, state, engine } = await interruptedAssessmentFixture("tester");
+    const { captureProcessIdentity } =
+      await import("../src/workflow/execution-identity.ts");
+    state.executions.push({
+      id: "00000000-0000-4000-8000-000000000064",
+      workflowId: state.id,
+      agent: "tester",
+      attempt: 1,
+      status: "RUNNING",
+      owner: await captureProcessIdentity(),
+      children: [],
+    });
+    await engine.store.save(state);
+    let approvals = 0;
+    const retry = new WorkflowEngine(cwd, new FixtureRunner(), {
+      ...ui,
+      approve: async () => {
+        approvals++;
+        return ["recover"];
+      },
+    });
+    await assert.rejects(
+      retry.retryAgent(state, "tester", false, "recover"),
+      /ACTIVE/,
+    );
+    assert.equal(approvals, 0);
+    const durable = await retry.store.load(state.id);
+    assert.equal(durable.executions.length, 1);
+    assert.equal(durable.phase, "BLOCKED");
+    assert.ok(
+      !durable.history.some(
+        (h) => h.event === "interrupted_agent_recovery_accepted",
+      ),
+    );
+  },
+);

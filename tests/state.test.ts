@@ -350,3 +350,62 @@ test("concurrent stale-lock recovery leaves one complete owner", async () => {
   assert.equal(typeof owner.token, "string");
   await winners[0].value();
 });
+
+test("a separate process cannot reclaim a live workflow lock", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cwd = await mkdtemp(join(tmpdir(), "pi-peer-lock-"));
+  const store = new StateStore(cwd);
+  const unlock = await store.lock();
+  try {
+    const code = `import {StateStore} from ${JSON.stringify(new URL("../src/workflow/persistence.ts", import.meta.url).href)}; try { const release = await new StateStore(${JSON.stringify(cwd)}).lock(); await release(); process.exitCode = 1; } catch (error) { if (!String(error).includes("already running")) throw error; }`;
+    await promisify(execFile)(process.execPath, [
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "-e",
+      code,
+    ]);
+    const path = join(store.dir, "active.lock");
+    const held = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(held.pid, process.pid);
+    // Legacy ISO identity is unknown while the owner is alive, never proof of reuse.
+    await writeFile(
+      path,
+      JSON.stringify({ ...held, processIdentity: new Date().toISOString() }),
+    );
+    await assert.rejects(new StateStore(cwd).lock(), /already running/);
+  } finally {
+    await unlock();
+  }
+});
+
+test("lost workflow lock prevents stale state publication and preserves replacement owner", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-lost-lock-"));
+  const store = new StateStore(cwd);
+  const unlock = await store.lock();
+  const state = newState(cwd, "initial", config(), {
+    head: null,
+    dirtyPaths: [],
+    status: "",
+    diff: "",
+    cachedDiff: "",
+  });
+  await store.save(state);
+  const lock = join(store.dir, "active.lock");
+  const replacement = {
+    pid: process.pid,
+    token: "replacement-owner",
+    at: new Date().toISOString(),
+  };
+  await writeFile(lock, JSON.stringify(replacement));
+  state.task = "stale overwrite";
+  await assert.rejects(store.save(state), /lock ownership changed/);
+  assert.equal((await store.load(state.id)).task, "initial");
+  await unlock();
+  assert.equal(
+    JSON.parse(await readFile(lock, "utf8")).token,
+    replacement.token,
+  );
+  await unlink(lock);
+});
