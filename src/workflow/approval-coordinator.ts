@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { withTerminalPrompt } from "../integrations/approval-presentation.ts";
 import type { Command } from "../config/schema.ts";
 import type { Role } from "../agents/schemas.ts";
 import type { ContractOperation } from "../agents/permissions.ts";
@@ -417,7 +418,7 @@ export class RuntimeCommandApprovalCoordinator {
     const mutationSummary = context
       ? `\n\nMutation risk: ${context.mutation.risk}\nHost classification: ${redactVisibleText(context.mutation.reason)}\nPotential repository changes:\n${potentialChanges.map((path) => `- ${redactVisibleText(path)}`).join("\n") || "- none identified"}`
       : "";
-    return {
+    const approval: ApprovalRequest = {
       kind: "runtimeCommand",
       title: dependencyMutation
         ? `${label} requests dependency installation authorization`
@@ -457,6 +458,15 @@ export class RuntimeCommandApprovalCoordinator {
         },
       ],
     };
+    const fullLine = [command.executable, ...command.args]
+      .map((part) => (/[\s"']/.test(part) ? JSON.stringify(part) : part))
+      .join(" ");
+    return fullLine === line
+      ? approval
+      : withTerminalPrompt(
+          approval,
+          `${approval.prompt}\n\nFull command for trusted local review:\nExecutable: ${JSON.stringify(command.executable)}\nArgv: ${JSON.stringify(command.args)}`,
+        );
   }
   saveRuntimeApproval(
     s: WorkflowState,

@@ -64,21 +64,62 @@ async function invoke(
   params: unknown,
   signal?: AbortSignal,
 ) {
+  if (signal?.aborted) return undefined;
+  if (ctx.mode !== "tui" || !ctx.hasUI || typeof ctx.ui.custom !== "function")
+    throw new Error(
+      "Local terminal approval unavailable: Pi requires an active interactive TUI context. No permission was granted. Open interactive Pi and use /team resume to review pending approvals; inspect the interrupted attempt before retrying it.",
+    );
   const { tool } = await checkAskCompatibility({
     appendEntry: pi.appendEntry.bind(pi),
   });
-  const result = await tool.execute(
-    `team-question-${Date.now()}`,
-    params,
-    signal,
-    undefined,
-    // pi-ask 1.2 uses the base extension context only; Pi 0.99 types tool contexts separately.
-    ctx as ExtensionToolContext,
-  );
-  const details = result.details as any;
-  return !details?.cancelled && details?.mode === "submit"
-    ? details
-    : undefined;
+  if (signal?.aborted) return undefined;
+  // pi-ask 1.2 ignores its execute signal. Close its SDK dialog ourselves so
+  // obsolete dialogs cannot survive workflow cancellation or attempt retry.
+  const ui = ctx.ui;
+  let cleanup: (() => void) | undefined;
+  const context = Object.create(ctx) as ExtensionContext;
+  Object.defineProperty(context, "ui", {
+    value: {
+      ...ui,
+      custom: ((factory, options) =>
+        ui.custom((tui, theme, keys, done) => {
+          const abort = () =>
+            done({
+              cancelled: true,
+              mode: "cancel",
+              questions: [],
+              answers: {},
+            } as never);
+          signal?.addEventListener("abort", abort, { once: true });
+          cleanup = () => signal?.removeEventListener("abort", abort);
+          if (signal?.aborted) {
+            abort();
+            return { render: () => [], invalidate: () => {} };
+          }
+          return factory(tui, theme, keys, (value) => {
+            cleanup?.();
+            done(value);
+          });
+        }, options)) as ExtensionContext["ui"]["custom"],
+    },
+  });
+  try {
+    const result = await tool.execute(
+      `team-question-${Date.now()}`,
+      params,
+      signal,
+      undefined,
+      // pi-ask 1.2 uses the base extension context only; Pi 0.99 types tool contexts separately.
+      context as ExtensionToolContext,
+    );
+    if (signal?.aborted) return undefined;
+    const details = result.details as any;
+    return !details?.cancelled && details?.mode === "submit"
+      ? details
+      : undefined;
+  } finally {
+    cleanup?.();
+  }
 }
 export function approvalParams(request: ApprovalRequest) {
   return {

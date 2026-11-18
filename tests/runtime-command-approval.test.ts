@@ -25,6 +25,172 @@ import { formatToolActivity } from "../src/ui/activity.ts";
 import { getWorkflowRecoveryPlan } from "../src/workflow/recovery.ts";
 import type { Role } from "../src/agents/schemas.ts";
 import { validateState } from "../src/workflow/state.ts";
+import { UserInteractionService } from "../src/integrations/user-interaction.ts";
+
+function terminalRouting(
+  f: Awaited<ReturnType<typeof fixture>>,
+  decide: () => Promise<string[] | undefined>,
+) {
+  const local: any[] = [];
+  const pi = {
+    events: { emit() {} },
+    appendEntry(_type: string, data: any) {
+      local.push(data);
+    },
+  };
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    cwd: f.cwd,
+    ui: {
+      setWorkingVisible() {},
+      async custom() {
+        const values = await decide();
+        return {
+          cancelled: values === undefined,
+          mode: "submit",
+          questions: [],
+          answers: { approval: { values } },
+        };
+      },
+    },
+  };
+  f.state.config.ui.approvals.transport = "telegram";
+  const interactions = new UserInteractionService(
+    pi as any,
+    ctx as any,
+    () => f.state,
+  );
+  (f.engine.ui as any).approve = (request: any, signal: AbortSignal) =>
+    interactions.approve(request, signal);
+  return local;
+}
+
+for (const choice of ["allow_once", "deny"])
+  test(`php tinker approval falls back in the active coordinator: ${choice}`, async () => {
+    const f = await fixture();
+    let answer!: (values: string[]) => void;
+    const decision = new Promise<string[]>((resolve) => {
+      answer = resolve;
+    });
+    const local = terminalRouting(f, () => decision);
+    f.state.phase = "PENTEST";
+    const pending = f.approve("pentester", f.control("pentester"), {
+      executable: "php",
+      args: [
+        "tinker",
+        "--execute=",
+        "$user = App\\Models\\User::factory()->create(); $token='synthetic-secret';",
+      ],
+      purpose: "Inspect authentication",
+      category: "pentest",
+    });
+    while (!local.length)
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(f.state.phase, "PENTEST");
+    assert.equal(f.state.pendingRuntimeCommands.length, 1);
+    assert.equal(
+      f.state.history.some((entry) => entry.event === "blocked"),
+      false,
+    );
+    assert.match(local[0].params.questions[0].prompt, /synthetic-secret/);
+    assert.match(
+      local[0].params.questions[0].prompt,
+      /Full command for trusted local review/,
+    );
+    answer([choice]);
+    assert.equal(await pending, choice === "deny" ? "deny" : "allow");
+    assert.equal(f.state.pendingRuntimeCommands.length, 0);
+    assert.equal(f.state.runtimeCommandApprovals.length, 0);
+    assert.doesNotMatch(JSON.stringify(f.events), /synthetic-secret/);
+  });
+
+for (const choice of ["allow_once", "deny"])
+  test(`terminal fallback ${choice} gates original argv execution`, async () => {
+    const f = await fixture();
+    const local = terminalRouting(f, async () => [choice]);
+    const run = f.control("implementor");
+    const evidence: any[] = [];
+    const tool = commandTool(
+      "implementor",
+      effectiveConfig(f.state),
+      f.cwd,
+      evidence,
+      (command, request, signal) =>
+        (f.engine as any).runtimeCommandApproval(
+          f.state,
+          f.state,
+          "implementor",
+          run,
+          command,
+          request,
+          signal,
+          () => {},
+        ),
+    );
+    const result = await tool.execute(
+      "fallback-once",
+      {
+        executable: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(process.argv[1])",
+          "--",
+          "--token=synthetic-secret",
+        ],
+        purpose: "Inspect runtime",
+        category: "development",
+      },
+      run.controller.signal,
+      undefined,
+      {} as any,
+    );
+    assert.equal(local.length, 1);
+    assert.equal(evidence.length, choice === "deny" ? 0 : 1);
+    if (choice === "deny")
+      assert.equal((result.details as any).code, "COMMAND_APPROVAL_DENIED");
+    else
+      assert.match((result.details as any).output, /--token=synthetic-secret/);
+  });
+
+test("restart cannot resume a local continuation; repeated approval recovery never executes it", async () => {
+  const f = await fixture();
+  const local = terminalRouting(f, async () => ["deny"]);
+  const command = normalizedRuntimeCommand(
+    {
+      executable: "php",
+      args: ["tinker", "--execute=", "$token='synthetic-secret'"],
+      purpose: "Inspect",
+      category: "pentest",
+    },
+    "pentester",
+  ).command;
+  f.state.phase = "PENTEST";
+  f.state.inFlight = { phase: "PENTEST", roles: ["pentester"] };
+  f.state.pendingRuntimeCommands.push({
+    workflowId: f.state.id,
+    agentId: "pentester",
+    run: 1,
+    requestId: randomUUID(),
+    command,
+    purpose: "Inspect",
+  });
+  await f.engine.store.save(f.state);
+  const loaded = await f.engine.store.load(f.state.id);
+  await f.engine.run(loaded);
+  await f.engine.run(loaded);
+  assert.equal(local.length, 1);
+  assert.match(local[0].params.questions[0].prompt, /requesting run has ended/);
+  assert.equal(
+    local[0].params.questions[0].options.some(
+      (o: any) => o.value === "allow_once",
+    ),
+    false,
+  );
+  assert.equal(loaded.pendingRuntimeCommands.length, 0);
+  assert.equal(loaded.runtimeCommandApprovals.length, 0);
+  assert.equal(loaded.phase, "BLOCKED");
+});
 
 async function fixture(answers: (string[] | undefined)[] = []) {
   const cwd = await repository();

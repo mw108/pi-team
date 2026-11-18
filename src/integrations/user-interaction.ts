@@ -8,6 +8,7 @@ import type { TeamConfig } from "../config/schema.ts";
 import type { Question } from "../agents/schemas.ts";
 import { redactVisibleText } from "../agents/redaction.ts";
 import type { ApprovalRequest, WorkflowState } from "../workflow/state.ts";
+import { terminalPrompt } from "./approval-presentation.ts";
 import {
   askApproval as askTerminalApproval,
   askResearchQuestions as askTerminalResearchQuestions,
@@ -144,40 +145,71 @@ export class UserInteractionService {
     signal?: AbortSignal,
     state = this.state(),
   ) {
-    if (transport(state.config) === "terminal")
-      return askTerminalApproval(this.pi, this.ctx, request, signal);
+    if (signal?.aborted) return undefined;
+    const local = () =>
+      askTerminalApproval(
+        this.pi,
+        this.ctx,
+        { ...request, prompt: terminalPrompt(request) },
+        signal,
+      );
+    if (transport(state.config) === "terminal") return local();
     const interactionId = randomUUID();
     const multiple =
       request.kind === "commands" || request.kind === "dirtyPaths";
-    const response = await requireTelegramService(this.pi).request(
-      {
-        id: interactionId,
-        title: request.title,
-        message: completeTelegramText(request.prompt, "approval"),
-        project: basename(state.cwd),
-        options: [
-          ...request.options.map((option) => ({
-            id: option.value,
-            label: option.label,
-            description: redactVisibleText(option.description),
-          })),
-          ...(multiple
-            ? [
-                {
-                  id: SELECT_NONE_OPTION_ID,
-                  label: "Select none / deny all",
-                  description: "Submit without approving any listed item",
-                },
-              ]
-            : []),
-        ],
-        multiple,
-        allowText: true,
-        details: fullApprovalDetails(request),
-        timeoutMs: 0,
-      },
-      { signal },
-    );
+    // Only transport/preflight failures transfer ownership. A returned decision,
+    // including cancellation, denial or an invalid response, never does.
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    let response: TelegramResponse;
+    try {
+      if (
+        terminalPrompt(request) !== request.prompt ||
+        request.prompt.includes("[REDACTED]")
+      )
+        throw new Error("Approval requires complete local review");
+      response = await requireTelegramService(this.pi).request(
+        {
+          id: interactionId,
+          title: request.title,
+          message: completeTelegramText(request.prompt, "approval"),
+          project: basename(state.cwd),
+          options: [
+            ...request.options.map((option) => ({
+              id: option.value,
+              label: option.label,
+              description: redactVisibleText(option.description),
+            })),
+            ...(multiple
+              ? [
+                  {
+                    id: SELECT_NONE_OPTION_ID,
+                    label: "Select none / deny all",
+                    description: "Submit without approving any listed item",
+                  },
+                ]
+              : []),
+          ],
+          multiple,
+          allowText: true,
+          details: fullApprovalDetails(request),
+          timeoutMs: 0,
+        },
+        { signal: controller.signal },
+      );
+    } catch {
+      // Revoke remote ownership before opening the one local dialog. The v1
+      // service removes pending callbacks on rejection and on signal abort.
+      controller.abort();
+      if (signal?.aborted) return undefined;
+      this.notifyLocalApproval();
+      return local();
+    } finally {
+      controller.abort();
+      signal?.removeEventListener("abort", abort);
+    }
+    if (signal?.aborted) return undefined;
     if (response.requestId !== interactionId)
       throw new Error("Telegram interaction response correlation failed");
     if (response.cancelled) return undefined;
@@ -203,6 +235,31 @@ export class UserInteractionService {
         "Telegram returned an invalid or stale Pi-Team approval decision; no permission was granted",
       );
     return selected;
+  }
+
+  private notifyLocalApproval() {
+    // Never include request text, titles, paths, or service failure details.
+    try {
+      this.pi.events.emit("pi-ask-user-telegram:notification-service:v1", {
+        protocolVersion: 1,
+        accept(service: {
+          protocolVersion: number;
+          notify(text: string): Promise<void>;
+        }) {
+          if (
+            service?.protocolVersion === 1 &&
+            typeof service.notify === "function"
+          )
+            void Promise.resolve()
+              .then(() =>
+                service.notify("Pi-Team requires local terminal approval"),
+              )
+              .catch(() => {});
+        },
+      });
+    } catch {
+      // Notification delivery cannot prevent trusted local review.
+    }
   }
 
   async ask(question: Question, signal?: AbortSignal, state = this.state()) {
