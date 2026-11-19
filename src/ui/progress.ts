@@ -4,6 +4,7 @@ import type { WorkflowState } from "../workflow/state.ts";
 import type { AgentProgress, ProgressRuntime } from "./runtime.ts";
 import { getAgentDisplayName } from "./agent-name.ts";
 import { getActiveSolverIds } from "../config/solvers.ts";
+import { resolvedCommandApproval } from "../workflow/command-approval-recovery.ts";
 import { solverIds } from "../agents/schemas.ts";
 import { formatCommandLine } from "../agents/command-observability.ts";
 import { getPhaseRoles, phaseRoles } from "../workflow/router.ts";
@@ -124,11 +125,20 @@ export function deriveAgentProgressState(
     !!state.results[role] &&
     (invalidation < 0 || completion > invalidation) &&
     (latestStart < 0 || completion >= latestStart);
+  if (resolvedCommandApproval(state)?.agent === role)
+    return {
+      status: "stopped",
+      attempt: latest?.meta?.attempt,
+      detail: "approval resolved; explicit execution recovery required",
+    };
   if (state.pendingRuntimeCommands?.some((request) => request.agentId === role))
     return {
       status: "waiting",
       attempt: live?.attempt ?? latest?.meta?.attempt,
-      detail: "waiting for command approval",
+      detail:
+        completion > latestStart && !live
+          ? "saved command permission requires review; previous run ended"
+          : "waiting for command approval",
     };
   const pendingFile = state.pendingRuntimeFiles?.find(
     (request) => request.agentId === role,

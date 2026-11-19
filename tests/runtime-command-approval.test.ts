@@ -24,7 +24,7 @@ import { AgentLogStore } from "../src/workflow/agent-logs.ts";
 import { formatToolActivity } from "../src/ui/activity.ts";
 import { getWorkflowRecoveryPlan } from "../src/workflow/recovery.ts";
 import type { Role } from "../src/agents/schemas.ts";
-import { validateState } from "../src/workflow/state.ts";
+import { validateState, record } from "../src/workflow/state.ts";
 import { UserInteractionService } from "../src/integrations/user-interaction.ts";
 
 function terminalRouting(
@@ -155,6 +155,10 @@ for (const choice of ["allow_once", "deny"])
 
 test("restart cannot resume a local continuation; repeated approval recovery never executes it", async () => {
   const f = await fixture();
+  record(f.state, "agent_attempt_started", "pentester run 1 started", {
+    agent: "pentester",
+    attempt: 1,
+  });
   const local = terminalRouting(f, async () => ["deny"]);
   const command = normalizedRuntimeCommand(
     {
@@ -657,6 +661,10 @@ test("parallel requests retain agent identities; stale and aborted answers canno
 
 test("pending approval survives restart and is re-presented without executing", async () => {
   const f = await fixture([["allow_workflow"]]);
+  record(f.state, "agent_attempt_started", "implementor run 1 started", {
+    agent: "implementor",
+    attempt: 1,
+  });
   const command = normalizedRuntimeCommand(
     {
       executable: "php",
@@ -903,9 +911,16 @@ test("cancelled approval pauses routing without counting an agent failure", asyn
   assert.equal(result.runtimeCommandApprovals.length, 1);
   assert.equal(
     (await getWorkflowRecoveryPlan(result, cwd)).kind,
-    "retry-agent",
+    "interrupted-mutation",
   );
-  assert.equal(await engine.retryAgent(result, "implementor"), "prepared");
+  await assert.rejects(
+    engine.retryAgent(result, "implementor"),
+    /keep or.*discard/,
+  );
+  assert.equal(
+    await engine.retryAgent(result, "implementor", false, "keep"),
+    "prepared",
+  );
 });
 
 test("exact runtime grants persist for one role and prompt exposes scope", async () => {

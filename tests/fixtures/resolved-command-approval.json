@@ -1,0 +1,60 @@
+{
+  "id": "9807d5cd-f827-4902-9970-80c320d1d0a3",
+  "version": 3,
+  "phase": "BLOCKED",
+  "commandApprovalComplete": true,
+  "pendingRuntimeCommands": [],
+  "blocker": "Pi-Team approval contains secret-like content that cannot be meaningfully reviewed through Telegram after redaction; nothing was sent",
+  "executions": [
+    {
+      "id": "572dee2d-a060-43a0-9189-c2cd05fcaf66",
+      "workflowId": "9807d5cd-f827-4902-9970-80c320d1d0a3",
+      "agent": "pentester",
+      "attempt": 1,
+      "status": "COMPLETED",
+      "children": []
+    }
+  ],
+  "history": [
+    {
+      "at": "2026-11-17T14:28:42.706Z",
+      "phase": "PENTEST",
+      "event": "agent_attempt_started",
+      "detail": "pentester run 1 started",
+      "meta": { "agent": "pentester", "attempt": 1 }
+    },
+    {
+      "at": "2026-11-17T14:34:26.596Z",
+      "phase": "PENTEST",
+      "event": "command_approval_requested",
+      "detail": "pentester requested detected-61c1f5e4d00a",
+      "meta": { "agent": "pentester", "attempt": 1 }
+    },
+    {
+      "at": "2026-11-17T14:41:44.189Z",
+      "phase": "PENTEST",
+      "event": "agent_attempt_completed",
+      "detail": "pentester run 1 completed",
+      "meta": { "agent": "pentester", "attempt": 1 }
+    },
+    {
+      "at": "2026-11-17T14:41:44.212Z",
+      "phase": "PENTEST",
+      "event": "blocked",
+      "detail": "Command approval pending for pentester; review it with /team resume, then inspect and retry the agent."
+    },
+    {
+      "at": "2026-11-17T14:53:16.168Z",
+      "phase": "BLOCKED",
+      "event": "blocked",
+      "detail": "Pi-Team approval contains secret-like content that cannot be meaningfully reviewed through Telegram after redaction; nothing was sent"
+    },
+    {
+      "at": "2026-11-18T19:17:18.931Z",
+      "phase": "BLOCKED",
+      "event": "command_approval_decided",
+      "detail": "pentester allow_workflow detected-61c1f5e4d00a",
+      "meta": { "agent": "pentester", "attempt": 1 }
+    }
+  ]
+}

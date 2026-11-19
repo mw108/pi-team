@@ -342,6 +342,7 @@ export const stateSchema = z.object({
           sourceAttempt: z.number().int().positive().optional(),
           paths: z.array(z.string()).optional(),
           commandId: z.string().optional(),
+          requestId: z.string().uuid().optional(),
           executionId: z.string().uuid().optional(),
           category: z
             .enum([

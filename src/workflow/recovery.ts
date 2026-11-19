@@ -3,6 +3,10 @@ import {
   formatInterruptedGateAssessment,
 } from "./interrupted-gate-assessment.ts";
 import {
+  resolvedCommandApproval,
+  savedCommandApprovalMismatch,
+} from "./command-approval-recovery.ts";
+import {
   classifyVerifiedCommand,
   currentVerifiedCommandResults,
   repositoryEvidenceState,
@@ -481,6 +485,8 @@ export function interruptedQualityGate(
   state: WorkflowState,
   agent: "pentester" | "tester",
 ): number | undefined {
+  const approval = resolvedCommandApproval(state);
+  if (approval?.agent === agent && !state.commit) return approval.attempt;
   const phase = agent === "pentester" ? "PENTEST" : "TEST";
   if (
     state.phase !== "BLOCKED" ||
@@ -705,6 +711,8 @@ async function planWorkflowRecovery(
     reason,
   });
   if (active) return unsafe("Workflow is already running.");
+  const approvalMismatch = savedCommandApprovalMismatch(state);
+  if (approvalMismatch) return unsafe(approvalMismatch);
   if (
     state.phase === "WAITING_USER" &&
     state.pentestUnavailabilityReview &&
@@ -755,7 +763,7 @@ async function planWorkflowRecovery(
         state.pendingRuntimeFiles?.length ||
         state.pendingContractPaths?.length ||
         state.pendingContractExtensions?.length
-          ? "Waiting for tool approval. Run /team resume to review the saved request. /team-continue cannot bypass it."
+          ? "Saved tool permission requires review. Run /team resume to review the request. An ended command continuation cannot be resumed; agent recovery is explicit. /team-continue cannot bypass approval."
           : "Workflow is waiting for user input.",
     };
   if (state.phase === "DONE")
@@ -888,9 +896,30 @@ async function planWorkflowRecovery(
         kind: "interrupted-quality-gate",
         agentId: agent,
         attempt,
-        reason: formatInterruptedGateAssessment(assessment),
+        reason: `${resolvedCommandApproval(state)?.agent === agent ? `Workflow recovery required\nAgent: ${agent}\nPrevious command approval: resolved\nOriginal command continuation: ended; it cannot be resumed.\nInspect repository and external effects before explicit recovery.\n\n` : ""}${formatInterruptedGateAssessment(assessment)}`,
       };
     }
+  }
+  const resolvedApproval = resolvedCommandApproval(state);
+  if (resolvedApproval) {
+    if ((await head(cwd)) !== state.baseline.head)
+      return unsafe(
+        "Repository HEAD changed; resolved approval cannot authorize retry.",
+      );
+    if (
+      state.gateHashes &&
+      (JSON.stringify(await gateSnapshot(state)) !==
+        JSON.stringify(state.gateHashes) ||
+        (await unexpectedWorkflowPaths(state)).length)
+    )
+      return unsafe(
+        "Repository changed after command approval; inspect effects before retrying.",
+      );
+    return {
+      kind: "retry-agent",
+      agentId: resolvedApproval.agent,
+      reason: `${resolvedApproval.agent} command approval was resolved after its run ended. Inspect effects, then explicitly retry the agent; no old command will be replayed.`,
+    };
   }
   const manual = classifyManualRetry(state);
   if (manual.kind === "unconsumed" && !state.inFlight) {

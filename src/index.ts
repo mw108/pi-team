@@ -45,8 +45,10 @@ async function finalText(state: WorkflowState) {
   if (state.phase === "DONE") return completionText(state);
   if (state.phase === "ABORTED")
     return "Team workflow aborted; repository changes preserved.";
-  if (state.pendingRuntimeCommands?.length)
-    return `Waiting for command approval (${state.pendingRuntimeCommands.length} request${state.pendingRuntimeCommands.length === 1 ? "" : "s"}). Run /team resume ${state.id} to review.`;
+  if (state.pendingRuntimeCommands?.length) {
+    const recovery = await getWorkflowRecoveryPlan(state, state.cwd);
+    return `${recovery.reason}\nNext safe action: ${recoveryAction(recovery)}`;
+  }
   if (state.pendingContractExtensions?.length)
     return `Approval required for ${state.pendingContractExtensions.length} repository change${state.pendingContractExtensions.length === 1 ? "" : "s"} outside the Implementation Contract. Run /team resume ${state.id} to review.`;
   if (state.phase === "BLOCKED")

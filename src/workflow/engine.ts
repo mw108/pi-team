@@ -5,6 +5,12 @@ import {
   type ExecutionContext,
 } from "./execution-identity.ts";
 import {
+  resolvedCommandApproval,
+  commandApprovalRecoveryBlocker,
+  commandApprovalRecoveryEvent,
+  savedCommandApprovalMismatch,
+} from "./command-approval-recovery.ts";
+import {
   assessInterruptedGate,
   formatInterruptedGateAssessment,
 } from "./interrupted-gate-assessment.ts";
@@ -830,6 +836,16 @@ export class WorkflowEngine {
     );
     if (instructionDrift) throw new Error(instructionDrift);
     const label = getAgentDisplayName(state.config, role);
+    if (!this.running && resolvedCommandApproval(state))
+      await this.reconcileCommandApproval(state);
+    if (
+      !mode &&
+      (role === "pentester" || role === "tester") &&
+      resolvedCommandApproval(state)?.agent === role
+    )
+      throw new Error(
+        `The previous command approval is resolved, but its command continuation ended. Inspect effects and use /team-retry ${role} recover; ordinary retry cannot bypass recovery.`,
+      );
     if (mode === "recover") {
       if (role !== "pentester" && role !== "tester")
         throw new Error(
@@ -917,6 +933,13 @@ export class WorkflowEngine {
       );
       const revalidate =
         assessment.status === "ATTRIBUTABLE_TO_INTERRUPTED_ATTEMPT";
+      if (resolvedCommandApproval(state)) {
+        if (state.results[role])
+          (state.results as Record<string, unknown>)[`previous_${role}`] =
+            state.results[role];
+        delete state.results[role];
+        this.invalidateDependents(state, role);
+      }
       if (revalidate) {
         if (state.results.codeReviewer)
           state.results.previous_codeReviewer = state.results.codeReviewer;
@@ -3296,6 +3319,53 @@ export class WorkflowEngine {
       await this.store.save(s);
     }
   }
+  /** Approval resolution ends the wait, not the attempt's recovery obligations.
+   * The marker and blocker replacement share StateStore's atomic state write.
+   */
+  private async reconcileCommandApproval(s: WorkflowState): Promise<boolean> {
+    const approval = resolvedCommandApproval(s);
+    if (
+      !approval ||
+      this.activeAttempts.size ||
+      this.sessions.list(s.id).length
+    )
+      return false;
+    if (
+      approval.execution &&
+      (await inspectExecution(approval.execution)).status !== "TERMINATED"
+    )
+      return false;
+    const blocker = commandApprovalRecoveryBlocker(
+      approval.agent,
+      approval.attempt,
+    );
+    if (s.blocker === blocker && !s.inFlight) return true;
+    if (approval.agent === "implementor" && !s.interruptedMutationRecovery) {
+      await this.markInterruptedImplementor(s, "process_interrupted");
+      if (s.interruptedMutationRecovery) {
+        // Preserve the existing mutation-recovery marker -> blocked chronology,
+        // attributing the new block to its original phase. No phase is run.
+        s.phase = approval.phase;
+        block(s, blocker);
+      }
+    }
+    s.blocker = blocker;
+    delete s.blockerMeta;
+    delete s.inFlight;
+    record(
+      s,
+      commandApprovalRecoveryEvent,
+      `${approval.agent} command permission resolved (${approval.decisions.join(", ")}); ended continuation requires explicit recovery`,
+      {
+        agent: approval.agent,
+        attempt: approval.attempt,
+        sourcePhase: approval.phase,
+        executionId: approval.execution?.id,
+      },
+    );
+    await this.store.save(s);
+    return true;
+  }
   async resumeReadonly(s: WorkflowState) {
     // Resume may be invoked before run(); acquire the same lock used by run.
     if (this.running) return this.resumeReadonlyLocked(s);
@@ -3313,6 +3383,7 @@ export class WorkflowEngine {
     }
   }
   private async resumeReadonlyLocked(s: WorkflowState) {
+    await this.reconcileCommandApproval(s);
     if (s.teamConfigHash && s.agentPromptHashes && s.teamConfigPath) {
       const current = await loadConfig(this.cwd);
       const drift = analyzeConfigDrift(s, current);
@@ -3531,6 +3602,8 @@ export class WorkflowEngine {
         }
       }
       if (s.pendingRuntimeCommands.length && this.activeAttempts.size === 0) {
+        const mismatch = savedCommandApprovalMismatch(s);
+        if (mismatch) throw new Error(mismatch);
         for (const pending of [...s.pendingRuntimeCommands]) {
           if (signal?.aborted) break;
           const request = this.runtimeApprovalPrompt(
@@ -3600,14 +3673,29 @@ export class WorkflowEngine {
             s,
             "command_approval_decided",
             `${pending.agentId} ${choice} ${pending.command.id}`,
-            { agent: pending.agentId, attempt: pending.run },
+            {
+              agent: pending.agentId,
+              attempt: pending.run,
+              commandId: pending.command.id,
+              requestId: pending.requestId,
+              executionId: s.executions.find(
+                (e) => e.agent === pending.agentId && e.attempt === pending.run,
+              )?.id,
+            },
           );
-          await this.store.save(s);
+          if (!(await this.reconcileCommandApproval(s)))
+            await this.store.save(s);
         }
         if (s.pendingRuntimeCommands.length) {
           this.ui.progress(s);
           return s;
         }
+      }
+      const resolvedApproval = resolvedCommandApproval(s);
+      if (resolvedApproval) {
+        await this.reconcileCommandApproval(s);
+        this.ui.progress(s);
+        return s;
       }
       await this.recover(s);
       if (

@@ -573,7 +573,15 @@ export class RuntimeCommandApprovalCoordinator {
       s,
       "command_approval_requested",
       `${role} requested ${command.id}`,
-      { agent: role, attempt: control.attempt },
+      {
+        agent: role,
+        attempt: control.attempt,
+        commandId: command.id,
+        requestId: pending.requestId,
+        executionId: s.executions.find(
+          (e) => e.agent === role && e.attempt === control.attempt,
+        )?.id,
+      },
     );
     this.deps.progress(s);
     const decide = async (): Promise<"allow" | "deny" | "pending"> => {
@@ -670,7 +678,15 @@ export class RuntimeCommandApprovalCoordinator {
         s,
         "command_approval_decided",
         `${role} ${choice} ${command.id}`,
-        { agent: role, attempt: control.attempt },
+        {
+          agent: role,
+          attempt: control.attempt,
+          commandId: command.id,
+          requestId: pending.requestId,
+          executionId: s.executions.find(
+            (e) => e.agent === role && e.attempt === control.attempt,
+          )?.id,
+        },
       );
       if (choice !== "deny")
         this.deps.emitAgentEvent({
